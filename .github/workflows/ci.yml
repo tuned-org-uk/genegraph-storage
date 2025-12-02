@@ -21,6 +21,13 @@ jobs:
       TZ: "/usr/share/zoneinfo/your/location"
     steps:
       - uses: actions/checkout@v4
+
+      - name: Setup Protobuf
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "25.x"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Cache .cargo and target
         uses: actions/cache@v4
         with:
@@ -28,15 +35,39 @@ jobs:
             ~/.cargo
             ./target
           key: ${{ runner.os }}-cargo-${{ matrix.platform.target }}-${{ hashFiles('**/Cargo.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-${{ matrix.platform.target }}-
+          restore-keys: ${{ runner.os }}-cargo-${{ matrix.platform.target }}
+
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: actions-rs/toolchain@v1
         with:
-          targets: ${{ matrix.platform.target }}
-      - name: Stable Build with all features
-        run: cargo build --all-features --target ${{ matrix.platform.target }}
-      - name: Stable Build without features
-        run: cargo build --target ${{ matrix.platform.target }}
-      - name: Tests
-        run: cargo test --all-features
+          toolchain: stable
+          target: ${{ matrix.platform.target }}
+          profile: minimal
+          default: true
+
+      - name: Verify Protobuf installation
+        run: protoc --version
+
+      - name: Build with all features
+        uses: actions-rs/cargo@v1
+        with:
+          command: build
+          args: --all-features --target ${{ matrix.platform.target }}
+
+      - name: Build without features
+        uses: actions-rs/cargo@v1
+        with:
+          command: build
+          args: --target ${{ matrix.platform.target }}
+
+      - name: Run tests
+        uses: actions-rs/cargo@v1
+        with:
+          command: test
+          args: --all-features
+
+      - name: Run clippy
+        uses: actions-rs/cargo@v1
+        with:
+          command: clippy
+          args: --all-features -- -D warnings
