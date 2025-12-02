@@ -9,8 +9,8 @@ repository = "https://github.com/tuned-org-uk/genegraph-storage"
 homepage = "https://github.com/tuned-org-uk/genegraph-storage"
 documentation = "https://docs.rs/genegraph-storage"
 readme = "README.md"
-keywords = ["graph-storage", "vector-space", "graph-signal", "similarity-search", "mlops", "aiops"]
-categories = ["file system", "database", "graph", "data", "storage"]
+keywords = ["graph-storage", "vector-space", "similarity-search", "mlops", "aiops"]
+categories = ["filesystem", "database", "asynchronous", "algorithms", "database-implementations"]
 exclude = [
     "target/*",
     "Cargo.lock",
