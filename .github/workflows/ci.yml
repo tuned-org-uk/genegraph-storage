@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  tests:
+    runs-on: "${{ matrix.platform.os }}-latest"
+    strategy:
+      matrix:
+        platform:
+          [
+            { os: "windows", target: "x86_64-pc-windows-msvc" },
+            { os: "ubuntu", target: "x86_64-unknown-linux-gnu" },
+            { os: "macos", target: "aarch64-apple-darwin" },
+          ]
+    env:
+      TZ: "/usr/share/zoneinfo/your/location"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache .cargo and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo
+            ./target
+          key: ${{ runner.os }}-cargo-${{ matrix.platform.target }}-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ matrix.platform.target }}-
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform.target }}
+      - name: Stable Build with all features
+        run: cargo build --all-features --target ${{ matrix.platform.target }}
+      - name: Stable Build without features
+        run: cargo build --target ${{ matrix.platform.target }}
+      - name: Tests
+        run: cargo test --all-features

@@ -2,15 +2,15 @@
 name = "genegraph-storage"
 version = "0.1.0"
 edition = "2024"
-description = "Vector database: dispersion models for search and graph analysis"
+description = "vector database: base Lance storage"
 authors = ["Lorenzo <tunedconsulting@gmail.com>"]
 license = "Apache-2.0"
-repository = "https://github.com/tuned-org-uk/genefold-storage"
-homepage = "https://github.com/tuned-org-uk/genefold-storage"
-documentation = "https://docs.rs/genefold-storage"
+repository = "https://github.com/tuned-org-uk/genegraph-storage"
+homepage = "https://github.com/tuned-org-uk/genegraph-storage"
+documentation = "https://docs.rs/genegraph-storage"
 readme = "README.md"
-keywords = ["vector-search", "vector-space", "graph-signal", "similarity-search", "mlops", "aiops"]
-categories = ["file system", "database", "graph", "data"]
+keywords = ["graph-storage", "vector-space", "graph-signal", "similarity-search", "mlops", "aiops"]
+categories = ["file system", "database", "graph", "data", "storage"]
 exclude = [
     "target/*",
     "Cargo.lock",
