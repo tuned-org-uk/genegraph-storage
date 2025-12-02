@@ -473,16 +473,23 @@ impl StorageBackend for LanceStorage {
             .join(format!("{}_metadata.json", self._name))
     }
 
-    /// Converts a filesystem path to a `file://` URI for Lance.
+    /// Converts the base path for the store to a `file://` URI for Lance.
+    fn basepath_to_uri(&self) -> String {
+        Self::path_to_uri(PathBuf::from(self._base.clone()).as_path())
+    }
+
+    /// Converts a full filesystem path to a `file://` URI for Lance.
     fn path_to_uri(path: &Path) -> String {
         path.canonicalize()
             .unwrap_or_else(|_| {
                 if path.is_absolute() {
                     path.to_path_buf()
-                } else {
+                } else if path.is_relative() {
                     std::env::current_dir()
                         .unwrap_or_else(|_| PathBuf::from("/"))
                         .join(path)
+                } else {
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(path)
                 }
             })
             .to_string_lossy()

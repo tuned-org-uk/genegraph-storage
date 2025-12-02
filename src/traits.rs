@@ -100,6 +100,8 @@ pub trait StorageBackend: Send + Sync {
     fn base_path(&self) -> PathBuf;
     /// Returns the metadata path.
     fn metadata_path(&self) -> PathBuf;
+    /// return the base path as file:// string
+    fn basepath_to_uri(&self) -> String;
 
     /// Load initial data using columnar format from a file path.
     /// Implementations may use this as a helper for async `load_dense`.
