@@ -6,37 +6,62 @@ use std::path::{Path, PathBuf};
 use crate::StorageResult;
 use crate::metadata::GeneMetadata;
 
-/// Storage backend trait for persisting ArrowSpace graph embeddings.
+/// Async storage backend for Lance-based graph and embedding data.
 ///
-/// ## Initialization Protocol
+/// This trait defines the minimal async API required to persist and reload
+/// all artifacts used by Javelin:
 ///
-/// Storage must be initialized before data can be saved:
+/// - Dense matrices (embeddings, eigenmaps, energy maps)
+/// - Sparse matrices in CSR form (e.g. Laplacians, adjacency)
+/// - Scalar vectors (eigenvalues, norms, generic f64 sequences)
+/// - Index-like vectors (usize mappings and cluster assignments)
+/// - Clustering metadata (centroid maps, subcentroids, lambdas)
+/// - Global metadata describing the dataset layout and dimensions
 ///
-/// 1. Call `save_metadata()` or `save_eigenmaps_all()`/`save_energymaps_all()` first
-/// 2. Only then can individual `save_dense()`, `save_sparse()`, `save_lambdas()` be called
-/// 3. All save operations validate that metadata exists
+/// ## Initialization
 ///
-/// Filename format is : <base dir> / <instance name>_<stem>.lance
+/// Storage must be initialized before saving any data:
+///
+/// 1. Call `save_metadata()` once to write an initial `*_metadata.json`.
+/// 2. Subsequent `save_*` calls validate that metadata exists and is consistent.
+/// 3. `exists()` can be used to detect and reuse an existing initialized store.
+///
+/// Filenames are conventionally:
+///
+/// ```
+/// <base dir>/<instance name>_<key>.lance
+/// ```
 ///
 /// ## Async usage
 ///
-/// This trait is now async-first for all I/O methods. Implementations (e.g. `LanceStorage`)
-/// must integrate with Tokio by providing non-blocking async methods; no `block_on` or
-/// nested runtimes are used inside the backend.
+/// All I/O functions are async and intended to be called from a Tokio runtime.
+/// Implementations (e.g. `LanceStorage`) must not create their own runtimes or
+/// block on I/O internally.
 ///
-/// ## Example
+/// ## High-level flow
 ///
-/// ```ignore
-/// let storage = LanceStorage::new(base, name);
-/// let builder = ArrowSpaceBuilder::new();
-/// let (mut aspace, gl) = builder.build_for_persistence(data, "Eigen", None);
+/// - Dense data:
+///   - `save_dense("raw_input", &matrix, md_path)`
+///   - `load_dense("raw_input")`
 ///
-/// // This initializes the storage directory with metadata and writes all artifacts
-/// storage.save_eigenmaps_all(&builder, &mut aspace, &gl).await?;
+/// - Sparse data:
+///   - `save_sparse("laplacian", &csr, md_path)`
+///   - `load_sparse("laplacian")`
 ///
-/// // Now individual loads will work
-/// let raw = storage.load_dense("rawinput").await?;
-/// ```
+/// - Scalars and indices:
+///   - `save_lambdas`, `load_lambdas`
+///   - `save_vector`, `load_vector`
+///   - `save_index`, `load_index`
+///   - `save_centroid_map`, `load_centroid_map`
+///   - `save_item_norms`, `load_item_norms`
+///   - `save_cluster_assignments`, `load_cluster_assignments`
+///
+/// - Clustering structure:
+///   - `save_subcentroids`, `load_subcentroids`
+///   - `save_subcentroid_lambdas`, `load_subcentroid_lambdas`
+///
+/// Implementations are free to choose the on-disk layout as long as they honor
+/// these logical keys and round-trip semantics.
 pub trait StorageBackend: Send + Sync {
     /// Base directory of the instance
     fn get_base(&self) -> String;
