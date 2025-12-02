@@ -475,17 +475,18 @@ impl StorageBackend for LanceStorage {
 
     /// Converts a filesystem path to a `file://` URI for Lance.
     fn path_to_uri(path: &Path) -> String {
-        // Ensure we have an absolute path
-        let abs_path = path.canonicalize().unwrap_or_else(|_| {
-            if path.is_absolute() {
-                path.to_path_buf()
-            } else {
-                std::env::current_dir()
-                    .unwrap_or_else(|_| PathBuf::from("/"))
-                    .join(path)
-            }
-        });
-        format!("file://{}", abs_path.display())
+        path.canonicalize()
+            .unwrap_or_else(|_| {
+                if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    std::env::current_dir()
+                        .unwrap_or_else(|_| PathBuf::from("/"))
+                        .join(path)
+                }
+            })
+            .to_string_lossy()
+            .to_string()
     }
 
     // Add these methods to impl LanceStorage {} block
