@@ -37,7 +37,7 @@ serde = { version = "^1.0.228", features = ["derive"] }
 serde_json = { version = "^1.0.145"}
 futures = "0.3.31"
 arrow-array = "^56.1.0"
-arrow = { version = "^56.1.0" }
+arrow = { version = "^57.1.0" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 parquet = { version = "^56.1.0" }
 
