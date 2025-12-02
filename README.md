@@ -1,11 +1,32 @@
 # genegraph-storage
 
-A Lance storage layer for graph-based vector databases.
+A storage layer for graph-based vector databases.
+Currently implements only the Lance file format (parquet and other formats can be implemented using the `StorageBackend` trait).
 
-A storage layer for [`javelin-tui`](https://github.com/tuned-org-uk/javelin-tui) and [`arrowspace`](https://github.com/Mec-iS/arrowspace-rs).
+Provided functionalities:
+* `save_metadata`, `load_metadata`: gives a simple wrapper for all the data in the directory
+* `save_*` dense matrices, sparse matrices, vectors, lambdas, indices
+* `load_*` dense matrices, sparse matrices, vectors, lambdas, indices
+* some other useful stuff
+
+A storage layer for:
+* [`javelin-tui`](https://github.com/tuned-org-uk/javelin-tui): a graph-based vector database Text-Interface and
+* [`arrowspace`](https://github.com/Mec-iS/arrowspace-rs): the next iteration of vector search
 
 ## Usage
+
+```bash
+cargo add genegraph_storage
+```
+
+Simple example:
+
 ```rust
+use genegraph_storage::lance::LanceStorage;
+use genegraph_storage::metadata::{FileInfo, GeneMetadata};
+use genegraph_storage::traits::StorageBackend;
+use smartcore::linalg::basic::matrix::DenseMatrix;
+
 // instantiate a storage
 let storage = LanceStorage::new(
     "/tmp".to_string_lossy().to_string(),
