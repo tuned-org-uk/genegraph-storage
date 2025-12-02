@@ -28,8 +28,8 @@ use crate::metadata::GeneMetadata;
 ///
 /// Filenames are conventionally:
 ///
-/// ```
-/// <base dir>/<instance name>_<key>.lance
+/// ```ignore
+/// <base dir>/<instance name or name id>_<key>.lance
 /// ```
 ///
 /// ## Async usage
@@ -85,11 +85,11 @@ pub trait StorageBackend: Send + Sync {
         if let Ok(entries) = std::fs::read_dir(&base_path) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if name.ends_with("_metadata.json") {
-                        debug!("StorageBackend::exists: found metadata file at {:?}", path);
-                        return (true, Some(path));
-                    }
+                if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                    && name.ends_with("_metadata.json")
+                {
+                    debug!("StorageBackend::exists: found metadata file at {:?}", path);
+                    return (true, Some(path));
                 }
             }
         }

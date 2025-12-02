@@ -86,7 +86,7 @@ impl GeneMetadata {
     /// Empty metadata object
     /// do not use in test, use seed_metadata_eigen instead
     fn new(name_id: &str) -> Self {
-        info!("SpaceMetadata::new: creating metadata for '{}'", name_id);
+        info!("GeneMetadata::new: creating metadata for '{}'", name_id);
         Self {
             name_id: name_id.to_string(),
             nrows: 0,
@@ -131,7 +131,7 @@ impl GeneMetadata {
         storage: &B,
     ) -> Result<GeneMetadata, StorageError> {
         info!(
-            "SpaceMetadata::seed_metadata: seeding metadata for '{}' with nitems={}, nfeatures={}",
+            "GeneMetadata::seed_metadata: seeding metadata for '{}' with nitems={}, nfeatures={}",
             name_id, nitems, nfeatures
         );
 
@@ -139,30 +139,29 @@ impl GeneMetadata {
             .with_base(storage.base_path())
             .with_dimensions(nitems, nfeatures);
 
-        debug!("SpaceMetadata::seed_metadata: registering files");
+        debug!("GeneMetadata::seed_metadata: registering files");
 
-        for (key, filetype, rows, cols, nnz) in [("rawinput", "dense", nitems, nfeatures, None)] {
-            debug!(
-                "SpaceMetadata::seed_metadata_eigen: adding file {} ({}x{}, nnz={:?})",
-                filetype, rows, cols, nnz
-            );
-            md = md.add_file(
-                key,
-                FileInfo::new(
-                    format!("{}_{}.lance", name_id, key),
-                    filetype,
-                    (rows, cols),
-                    nnz,
-                    None,
-                ),
-            );
-        }
+        let (key, filetype, rows, cols, nnz) = ("rawinput", "dense", nitems, nfeatures, None);
+        debug!(
+            "SpaceMetadata::seed_metadata_eigen: adding file {} ({}x{}, nnz={:?})",
+            filetype, rows, cols, nnz
+        );
+        md = md.add_file(
+            key,
+            FileInfo::new(
+                format!("{}_{}.lance", name_id, key),
+                filetype,
+                (rows, cols),
+                nnz,
+                None,
+            ),
+        );
 
-        debug!("SpaceMetadata::seed_metadata: saving metadata to storage");
+        debug!("GeneMetadata::seed_metadata: saving metadata to storage");
         storage.save_metadata(&md).await?;
 
         info!(
-            "SpaceMetadata::seed_metadata: metadata seeded successfully for '{}'",
+            "GeneMetadata::seed_metadata: metadata seeded successfully for '{}'",
             name_id
         );
         Ok(md)
@@ -175,7 +174,7 @@ impl GeneMetadata {
 
     pub fn with_dimensions(mut self, rows: usize, cols: usize) -> Self {
         debug!(
-            "SpaceMetadata::with_dimensions: setting dimensions to {}x{}",
+            "GeneMetadata::with_dimensions: setting dimensions to {}x{}",
             rows, cols
         );
         self.nrows = rows;
@@ -185,7 +184,7 @@ impl GeneMetadata {
 
     pub fn add_file(mut self, key: &str, info: FileInfo) -> Self {
         debug!(
-            "SpaceMetadata::add_file: adding file '{}' ({})",
+            "GeneMetadata::add_file: adding file '{}' ({})",
             key, info.filename
         );
         self.files.insert(key.to_string(), info);

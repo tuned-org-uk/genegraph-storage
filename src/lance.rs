@@ -136,6 +136,7 @@ Call save_metadata() or save_eigenmaps_all()/save_energymaps_all() first.",
     ///
     /// Returns:
     /// DenseMatrix in column-major format (smartcore convention)
+    #[allow(clippy::wrong_self_convention)]
     fn from_dense_record_batch(
         &self,
         batch: &RecordBatch,
@@ -865,7 +866,7 @@ impl StorageBackend for LanceStorage {
         info!("Saving {} values for vector {}", vector.len(), key);
 
         let schema = Schema::new(vec![Field::new("element", DataType::Float64, false)]);
-        let float64_array = Float64Array::from_iter_values(vector.iter().map(|&x| x as f64));
+        let float64_array = Float64Array::from_iter_values::<Vec<f64>>(vector.into());
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(float64_array) as _])
             .map_err(|e| StorageError::Lance(e.to_string()))?;
 
@@ -900,7 +901,7 @@ impl StorageBackend for LanceStorage {
             .downcast_ref::<Float64Array>()
             .ok_or_else(|| StorageError::Invalid("column type mismatch".into()))?;
 
-        let vector: Vec<f64> = (0..arr.len()).map(|i| arr.value(i) as f64).collect();
+        let vector: Vec<f64> = (0..arr.len()).map(|i| arr.value(i)).collect();
         info!("Loaded {} vector values for {}", vector.len(), filename);
         Ok(vector)
     }
