@@ -220,6 +220,24 @@ Call save_metadata() or save_eigenmaps_all()/save_energymaps_all() first.",
         DenseMatrix::new(rows, cols, data, true).map_err(|e| StorageError::Invalid(e.to_string()))
     }
 
+    /// Spawn a LanceStorage from an existing seeded directory (with metadata.json)
+    pub async fn spawn(base_path: String) -> Result<(LanceStorage, GeneMetadata), StorageError> {
+        // Reuse the generic `exists` helper from the StorageBackend trait
+        let (exists, md_path) = <LanceStorage as StorageBackend>::exists(&base_path);
+        assert!(
+            exists && md_path.is_some(),
+            "Metadata does not exist in this base path"
+        );
+
+        // Load metadata from the discovered metadata.json
+        let metadata = GeneMetadata::read(md_path.unwrap()).await?;
+
+        // Construct the LanceStorage using the metadata-provided nameid
+        let storage = LanceStorage::new(base_path.clone(), metadata.name_id.clone());
+
+        Ok((storage, metadata))
+    }
+
     /// Converts a sparse CSR matrix to a RecordBatch in columnar format.
     ///
     /// Only non-zero entries are stored.
@@ -478,7 +496,7 @@ impl StorageBackend for LanceStorage {
         Self::path_to_uri(PathBuf::from(self._base.clone()).as_path())
     }
 
-    /// Converts a full filesystem path to a `file://` URI for Lance.
+    /// Converts a full file path to a `file://` URI for Lance.
     fn path_to_uri(path: &Path) -> String {
         path.canonicalize()
             .unwrap_or_else(|_| {

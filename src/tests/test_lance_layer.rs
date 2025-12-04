@@ -479,3 +479,69 @@ async fn test_concurrent_storage_instances() {
         }
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[should_panic(expected = "Metadata does not exist in this base path")]
+async fn test_lance_storage_spawn_missing_metadata() {
+    // Setup: Create a temporary directory without metadata
+    let temp_dir = tmp_dir("test_concurrent_storage_instances").await;
+    let base_path = temp_dir.as_path().to_str().unwrap().to_string();
+
+    // Attempt to spawn without metadata - should panic
+    let _result = LanceStorage::spawn(base_path)
+        .await
+        .expect("Should panic before this");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[should_panic(expected = "Metadata does not exist in this base path")]
+async fn test_lance_storage_spawn_nonexistent_directory() {
+    // Try to spawn from a directory that doesn't exist
+    let base_path = "/tmp/nonexistent_directory_12345".to_string();
+
+    let _result = LanceStorage::spawn(base_path)
+        .await
+        .expect("Should panic before this");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_lance_storage_spawn_metadata_consistency() {
+    // Setup: Create storage with specific metadata
+    let temp_dir = tmp_dir("test_concurrent_storage_instances").await;
+    let base_path = temp_dir.as_path().to_str().unwrap().to_string();
+    let name_id = "consistency_test";
+
+    let storage = LanceStorage::new(base_path.clone(), name_id.to_string());
+
+    let mut metadata = GeneMetadata::seed_metadata(name_id, 200, 75, &storage)
+        .await
+        .expect("Failed to seed metadata");
+
+    // Add some file info
+    metadata = metadata.add_file(
+        "test_file",
+        FileInfo::new(
+            format!("{}_test_file.lance", name_id),
+            "dense",
+            (200, 75),
+            None,
+            None,
+        ),
+    );
+
+    storage
+        .save_metadata(&metadata.clone())
+        .await
+        .expect("Failed to save metadata");
+
+    // Spawn and verify all metadata fields
+    let (_spawned_storage, spawned_metadata) = LanceStorage::spawn(base_path.clone())
+        .await
+        .expect("Failed to spawn");
+
+    assert_eq!(spawned_metadata.name_id, metadata.name_id);
+    assert_eq!(spawned_metadata.nrows, metadata.nrows);
+    assert_eq!(spawned_metadata.ncols, metadata.ncols);
+    assert_eq!(spawned_metadata.base, metadata.base);
+    assert_eq!(spawned_metadata.files.len(), metadata.files.len());
+}
