@@ -481,6 +481,68 @@ async fn test_concurrent_storage_instances() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_lance_storage_spawn() {
+    // Setup: Create a temporary directory
+    let temp_dir = tmp_dir("test_concurrent_storage_instances").await;
+    let base_path = temp_dir.as_path().to_str().unwrap().to_string();
+    let name_id = "test_spawn_storage";
+
+    // Step 1: Create and seed initial storage with metadata
+    let storage = LanceStorage::new(base_path.clone(), name_id.to_string());
+
+    GeneMetadata::seed_metadata(
+        name_id, 100, // nitems
+        50,  // nfeatures
+        &storage,
+    )
+    .await
+    .expect("Failed to seed metadata");
+
+    // Step 2: Save some sample data to make it realistic
+    let test_matrix = DenseMatrix::from_2d_array(&[&[1.0, 2.0, 3.0], &[4.0, 5.0, 6.0]])
+        .expect("Failed to create test matrix");
+
+    storage
+        .save_dense("rawinput", &test_matrix, &storage.metadata_path())
+        .await
+        .expect("Failed to save dense matrix");
+
+    // Save lambdas
+    let lambdas = vec![0.1, 0.2, 0.3];
+    storage
+        .save_lambdas(&lambdas, &storage.metadata_path())
+        .await
+        .expect("Failed to save lambdas");
+
+    // Step 3: Now spawn from the existing directory
+    let (spawned_storage, spawned_metadata) = LanceStorage::spawn(base_path.clone())
+        .await
+        .expect("Failed to spawn LanceStorage");
+
+    // Assertions: Verify spawned storage matches original
+    assert_eq!(spawned_storage.get_base(), base_path);
+    assert_eq!(spawned_storage.get_name(), name_id);
+    assert_eq!(spawned_metadata.name_id, name_id);
+    assert_eq!(spawned_metadata.nrows, 100);
+    assert_eq!(spawned_metadata.ncols, 50);
+
+    // Verify we can load the saved data using spawned storage
+    let loaded_matrix = spawned_storage
+        .load_dense("rawinput")
+        .await
+        .expect("Failed to load dense matrix");
+
+    assert_eq!(loaded_matrix.shape(), (2, 3));
+
+    let loaded_lambdas = spawned_storage
+        .load_lambdas()
+        .await
+        .expect("Failed to load lambdas");
+
+    assert_eq!(loaded_lambdas, lambdas);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 #[should_panic(expected = "Metadata does not exist in this base path")]
 async fn test_lance_storage_spawn_missing_metadata() {
     // Setup: Create a temporary directory without metadata
