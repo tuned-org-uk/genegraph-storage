@@ -85,7 +85,7 @@ pub struct GeneMetadata {
 impl GeneMetadata {
     /// Empty metadata object
     /// do not use in test, use seed_metadata_eigen instead
-    fn new(name_id: &str) -> Self {
+    pub fn new(name_id: &str) -> Self {
         info!("GeneMetadata::new: creating metadata for '{}'", name_id);
         Self {
             name_id: name_id.to_string(),

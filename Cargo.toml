@@ -1,6 +1,6 @@
 [package]
 name = "genegraph-storage"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 description = "vector database: base Lance storage"
 authors = ["Lorenzo <tunedconsulting@gmail.com>"]
