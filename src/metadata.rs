@@ -26,7 +26,7 @@ pub struct FileInfo {
 
 impl FileInfo {
     /// Create a file spec to add to the persistence directory
-    pub(crate) fn new(
+    pub fn new(
         filename: String,
         filetype: &str,
         data_shape: (usize, usize),

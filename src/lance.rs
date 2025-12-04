@@ -951,7 +951,6 @@ impl StorageBackend for LanceStorage {
     /// Save dense matrix to file in columnar format (col_0, col_1, ..., col_N)
     ///
     /// Async test helper that avoids any internal blocking runtimes.
-    #[cfg(test)]
     async fn save_dense_to_file(data: &DenseMatrix<f64>, path: &PathBuf) -> StorageResult<()> {
         use tokio::fs as tokio_fs;
 
