@@ -195,5 +195,5 @@ pub trait StorageBackend: Send + Sync {
 
     async fn load_vector(&self, key: &str) -> StorageResult<Vec<f64>>;
 
-    async fn save_dense_to_file(data: &DenseMatrix<f64>, path: &PathBuf) -> StorageResult<()>;
+    async fn save_dense_to_file(data: &DenseMatrix<f64>, path: &Path) -> StorageResult<()>;
 }
