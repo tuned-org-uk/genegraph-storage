@@ -142,7 +142,7 @@ pub trait StorageBackend: Send + Sync {
         if !md_path.exists() {
             return Err(StorageError::Invalid(format!(
                 "Storage not initialized: metadata file missing at {:?}. \
-Call save_metadata() or save_eigenmaps_all()/save_energymaps_all() first.",
+                 Call save_metadata() or save_eigenmaps_all()/save_energymaps_all() first.",
                 md_path
             )));
         }
@@ -485,7 +485,15 @@ Call save_metadata() or save_eigenmaps_all()/save_energymaps_all() first.",
     async fn load_lambdas(&self) -> StorageResult<Vec<f64>>;
 
     /// Initializes storage by saving metadata. Must be called first.
-    async fn save_metadata(&self, metadata: &GeneMetadata) -> StorageResult<PathBuf>;
+    async fn save_metadata(&self, metadata: &GeneMetadata) -> StorageResult<PathBuf> {
+        let path = self.metadata_path();
+        info!("Saving metadata to {:?}", path);
+        fs::create_dir_all(self.base_path()).map_err(|e| StorageError::Io(e.to_string()))?;
+        let s = serde_json::to_string_pretty(metadata).map_err(StorageError::Serde)?;
+        fs::write(&path, s).map_err(|e| StorageError::Io(e.to_string()))?;
+        info!("Metadata saved successfully");
+        Ok(path)
+    }
 
     /// Loads metadata from storage.
     async fn load_metadata(&self) -> StorageResult<GeneMetadata> {

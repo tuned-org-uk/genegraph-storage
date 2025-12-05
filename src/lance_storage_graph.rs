@@ -4,7 +4,6 @@
 //! - All I/O is async, no internal `block_on` or runtime creation.
 //! - Callers (CLI, tests, services) are responsible for providing a Tokio runtime.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -446,25 +445,6 @@ impl StorageBackend for LanceStorageGraph {
         let lambdas: Vec<f64> = (0..arr.len()).map(|i| arr.value(i)).collect();
         info!("Loaded {} lambda values", lambdas.len());
         Ok(lambdas)
-    }
-
-    async fn save_metadata(&self, metadata: &GeneMetadata) -> StorageResult<PathBuf> {
-        let path = self.metadata_path();
-        info!("Saving metadata to {:?}", path);
-        fs::create_dir_all(self.base_path()).map_err(|e| StorageError::Io(e.to_string()))?;
-        let s = serde_json::to_string_pretty(metadata).map_err(StorageError::Serde)?;
-        fs::write(&path, s).map_err(|e| StorageError::Io(e.to_string()))?;
-        info!("Metadata saved successfully");
-        Ok(path)
-    }
-
-    async fn load_metadata(&self) -> StorageResult<GeneMetadata> {
-        let filename = self.metadata_path();
-        info!("Loading metadata from {:?}", filename);
-        let s = fs::read_to_string(filename).map_err(|e| StorageError::Io(e.to_string()))?;
-        let md: GeneMetadata = serde_json::from_str(&s).map_err(StorageError::Serde)?;
-        info!("Metadata loaded successfully");
-        Ok(md)
     }
 
     async fn save_vector(&self, key: &str, vector: &[f64], md_path: &Path) -> StorageResult<()> {

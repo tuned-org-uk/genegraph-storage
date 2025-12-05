@@ -74,8 +74,11 @@ let md_path = storage.save_metadata(&md).await.unwrap();
 let loaded = storage.load_dense("rawinput").await.unwrap();
 ```
 
-## Extension
-Traits in `traits` module can be reused to implement other formats. Other formats can use `StorageBackend` to implement similar child-traits alike to `LanceStorage`.
+## Extending and traits
+
+Every custom definition of a Lance database (store or manifold or data-cube) should implement the `Metadata` trait (or reuse `GeneMetadata`) and the `StorageBackend` trait like `LanceStorageGraph` does with `GeneMetadata` and `LanceStorage`. 
+
+Traits in `traits` module can also be reused to implement other formats. Other formats can use `StorageBackend` to implement similar child-traits alike to `LanceStorage`. Then if matched with a custom `Metadata` instance can make a database, so every database is simply a `StorageBackend + Metadata`.
 
 ## Contributing
 See `.github/` directory.
