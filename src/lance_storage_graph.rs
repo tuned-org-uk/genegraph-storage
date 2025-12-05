@@ -199,7 +199,7 @@ impl StorageBackend for LanceStorageGraph {
                 let tmp_storage = Self::new(parent, String::from("tmp_storage"));
 
                 // Reuse the async Lance reader logic.
-                let uri = Self::path_to_uri(&path);
+                let uri = Self::path_to_uri(path);
                 let batch = tmp_storage.read_lance_all_batches_async(uri).await?;
                 let matrix = tmp_storage.from_dense_record_batch(&batch)?;
                 info!(
@@ -559,7 +559,7 @@ impl StorageBackend for LanceStorageGraph {
                     )));
                 }
 
-                let uri = Self::path_to_uri(&path);
+                let uri = Self::path_to_uri(path);
                 tmp_storage.write_lance_batch_async(uri, batch).await?;
                 info!("Saved dense matrix to Lance: {} x {}", n_rows, n_cols);
                 Ok(())
