@@ -28,14 +28,14 @@ jobs:
           version: "25.x"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Cache .cargo and target
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo
-            ./target
-          key: ${{ runner.os }}-cargo-${{ matrix.platform.target }}-${{ hashFiles('**/Cargo.toml') }}
-          restore-keys: ${{ runner.os }}-cargo-${{ matrix.platform.target }}
+      # - name: Cache .cargo and target
+      #   uses: actions/cache@v4
+      #   with:
+      #     path: |
+      #       ~/.cargo
+      #       ./target
+      #     key: ${{ runner.os }}-cargo-${{ matrix.platform.target }}-${{ hashFiles('**/Cargo.toml') }}
+      #     restore-keys: ${{ runner.os }}-cargo-${{ matrix.platform.target }}
 
       - name: Install Rust toolchain
         uses: actions-rs/toolchain@v1
