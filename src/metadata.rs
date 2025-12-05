@@ -7,7 +7,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use crate::StorageError;
-use crate::traits::StorageBackend;
+use crate::traits::{Metadata, StorageBackend};
 
 /// Represent a single file spec in the persistence directory
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,9 +83,20 @@ pub struct GeneMetadata {
 }
 
 impl GeneMetadata {
+    /// Read metadata file from JSON
+    pub async fn read(path: PathBuf) -> Result<Self, StorageError> {
+        info!("Reading metadata from {:?}", path);
+        let s = fs::read_to_string(path).map_err(|e| StorageError::Io(e.to_string()))?;
+        let md: GeneMetadata = serde_json::from_str(&s).map_err(StorageError::Serde)?;
+        info!("Metadata read successfully");
+        Ok(md)
+    }
+}
+
+impl Metadata for GeneMetadata {
     /// Empty metadata object
     /// do not use in test, use seed_metadata_eigen instead
-    pub fn new(name_id: &str) -> Self {
+    fn new(name_id: &str) -> Self {
         info!("GeneMetadata::new: creating metadata for '{}'", name_id);
         Self {
             name_id: name_id.to_string(),
@@ -97,7 +108,7 @@ impl GeneMetadata {
         }
     }
 
-    pub fn new_fileinfo(
+    fn new_fileinfo(
         &self,
         key: &str,
         filetype: &str,
@@ -114,17 +125,8 @@ impl GeneMetadata {
         )
     }
 
-    /// Read metadata file from JSON
-    pub async fn read(path: PathBuf) -> Result<Self, StorageError> {
-        info!("Reading metadata from {:?}", path);
-        let s = fs::read_to_string(path).map_err(|e| StorageError::Io(e.to_string()))?;
-        let md: GeneMetadata = serde_json::from_str(&s).map_err(StorageError::Serde)?;
-        info!("Metadata read successfully");
-        Ok(md)
-    }
-
     /// Standard pipeline object
-    pub async fn seed_metadata<B: StorageBackend>(
+    async fn seed_metadata<B: StorageBackend>(
         name_id: &str,
         nitems: usize,
         nfeatures: usize,
@@ -167,12 +169,12 @@ impl GeneMetadata {
         Ok(md)
     }
 
-    pub fn with_base(mut self, base_path: PathBuf) -> Self {
+    fn with_base(mut self, base_path: PathBuf) -> Self {
         self.base = base_path.to_string_lossy().to_string();
         self
     }
 
-    pub fn with_dimensions(mut self, rows: usize, cols: usize) -> Self {
+    fn with_dimensions(mut self, rows: usize, cols: usize) -> Self {
         debug!(
             "GeneMetadata::with_dimensions: setting dimensions to {}x{}",
             rows, cols
@@ -182,7 +184,7 @@ impl GeneMetadata {
         self
     }
 
-    pub fn add_file(mut self, key: &str, info: FileInfo) -> Self {
+    fn add_file(mut self, key: &str, info: FileInfo) -> Self {
         debug!(
             "GeneMetadata::add_file: adding file '{}' ({})",
             key, info.filename

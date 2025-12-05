@@ -2,6 +2,7 @@ use crate::lance::LanceStorage;
 use crate::metadata::FileInfo;
 use crate::metadata::GeneMetadata;
 use crate::tests::tmp_dir;
+use crate::traits::Metadata;
 use crate::traits::StorageBackend;
 
 use log::debug;

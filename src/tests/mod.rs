@@ -1,5 +1,6 @@
 mod test_data;
 mod test_lance_layer;
+mod test_metadata;
 
 use std::fs;
 use std::path::PathBuf;

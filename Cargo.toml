@@ -1,6 +1,6 @@
 [package]
 name = "genegraph-storage"
-version = "0.1.4"
+version = "0.2.0"
 edition = "2024"
 description = "vector database: base Lance storage"
 authors = ["Lorenzo <tunedconsulting@gmail.com>"]
@@ -31,7 +31,7 @@ sprs = "0.11.4"
 log = "0.4.28"
 env_logger = "0.11.8"
 chrono = "0.4.42"
-uuid = { version = "1.18.1", features = ["v4", "serde"] }
+uuid = { version = "1.19.0", features = ["v4", "serde"] }
 lance = { version = " 0.39.0"}
 serde = { version = "^1.0.228", features = ["derive"] }
 serde_json = { version = "^1.0.145"}

@@ -1,7 +1,15 @@
-use log::debug;
+use arrow::array::{Float64Array, Int64Array, UInt32Array};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow_array::{Array as ArrowArray, FixedSizeListArray, RecordBatch, RecordBatchIterator};
+use futures::StreamExt;
+use lance::dataset::{Dataset, WriteMode, WriteParams};
+use log::{debug, info, trace};
+use smartcore::linalg::basic::arrays::Array;
 use smartcore::linalg::basic::matrix::DenseMatrix;
-use sprs::CsMat;
+use sprs::{CsMat, TriMat};
+use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::StorageResult;
 use crate::metadata::GeneMetadata;
@@ -110,9 +118,329 @@ pub trait StorageBackend: Send + Sync {
     /// Compute the full Lance/parquet file path for a logical filetype.
     fn file_path(&self, key: &str) -> PathBuf;
 
+    /// Validates that the storage directory is properly initialized with metadata.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` if metadata file exists, otherwise returns an error.
+    fn validate_initialized(&self, md_path: &Path) -> StorageResult<()> {
+        assert_eq!(self.metadata_path(), *md_path);
+        if !md_path.exists() {
+            return Err(StorageError::Invalid(format!(
+                "Storage not initialized: metadata file missing at {:?}. \
+Call save_metadata() or save_eigenmaps_all()/save_energymaps_all() first.",
+                md_path
+            )));
+        }
+        Ok(())
+    }
+
     // =========
     // ASYNC API
     // =========
+
+    /// Converts a dense matrix to a RecordBatch in vector format (Lance-optimized).
+    /// Each row of the matrix becomes a single FixedSizeList entry.
+    ///
+    /// Arguments:
+    /// * matrix - Dense matrix to convert (N rows × F cols)
+    ///
+    /// Returns:
+    /// RecordBatch with schema: { vector: FixedSizeList<Float64>[F] }
+    fn to_dense_record_batch(
+        &self,
+        matrix: &DenseMatrix<f64>,
+    ) -> Result<RecordBatch, StorageError> {
+        let (rows, cols) = (matrix.shape().0, matrix.shape().1);
+
+        debug!(
+            "Converting dense matrix to RecordBatch (vector format): {}x{}",
+            rows, cols
+        );
+
+        if rows == 0 || cols == 0 {
+            return Err(StorageError::Invalid(
+                "Cannot convert empty matrix to RecordBatch".to_string(),
+            ));
+        }
+
+        // Flatten matrix row-by-row into a single Vec<f64>
+        let mut values: Vec<f64> = Vec::with_capacity(rows * cols);
+        for r in 0..rows {
+            for c in 0..cols {
+                values.push(*matrix.get((r, c)));
+            }
+        }
+
+        // Create FixedSizeList field: each entry is a vector of length cols
+        let value_field = Field::new("item", DataType::Float64, false);
+        let list_field = Field::new(
+            "vector",
+            DataType::FixedSizeList(Arc::new(value_field), cols as i32),
+            false,
+        );
+
+        let schema = Schema::new(vec![list_field]);
+
+        // Build the FixedSizeList array
+        let values_array = Float64Array::from(values);
+        let list_array = FixedSizeListArray::new(
+            Arc::new(Field::new("item", DataType::Float64, false)),
+            cols as i32,
+            Arc::new(values_array),
+            None, // No nulls
+        );
+
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(list_array)])
+            .map_err(|e| StorageError::Lance(e.to_string()))?;
+
+        trace!(
+            "RecordBatch created with {} rows (vectors of length {})",
+            batch.num_rows(),
+            cols
+        );
+
+        Ok(batch)
+    }
+
+    /// Reconstructs a dense matrix from a RecordBatch in vector format.
+    ///
+    /// Arguments:
+    /// * batch - RecordBatch containing FixedSizeList<Float64> vectors
+    ///
+    /// Returns:
+    /// DenseMatrix in column-major format (smartcore convention)
+    #[allow(clippy::wrong_self_convention)]
+    fn from_dense_record_batch(
+        &self,
+        batch: &RecordBatch,
+    ) -> Result<DenseMatrix<f64>, StorageError> {
+        use std::mem;
+
+        debug!("Reconstructing dense matrix from RecordBatch (vector format)");
+        debug!("Batch has {} columns", batch.num_columns());
+
+        if batch.num_columns() != 1 {
+            return Err(StorageError::Invalid(format!(
+                "Expected Lance row-major format with 1 FixedSizeList<Float64> column, but found {} columns. \
+                  This parquet file appears to be in wide format (feature-per-column). \
+                  Convert it first using: \
+                  `python -c \"import pyarrow.parquet as pq; import pyarrow.compute as pc; \
+                  tbl = pq.read_table('input.parquet'); \
+                  import pyarrow as pa; \
+                  vectors = pa.array([row.as_py() for row in tbl.to_pylist()], type=pa.list_(pa.float64(), len(tbl.column_names))); \
+                  new_tbl = pa.table({{'vector': vectors}}); \
+                  pq.write_table(new_tbl, 'output.parquet')\"` \
+                  or use a Lance-native writer in your data pipeline.",
+                batch.num_columns()
+            )));
+        }
+
+        debug!("Extracting FixedSizeList column");
+        let column = batch.column(0);
+        let list_array = column
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .ok_or_else(|| {
+                StorageError::Invalid(format!(
+                    "Column 0 is not FixedSizeList (found type: {:?}). \
+                      Expected Lance row-major format with a single FixedSizeList<Float64> column.",
+                    column.data_type()
+                ))
+            })?;
+
+        let rows = list_array.len();
+        let cols = list_array.value_length() as usize;
+
+        debug!("Matrix dimensions: {}x{}", rows, cols);
+
+        // Guard against excessive allocations
+        let total = rows
+            .checked_mul(cols)
+            .ok_or_else(|| StorageError::Invalid("Matrix size overflow (rows*cols)".to_string()))?;
+        let bytes = total
+            .checked_mul(mem::size_of::<f64>())
+            .ok_or_else(|| StorageError::Invalid("Byte size overflow".to_string()))?;
+
+        const MAX_BYTES: usize = 4usize * 1024 * 1024 * 1024; // 4 GiB
+        if bytes > MAX_BYTES {
+            return Err(StorageError::Invalid(format!(
+                "Dense load would allocate {} bytes for {}x{} matrix; exceeds 4GiB cap. \
+                  Enable --reduce-dim or shard your input data.",
+                bytes, rows, cols
+            )));
+        }
+
+        // Extract Float64 values
+        let values_array = list_array
+            .values()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .ok_or_else(|| {
+                StorageError::Invalid("FixedSizeList values are not Float64Array".to_string())
+            })?;
+
+        debug!("Converting row-major to column-major");
+        let mut data = vec![0.0f64; total];
+        for r in 0..rows {
+            for c in 0..cols {
+                let row_major_idx = r * cols + c;
+                let col_major_idx = c * rows + r;
+                data[col_major_idx] = values_array.value(row_major_idx);
+            }
+        }
+
+        debug!("Creating DenseMatrix");
+        DenseMatrix::new(rows, cols, data, true).map_err(|e| StorageError::Invalid(e.to_string()))
+    }
+
+    /// Converts a sparse CSR matrix to a RecordBatch in columnar format.
+    ///
+    /// Only non-zero entries are stored.
+    fn to_sparse_record_batch(&self, m: &CsMat<f64>) -> StorageResult<RecordBatch> {
+        debug!(
+            "Converting sparse matrix to RecordBatch: {} x {}, nnz={}",
+            m.rows(),
+            m.cols(),
+            m.nnz()
+        );
+
+        let mut row_idx = Vec::with_capacity(m.nnz());
+        let mut col_idx = Vec::with_capacity(m.nnz());
+        let mut vals = Vec::with_capacity(m.nnz());
+
+        for (v, (r, c)) in m.iter() {
+            row_idx.push(r as u32);
+            col_idx.push(c as u32);
+            vals.push(*v);
+        }
+
+        // Store actual dimensions in schema metadata
+        let mut schema_metadata = std::collections::HashMap::new();
+        schema_metadata.insert("rows".to_string(), m.rows().to_string());
+        schema_metadata.insert("cols".to_string(), m.cols().to_string());
+        schema_metadata.insert("nnz".to_string(), m.nnz().to_string());
+
+        let schema = Schema::new(vec![
+            Field::new("row", DataType::UInt32, false),
+            Field::new("col", DataType::UInt32, false),
+            Field::new("value", DataType::Float64, false),
+        ])
+        .with_metadata(schema_metadata);
+
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(UInt32Array::from(row_idx)) as _,
+                Arc::new(UInt32Array::from(col_idx)) as _,
+                Arc::new(Float64Array::from(vals)) as _,
+            ],
+        )
+        .map_err(|e| StorageError::Lance(e.to_string()))?;
+
+        trace!(
+            "Sparse RecordBatch created with {} entries",
+            batch.num_rows()
+        );
+        Ok(batch)
+    }
+
+    /// Reconstructs a sparse CSR matrix from a RecordBatch in columnar format.
+    ///
+    /// * `batch` - RecordBatch containing (`row`, `col`, `value`) triplets
+    /// * `expected_rows` / `expected_cols` - dimensions taken from metadata
+    #[allow(clippy::wrong_self_convention)]
+    fn from_sparse_record_batch(
+        &self,
+        batch: RecordBatch,
+        expected_rows: usize,
+        expected_cols: usize,
+    ) -> StorageResult<CsMat<f64>> {
+        use arrow::array::UInt32Array;
+
+        debug!("Reconstructing sparse matrix from RecordBatch");
+
+        let row_arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .ok_or_else(|| StorageError::Invalid("row column type mismatch".into()))?;
+        let col_arr = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .ok_or_else(|| StorageError::Invalid("col column type mismatch".into()))?;
+        let val_arr = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .ok_or_else(|| StorageError::Invalid("value column type mismatch".into()))?;
+
+        let n = row_arr.len();
+        if n == 0 {
+            debug!(
+                "Empty RecordBatch, returning {}x{} sparse matrix",
+                expected_rows, expected_cols
+            );
+            return Ok(CsMat::zero((expected_rows, expected_cols)));
+        }
+
+        // Try to read dimensions from schema metadata (for validation)
+        let schema = batch.schema();
+        let schema_metadata = schema.metadata();
+        if let (Some(rows_str), Some(cols_str)) =
+            (schema_metadata.get("rows"), schema_metadata.get("cols"))
+        {
+            let schema_rows = rows_str.parse::<usize>().ok();
+            let schema_cols = cols_str.parse::<usize>().ok();
+            if schema_rows != Some(expected_rows) || schema_cols != Some(expected_cols) {
+                panic!(
+                    "Schema metadata dimensions ({:?}x{:?}) don't match storage metadata ({}x{})",
+                    schema_rows, schema_cols, expected_rows, expected_cols
+                );
+            } else {
+                debug!(
+                    "Schema metadata matches storage metadata: {}x{}",
+                    expected_rows, expected_cols
+                );
+            }
+        }
+
+        let rows = expected_rows;
+        let cols = expected_cols;
+        debug!(
+            "Reconstructing {}x{} sparse matrix from {} entries",
+            rows, cols, n
+        );
+
+        let mut trimat = TriMat::new((rows, cols));
+        for i in 0..n {
+            let r = row_arr.value(i) as usize;
+            let c = col_arr.value(i) as usize;
+            let v = val_arr.value(i);
+
+            if r >= rows || c >= cols {
+                return Err(StorageError::Invalid(format!(
+                    "Index out of bounds: ({}, {}) in {}x{} matrix",
+                    r, c, rows, cols
+                )));
+            }
+            trimat.add_triplet(r, c, v);
+        }
+
+        let result = trimat.to_csr();
+        if result.rows() != rows || result.cols() != cols {
+            return Err(StorageError::Invalid(format!(
+                "Dimension mismatch after reconstruction: expected {}x{}, got {}x{}",
+                rows,
+                cols,
+                result.rows(),
+                result.cols()
+            )));
+        }
+
+        Ok(result)
+    }
 
     /// Saves a dense matrix. Requires metadata to exist.
     async fn save_dense(
@@ -146,7 +474,14 @@ pub trait StorageBackend: Send + Sync {
     async fn save_metadata(&self, metadata: &GeneMetadata) -> StorageResult<PathBuf>;
 
     /// Loads metadata from storage.
-    async fn load_metadata(&self) -> StorageResult<GeneMetadata>;
+    async fn load_metadata(&self) -> StorageResult<GeneMetadata> {
+        let filename = self.metadata_path();
+        info!("Loading metadata from {:?}", filename);
+        let s = fs::read_to_string(filename).map_err(|e| StorageError::Io(e.to_string()))?;
+        let md: GeneMetadata = serde_json::from_str(&s).map_err(StorageError::Serde)?;
+        info!("Metadata loaded successfully");
+        Ok(md)
+    }
 
     /// Save vectors that are not lambdas but indices.
     #[allow(dead_code)]
@@ -196,4 +531,38 @@ pub trait StorageBackend: Send + Sync {
     async fn load_vector(&self, key: &str) -> StorageResult<Vec<f64>>;
 
     async fn save_dense_to_file(data: &DenseMatrix<f64>, path: &Path) -> StorageResult<()>;
+}
+
+use crate::StorageError;
+use crate::metadata::FileInfo;
+
+/// A trait to create metadata structures.
+/// Instantiate structures with this trait, like for `GeneMetaData`
+pub trait Metadata {
+    /// constructor
+    fn new(name_id: &str) -> Self;
+    /// instantiate a new file info instance for this Metadata type
+    fn new_fileinfo(
+        &self,
+        key: &str,
+        filetype: &str,
+        data_shape: (usize, usize),
+        nnz: Option<usize>,
+        size_bytes: Option<u64>,
+    ) -> FileInfo;
+
+    /// Standard pipeline object
+    async fn seed_metadata<B: StorageBackend>(
+        name_id: &str,
+        nitems: usize,
+        nfeatures: usize,
+        storage: &B,
+    ) -> Result<GeneMetadata, StorageError>;
+
+    /// add a file to the metadata files
+    fn add_file(self, key: &str, info: FileInfo) -> Self;
+
+    // constructor helpers
+    fn with_base(self, base_path: PathBuf) -> Self;
+    fn with_dimensions(self, rows: usize, cols: usize) -> Self;
 }
