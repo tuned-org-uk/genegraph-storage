@@ -4,23 +4,22 @@
 //! - All I/O is async, no internal `block_on` or runtime creation.
 //! - Callers (CLI, tests, services) are responsible for providing a Tokio runtime.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow::array::{Float64Array, Int64Array, UInt32Array};
 use arrow::datatypes::{DataType, Field, Schema};
-use arrow_array::{Array as ArrowArray, FixedSizeListArray, RecordBatch, RecordBatchIterator};
-use futures::StreamExt;
-use lance::dataset::{Dataset, WriteMode, WriteParams};
-use log::{debug, info, trace};
+use arrow_array::{Array as ArrowArray, RecordBatch};
+use log::{debug, info};
 use smartcore::linalg::basic::arrays::Array;
 use smartcore::linalg::basic::matrix::DenseMatrix;
-use sprs::{CsMat, TriMat};
+use sprs::CsMat;
 
 use crate::metadata::FileInfo;
 use crate::metadata::GeneMetadata;
-use crate::traits::StorageBackend;
+use crate::traits::backend::StorageBackend;
+use crate::traits::lance::LanceStorage;
+use crate::traits::metadata::Metadata;
 use crate::{StorageError, StorageResult};
 
 /// Lance-based storage backend for ArrowSpace graph embeddings.
@@ -29,12 +28,12 @@ use crate::{StorageError, StorageResult};
 /// (`row`, `col`, `value` for sparse; `col_*` for dense) schema for efficient
 /// random and columnar access.
 #[derive(Debug, Clone)]
-pub struct LanceStorage {
+pub struct LanceStorageGraph {
     pub(crate) _base: String,
     pub(crate) _name: String,
 }
 
-impl LanceStorage {
+impl LanceStorageGraph {
     /// Creates a new Lance storage backend.
     ///
     /// This is used for on-the-fly creation. For proper setup use `Genefold<...>::seed`.
@@ -48,182 +47,10 @@ impl LanceStorage {
         Self { _base, _name }
     }
 
-    /// Validates that the storage directory is properly initialized with metadata.
-    ///
-    /// # Returns
-    ///
-    /// Returns `Ok(())` if metadata file exists, otherwise returns an error.
-    fn validate_initialized(&self, md_path: &Path) -> StorageResult<()> {
-        assert_eq!(self.metadata_path(), *md_path);
-        if !md_path.exists() {
-            return Err(StorageError::Invalid(format!(
-                "Storage not initialized: metadata file missing at {:?}. \
-Call save_metadata() or save_eigenmaps_all()/save_energymaps_all() first.",
-                md_path
-            )));
-        }
-        Ok(())
-    }
-
-    /// Converts a dense matrix to a RecordBatch in vector format (Lance-optimized).
-    /// Each row of the matrix becomes a single FixedSizeList entry.
-    ///
-    /// Arguments:
-    /// * matrix - Dense matrix to convert (N rows × F cols)
-    ///
-    /// Returns:
-    /// RecordBatch with schema: { vector: FixedSizeList<Float64>[F] }
-    fn to_dense_record_batch(
-        &self,
-        matrix: &DenseMatrix<f64>,
-    ) -> Result<RecordBatch, StorageError> {
-        let (rows, cols) = (matrix.shape().0, matrix.shape().1);
-
-        debug!(
-            "Converting dense matrix to RecordBatch (vector format): {}x{}",
-            rows, cols
-        );
-
-        if rows == 0 || cols == 0 {
-            return Err(StorageError::Invalid(
-                "Cannot convert empty matrix to RecordBatch".to_string(),
-            ));
-        }
-
-        // Flatten matrix row-by-row into a single Vec<f64>
-        let mut values: Vec<f64> = Vec::with_capacity(rows * cols);
-        for r in 0..rows {
-            for c in 0..cols {
-                values.push(*matrix.get((r, c)));
-            }
-        }
-
-        // Create FixedSizeList field: each entry is a vector of length cols
-        let value_field = Field::new("item", DataType::Float64, false);
-        let list_field = Field::new(
-            "vector",
-            DataType::FixedSizeList(Arc::new(value_field), cols as i32),
-            false,
-        );
-
-        let schema = Schema::new(vec![list_field]);
-
-        // Build the FixedSizeList array
-        let values_array = Float64Array::from(values);
-        let list_array = FixedSizeListArray::new(
-            Arc::new(Field::new("item", DataType::Float64, false)),
-            cols as i32,
-            Arc::new(values_array),
-            None, // No nulls
-        );
-
-        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(list_array)])
-            .map_err(|e| StorageError::Lance(e.to_string()))?;
-
-        trace!(
-            "RecordBatch created with {} rows (vectors of length {})",
-            batch.num_rows(),
-            cols
-        );
-
-        Ok(batch)
-    }
-
-    /// Reconstructs a dense matrix from a RecordBatch in vector format.
-    ///
-    /// Arguments:
-    /// * batch - RecordBatch containing FixedSizeList<Float64> vectors
-    ///
-    /// Returns:
-    /// DenseMatrix in column-major format (smartcore convention)
-    #[allow(clippy::wrong_self_convention)]
-    fn from_dense_record_batch(
-        &self,
-        batch: &RecordBatch,
-    ) -> Result<DenseMatrix<f64>, StorageError> {
-        use std::mem;
-
-        debug!("Reconstructing dense matrix from RecordBatch (vector format)");
-        debug!("Batch has {} columns", batch.num_columns());
-
-        if batch.num_columns() != 1 {
-            return Err(StorageError::Invalid(format!(
-                "Expected Lance row-major format with 1 FixedSizeList<Float64> column, but found {} columns. \
-                  This parquet file appears to be in wide format (feature-per-column). \
-                  Convert it first using: \
-                  `python -c \"import pyarrow.parquet as pq; import pyarrow.compute as pc; \
-                  tbl = pq.read_table('input.parquet'); \
-                  import pyarrow as pa; \
-                  vectors = pa.array([row.as_py() for row in tbl.to_pylist()], type=pa.list_(pa.float64(), len(tbl.column_names))); \
-                  new_tbl = pa.table({{'vector': vectors}}); \
-                  pq.write_table(new_tbl, 'output.parquet')\"` \
-                  or use a Lance-native writer in your data pipeline.",
-                batch.num_columns()
-            )));
-        }
-
-        debug!("Extracting FixedSizeList column");
-        let column = batch.column(0);
-        let list_array = column
-            .as_any()
-            .downcast_ref::<FixedSizeListArray>()
-            .ok_or_else(|| {
-                StorageError::Invalid(format!(
-                    "Column 0 is not FixedSizeList (found type: {:?}). \
-                      Expected Lance row-major format with a single FixedSizeList<Float64> column.",
-                    column.data_type()
-                ))
-            })?;
-
-        let rows = list_array.len();
-        let cols = list_array.value_length() as usize;
-
-        debug!("Matrix dimensions: {}x{}", rows, cols);
-
-        // Guard against excessive allocations
-        let total = rows
-            .checked_mul(cols)
-            .ok_or_else(|| StorageError::Invalid("Matrix size overflow (rows*cols)".to_string()))?;
-        let bytes = total
-            .checked_mul(mem::size_of::<f64>())
-            .ok_or_else(|| StorageError::Invalid("Byte size overflow".to_string()))?;
-
-        const MAX_BYTES: usize = 4usize * 1024 * 1024 * 1024; // 4 GiB
-        if bytes > MAX_BYTES {
-            return Err(StorageError::Invalid(format!(
-                "Dense load would allocate {} bytes for {}x{} matrix; exceeds 4GiB cap. \
-                  Enable --reduce-dim or shard your input data.",
-                bytes, rows, cols
-            )));
-        }
-
-        // Extract Float64 values
-        let values_array = list_array
-            .values()
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .ok_or_else(|| {
-                StorageError::Invalid("FixedSizeList values are not Float64Array".to_string())
-            })?;
-
-        debug!("Converting row-major to column-major");
-        let mut data = vec![0.0f64; total];
-        for r in 0..rows {
-            for c in 0..cols {
-                let row_major_idx = r * cols + c;
-                let col_major_idx = c * rows + r;
-                data[col_major_idx] = values_array.value(row_major_idx);
-            }
-        }
-
-        debug!("Creating DenseMatrix");
-        DenseMatrix::new(rows, cols, data, true).map_err(|e| StorageError::Invalid(e.to_string()))
-    }
-
     /// Spawn a LanceStorage from an existing seeded directory (with metadata.json)
-    pub async fn spawn(base_path: String) -> Result<(LanceStorage, GeneMetadata), StorageError> {
+    pub async fn spawn(base_path: String) -> Result<(Self, GeneMetadata), StorageError> {
         // Reuse the generic `exists` helper from the StorageBackend trait
-        let (exists, md_path) = <LanceStorage as StorageBackend>::exists(&base_path);
+        let (exists, md_path) = <Self as StorageBackend>::exists(&base_path);
         assert!(
             exists && md_path.is_some(),
             "Metadata does not exist in this base path"
@@ -233,247 +60,15 @@ Call save_metadata() or save_eigenmaps_all()/save_energymaps_all() first.",
         let metadata = GeneMetadata::read(md_path.unwrap()).await?;
 
         // Construct the LanceStorage using the metadata-provided nameid
-        let storage = LanceStorage::new(base_path.clone(), metadata.name_id.clone());
+        let storage = Self::new(base_path.clone(), metadata.name_id.clone());
 
         Ok((storage, metadata))
     }
-
-    /// Converts a sparse CSR matrix to a RecordBatch in columnar format.
-    ///
-    /// Only non-zero entries are stored.
-    fn to_sparse_record_batch(&self, m: &CsMat<f64>) -> StorageResult<RecordBatch> {
-        debug!(
-            "Converting sparse matrix to RecordBatch: {} x {}, nnz={}",
-            m.rows(),
-            m.cols(),
-            m.nnz()
-        );
-
-        let mut row_idx = Vec::with_capacity(m.nnz());
-        let mut col_idx = Vec::with_capacity(m.nnz());
-        let mut vals = Vec::with_capacity(m.nnz());
-
-        for (v, (r, c)) in m.iter() {
-            row_idx.push(r as u32);
-            col_idx.push(c as u32);
-            vals.push(*v);
-        }
-
-        // Store actual dimensions in schema metadata
-        let mut schema_metadata = std::collections::HashMap::new();
-        schema_metadata.insert("rows".to_string(), m.rows().to_string());
-        schema_metadata.insert("cols".to_string(), m.cols().to_string());
-        schema_metadata.insert("nnz".to_string(), m.nnz().to_string());
-
-        let schema = Schema::new(vec![
-            Field::new("row", DataType::UInt32, false),
-            Field::new("col", DataType::UInt32, false),
-            Field::new("value", DataType::Float64, false),
-        ])
-        .with_metadata(schema_metadata);
-
-        let batch = RecordBatch::try_new(
-            Arc::new(schema),
-            vec![
-                Arc::new(UInt32Array::from(row_idx)) as _,
-                Arc::new(UInt32Array::from(col_idx)) as _,
-                Arc::new(Float64Array::from(vals)) as _,
-            ],
-        )
-        .map_err(|e| StorageError::Lance(e.to_string()))?;
-
-        trace!(
-            "Sparse RecordBatch created with {} entries",
-            batch.num_rows()
-        );
-        Ok(batch)
-    }
-
-    /// Reconstructs a sparse CSR matrix from a RecordBatch in columnar format.
-    ///
-    /// * `batch` - RecordBatch containing (`row`, `col`, `value`) triplets
-    /// * `expected_rows` / `expected_cols` - dimensions taken from metadata
-    #[allow(clippy::wrong_self_convention)]
-    fn from_sparse_record_batch(
-        &self,
-        batch: RecordBatch,
-        expected_rows: usize,
-        expected_cols: usize,
-    ) -> StorageResult<CsMat<f64>> {
-        use arrow::array::UInt32Array;
-
-        debug!("Reconstructing sparse matrix from RecordBatch");
-
-        let row_arr = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<UInt32Array>()
-            .ok_or_else(|| StorageError::Invalid("row column type mismatch".into()))?;
-        let col_arr = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<UInt32Array>()
-            .ok_or_else(|| StorageError::Invalid("col column type mismatch".into()))?;
-        let val_arr = batch
-            .column(2)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .ok_or_else(|| StorageError::Invalid("value column type mismatch".into()))?;
-
-        let n = row_arr.len();
-        if n == 0 {
-            debug!(
-                "Empty RecordBatch, returning {}x{} sparse matrix",
-                expected_rows, expected_cols
-            );
-            return Ok(CsMat::zero((expected_rows, expected_cols)));
-        }
-
-        // Try to read dimensions from schema metadata (for validation)
-        let schema = batch.schema();
-        let schema_metadata = schema.metadata();
-        if let (Some(rows_str), Some(cols_str)) =
-            (schema_metadata.get("rows"), schema_metadata.get("cols"))
-        {
-            let schema_rows = rows_str.parse::<usize>().ok();
-            let schema_cols = cols_str.parse::<usize>().ok();
-            if schema_rows != Some(expected_rows) || schema_cols != Some(expected_cols) {
-                panic!(
-                    "Schema metadata dimensions ({:?}x{:?}) don't match storage metadata ({}x{})",
-                    schema_rows, schema_cols, expected_rows, expected_cols
-                );
-            } else {
-                debug!(
-                    "Schema metadata matches storage metadata: {}x{}",
-                    expected_rows, expected_cols
-                );
-            }
-        }
-
-        let rows = expected_rows;
-        let cols = expected_cols;
-        debug!(
-            "Reconstructing {}x{} sparse matrix from {} entries",
-            rows, cols, n
-        );
-
-        let mut trimat = TriMat::new((rows, cols));
-        for i in 0..n {
-            let r = row_arr.value(i) as usize;
-            let c = col_arr.value(i) as usize;
-            let v = val_arr.value(i);
-
-            if r >= rows || c >= cols {
-                return Err(StorageError::Invalid(format!(
-                    "Index out of bounds: ({}, {}) in {}x{} matrix",
-                    r, c, rows, cols
-                )));
-            }
-            trimat.add_triplet(r, c, v);
-        }
-
-        let result = trimat.to_csr();
-        if result.rows() != rows || result.cols() != cols {
-            return Err(StorageError::Invalid(format!(
-                "Dimension mismatch after reconstruction: expected {}x{}, got {}x{}",
-                rows,
-                cols,
-                result.rows(),
-                result.cols()
-            )));
-        }
-
-        Ok(result)
-    }
-
-    /// Async helper: write a RecordBatch to a Lance dataset.
-    async fn write_lance_batch_async(&self, path: &Path, batch: RecordBatch) -> StorageResult<()> {
-        let uri = Self::path_to_uri(path);
-        info!("Writing Lance dataset to {}", uri);
-
-        let schema = batch.schema();
-        let batches = vec![batch];
-        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
-
-        let params = WriteParams {
-            mode: WriteMode::Create,
-            ..WriteParams::default()
-        };
-
-        Dataset::write(reader, &uri, Some(params))
-            .await
-            .map_err(|e| StorageError::Lance(e.to_string()))?;
-
-        info!("Successfully wrote Lance dataset to {}", uri);
-        Ok(())
-    }
-
-    /// Async helper: read and concatenate all RecordBatches from a Lance dataset.
-    async fn read_lance_all_batches_async(&self, path: &Path) -> StorageResult<RecordBatch> {
-        let uri = Self::path_to_uri(path);
-        info!("Reading Lance dataset from {}", uri);
-
-        let dataset = Dataset::open(&uri)
-            .await
-            .map_err(|e| StorageError::Lance(e.to_string()))?;
-        let scanner = dataset.scan();
-        let mut stream = scanner
-            .try_into_stream()
-            .await
-            .map_err(|e| StorageError::Lance(e.to_string()))?;
-
-        let mut batches = Vec::new();
-        while let Some(batch_result) = stream.next().await {
-            let batch = batch_result.map_err(|e| StorageError::Lance(e.to_string()))?;
-            batches.push(batch);
-        }
-
-        if batches.is_empty() {
-            return Err(StorageError::Invalid("Empty Lance dataset".into()));
-        }
-
-        let schema = batches[0].schema();
-        let combined = arrow::compute::concat_batches(&schema, &batches)
-            .map_err(|e| StorageError::Lance(format!("Failed to concatenate batches: {}", e)))?;
-
-        debug!(
-            "Combined Lance batch for {:?} has {} rows",
-            path,
-            combined.num_rows()
-        );
-        Ok(combined)
-    }
-
-    /// Async helper: read the first RecordBatch from a Lance dataset.
-    async fn read_lance_first_batch_async(&self, path: &Path) -> StorageResult<RecordBatch> {
-        let uri = Self::path_to_uri(path);
-        info!("Reading first batch from Lance dataset {}", uri);
-
-        let dataset = Dataset::open(&uri)
-            .await
-            .map_err(|e| StorageError::Lance(e.to_string()))?;
-        let scanner = dataset.scan();
-        let mut stream = scanner
-            .try_into_stream()
-            .await
-            .map_err(|e| StorageError::Lance(e.to_string()))?;
-
-        let batch = stream
-            .next()
-            .await
-            .ok_or_else(|| StorageError::Lance("empty Lance dataset".to_string()))?
-            .map_err(|e| StorageError::Lance(e.to_string()))?;
-
-        debug!(
-            "Read first RecordBatch for path {:?} with {} rows",
-            path,
-            batch.num_rows()
-        );
-        Ok(batch)
-    }
 }
 
-impl StorageBackend for LanceStorage {
+impl LanceStorage for LanceStorageGraph {}
+
+impl StorageBackend for LanceStorageGraph {
     fn get_base(&self) -> String {
         self._base.clone()
     }
@@ -494,24 +89,6 @@ impl StorageBackend for LanceStorage {
     /// Converts the base path for the store to a `file://` URI for Lance.
     fn basepath_to_uri(&self) -> String {
         Self::path_to_uri(PathBuf::from(self._base.clone()).as_path())
-    }
-
-    /// Converts a full file path to a `file://` URI for Lance.
-    fn path_to_uri(path: &Path) -> String {
-        path.canonicalize()
-            .unwrap_or_else(|_| {
-                if path.is_absolute() {
-                    path.to_path_buf()
-                } else if path.is_relative() {
-                    std::env::current_dir()
-                        .unwrap_or_else(|_| PathBuf::from("/"))
-                        .join(path)
-                } else {
-                    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(path)
-                }
-            })
-            .to_string_lossy()
-            .to_string()
     }
 
     // Add these methods to impl LanceStorage {} block
@@ -553,7 +130,8 @@ impl StorageBackend for LanceStorage {
         }
 
         // Write to Lance
-        self.write_lance_batch_async(&path, batch).await?;
+        let uri = Self::path_to_uri(&path);
+        self.write_lance_batch_async(uri, batch).await?;
 
         info!("Dense {} matrix saved successfully", key);
         Ok(())
@@ -573,7 +151,8 @@ impl StorageBackend for LanceStorage {
         info!("Loading dense {} matrix from {:?}", key, path);
 
         // Read all batches from Lance (may span multiple batches for large datasets)
-        let batch = self.read_lance_all_batches_async(&path).await?;
+        let uri = Self::path_to_uri(&path);
+        let batch = self.read_lance_all_batches_async(uri).await?;
 
         // Convert from FixedSizeList format to DenseMatrix
         let matrix = self.from_dense_record_batch(&batch)?;
@@ -617,11 +196,11 @@ impl StorageBackend for LanceStorage {
                     })?
                     .to_string();
 
-                let tmp_storage =
-                    crate::lance::LanceStorage::new(parent, String::from("tmp_storage"));
+                let tmp_storage = Self::new(parent, String::from("tmp_storage"));
 
                 // Reuse the async Lance reader logic.
-                let batch = tmp_storage.read_lance_all_batches_async(path).await?;
+                let uri = Self::path_to_uri(path);
+                let batch = tmp_storage.read_lance_all_batches_async(uri).await?;
                 let matrix = tmp_storage.from_dense_record_batch(&batch)?;
                 info!(
                     "Loaded dense matrix from Lance: {} x {}",
@@ -698,8 +277,7 @@ impl StorageBackend for LanceStorage {
                         })?
                         .to_string();
 
-                    let tmp_storage =
-                        crate::lance::LanceStorage::new(parent, String::from("tmp_storage"));
+                    let tmp_storage = Self::new(parent, String::from("tmp_storage"));
                     tmp_storage.from_dense_record_batch(&combined)?
                 } else if is_wide_col {
                     // Old wide columnar: columns like col_0, col_1, ... as Float64
@@ -786,20 +364,19 @@ impl StorageBackend for LanceStorage {
         let filetype = FileInfo::which_filetype(key);
         metadata.files.insert(
             key.to_string(),
-            FileInfo {
-                filename: format!("{}_{}.lance", self.get_name(), key),
-                filetype: filetype.to_string(),
-                storage_format: FileInfo::which_format(&filetype),
-                rows: matrix.rows(),
-                cols: matrix.cols(),
-                nnz: Some(matrix.nnz()),
-                size_bytes: None,
-            },
+            metadata.new_fileinfo(
+                key,
+                filetype.as_str(),
+                (matrix.rows(), matrix.cols()),
+                Some(matrix.nnz()),
+                None,
+            ),
         );
         self.save_metadata(&metadata).await?;
 
         let batch = self.to_sparse_record_batch(matrix)?;
-        self.write_lance_batch_async(&path, batch).await?;
+        let uri = Self::path_to_uri(&path);
+        self.write_lance_batch_async(uri, batch).await?;
         info!("Sparse matrix {} saved successfully", filetype);
         Ok(())
     }
@@ -822,7 +399,8 @@ impl StorageBackend for LanceStorage {
         );
 
         let path = self.file_path(key);
-        let batch = self.read_lance_first_batch_async(&path).await?;
+        let uri = Self::path_to_uri(&path);
+        let batch = self.read_lance_first_batch_async(uri).await?;
         let matrix = self.from_sparse_record_batch(batch, expected_rows, expected_cols)?;
         info!(
             "Sparse {} matrix loaded: {} x {}, nnz={}",
@@ -846,7 +424,8 @@ impl StorageBackend for LanceStorage {
         )
         .map_err(|e| StorageError::Lance(e.to_string()))?;
 
-        self.write_lance_batch_async(&path, batch).await?;
+        let uri = Self::path_to_uri(&path);
+        self.write_lance_batch_async(uri, batch).await?;
         info!("Lambda values saved successfully");
         Ok(())
     }
@@ -855,7 +434,8 @@ impl StorageBackend for LanceStorage {
         let path = self.file_path("lambdas");
         info!("Loading lambda values from {:?}", path);
 
-        let batch = self.read_lance_first_batch_async(&path).await?;
+        let uri = Self::path_to_uri(&path);
+        let batch = self.read_lance_first_batch_async(uri).await?;
         let arr = batch
             .column(0)
             .as_any()
@@ -865,25 +445,6 @@ impl StorageBackend for LanceStorage {
         let lambdas: Vec<f64> = (0..arr.len()).map(|i| arr.value(i)).collect();
         info!("Loaded {} lambda values", lambdas.len());
         Ok(lambdas)
-    }
-
-    async fn save_metadata(&self, metadata: &GeneMetadata) -> StorageResult<PathBuf> {
-        let path = self.metadata_path();
-        info!("Saving metadata to {:?}", path);
-        fs::create_dir_all(self.base_path()).map_err(|e| StorageError::Io(e.to_string()))?;
-        let s = serde_json::to_string_pretty(metadata).map_err(StorageError::Serde)?;
-        fs::write(&path, s).map_err(|e| StorageError::Io(e.to_string()))?;
-        info!("Metadata saved successfully");
-        Ok(path)
-    }
-
-    async fn load_metadata(&self) -> StorageResult<GeneMetadata> {
-        let filename = self.metadata_path();
-        info!("Loading metadata from {:?}", filename);
-        let s = fs::read_to_string(filename).map_err(|e| StorageError::Io(e.to_string()))?;
-        let md: GeneMetadata = serde_json::from_str(&s).map_err(StorageError::Serde)?;
-        info!("Metadata loaded successfully");
-        Ok(md)
     }
 
     async fn save_vector(&self, key: &str, vector: &[f64], md_path: &Path) -> StorageResult<()> {
@@ -896,7 +457,8 @@ impl StorageBackend for LanceStorage {
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(float64_array) as _])
             .map_err(|e| StorageError::Lance(e.to_string()))?;
 
-        self.write_lance_batch_async(&path, batch).await?;
+        let uri = Self::path_to_uri(&path);
+        self.write_lance_batch_async(uri, batch).await?;
         info!("Index {} saved successfully", key);
         Ok(())
     }
@@ -911,7 +473,8 @@ impl StorageBackend for LanceStorage {
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(uint32_array) as _])
             .map_err(|e| StorageError::Lance(e.to_string()))?;
 
-        self.write_lance_batch_async(&path, batch).await?;
+        let uri = Self::path_to_uri(&path);
+        self.write_lance_batch_async(uri, batch).await?;
         info!("Index {} saved successfully", key);
         Ok(())
     }
@@ -920,7 +483,8 @@ impl StorageBackend for LanceStorage {
         let path = self.file_path(filename);
         info!("Loading vector {} from {:?}", filename, path);
 
-        let batch = self.read_lance_first_batch_async(&path).await?;
+        let uri = Self::path_to_uri(&path);
+        let batch = self.read_lance_first_batch_async(uri).await?;
         let arr = batch
             .column(0)
             .as_any()
@@ -936,7 +500,8 @@ impl StorageBackend for LanceStorage {
         let path = self.file_path(filename);
         info!("Loading vector {} from {:?}", filename, path);
 
-        let batch = self.read_lance_first_batch_async(&path).await?;
+        let uri = Self::path_to_uri(&path);
+        let batch = self.read_lance_first_batch_async(uri).await?;
         let arr = batch
             .column(0)
             .as_any()
@@ -964,7 +529,7 @@ impl StorageBackend for LanceStorage {
         }
 
         // Create a temporary storage only to store the file.
-        let tmp_storage = LanceStorage::new(
+        let tmp_storage = Self::new(
             String::from(path.parent().unwrap().to_str().unwrap()),
             String::from("tmp_storage"),
         );
@@ -994,7 +559,8 @@ impl StorageBackend for LanceStorage {
                     )));
                 }
 
-                tmp_storage.write_lance_batch_async(path, batch).await?;
+                let uri = Self::path_to_uri(path);
+                tmp_storage.write_lance_batch_async(uri, batch).await?;
                 info!("Saved dense matrix to Lance: {} x {}", n_rows, n_cols);
                 Ok(())
             }
@@ -1060,7 +626,8 @@ impl StorageBackend for LanceStorage {
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(uint32_array) as _])
             .map_err(|e| StorageError::Lance(e.to_string()))?;
 
-        self.write_lance_batch_async(&path, batch).await?;
+        let uri = Self::path_to_uri(&path);
+        self.write_lance_batch_async(uri, batch).await?;
         info!("Centroid map saved successfully");
         Ok(())
     }
@@ -1070,7 +637,8 @@ impl StorageBackend for LanceStorage {
         let path = self.file_path("centroid_map");
         info!("Loading centroid map from {:?}", path);
 
-        let batch = self.read_lance_first_batch_async(&path).await?;
+        let uri = Self::path_to_uri(&path);
+        let batch = self.read_lance_first_batch_async(uri).await?;
         let arr = batch
             .column(0)
             .as_any()
@@ -1099,7 +667,8 @@ impl StorageBackend for LanceStorage {
         )
         .map_err(|e| StorageError::Lance(e.to_string()))?;
 
-        self.write_lance_batch_async(&path, batch).await?;
+        let uri = Self::path_to_uri(&path);
+        self.write_lance_batch_async(uri, batch).await?;
         info!("Subcentroid lambda values saved successfully");
         Ok(())
     }
@@ -1109,7 +678,8 @@ impl StorageBackend for LanceStorage {
         let path = self.file_path("subcentroid_lambdas");
         info!("Loading subcentroid lambda values from {:?}", path);
 
-        let batch = self.read_lance_first_batch_async(&path).await?;
+        let uri = Self::path_to_uri(&path);
+        let batch = self.read_lance_first_batch_async(uri).await?;
         let arr = batch
             .column(0)
             .as_any()
@@ -1138,7 +708,8 @@ impl StorageBackend for LanceStorage {
         );
 
         let batch = self.to_dense_record_batch(subcentroids)?;
-        self.write_lance_batch_async(&path, batch).await?;
+        let uri = Self::path_to_uri(&path);
+        self.write_lance_batch_async(uri, batch).await?;
         debug!("Subcentroids matrix saved successfully");
         Ok(())
     }
@@ -1148,7 +719,8 @@ impl StorageBackend for LanceStorage {
         let path = self.file_path("sub_centroids");
         info!("Loading sub_centroids from {:?}", path);
 
-        let batch = self.read_lance_all_batches_async(&path).await?;
+        let uri = Self::path_to_uri(&path);
+        let batch = self.read_lance_all_batches_async(uri).await?;
         let matrix = self.from_dense_record_batch(&batch)?;
 
         // Convert DenseMatrix to Vec<Vec<f64>>
@@ -1182,7 +754,8 @@ impl StorageBackend for LanceStorage {
         )
         .map_err(|e| StorageError::Lance(e.to_string()))?;
 
-        self.write_lance_batch_async(&path, batch).await?;
+        let uri = Self::path_to_uri(&path);
+        self.write_lance_batch_async(uri, batch).await?;
         info!("Item norms saved successfully");
         Ok(())
     }
@@ -1192,7 +765,8 @@ impl StorageBackend for LanceStorage {
         let path = self.file_path("item_norms");
         info!("Loading item norms from {:?}", path);
 
-        let batch = self.read_lance_first_batch_async(&path).await?;
+        let uri = Self::path_to_uri(&path);
+        let batch = self.read_lance_first_batch_async(uri).await?;
         let arr = batch
             .column(0)
             .as_any()
@@ -1226,7 +800,8 @@ impl StorageBackend for LanceStorage {
         )
         .map_err(|e| StorageError::Lance(e.to_string()))?;
 
-        self.write_lance_batch_async(&path, batch).await?;
+        let uri = Self::path_to_uri(&path);
+        self.write_lance_batch_async(uri, batch).await?;
         info!("Cluster assignments saved successfully");
         Ok(())
     }
@@ -1235,7 +810,8 @@ impl StorageBackend for LanceStorage {
         let path = self.file_path("cluster_assignments");
         info!("Loading cluster assignments from {:?}", path);
 
-        let batch = self.read_lance_first_batch_async(&path).await?;
+        let uri = Self::path_to_uri(&path);
+        let batch = self.read_lance_first_batch_async(uri).await?;
         let arr = batch
             .column(0)
             .as_any()

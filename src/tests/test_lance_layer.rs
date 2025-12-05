@@ -1,8 +1,9 @@
-use crate::lance::LanceStorage;
+use crate::lance_storage_graph::LanceStorageGraph;
 use crate::metadata::FileInfo;
 use crate::metadata::GeneMetadata;
 use crate::tests::tmp_dir;
-use crate::traits::StorageBackend;
+use crate::traits::backend::StorageBackend;
+use crate::traits::metadata::Metadata;
 
 use log::debug;
 use std::path::PathBuf;
@@ -18,7 +19,7 @@ async fn init_test_builder(
     instance_name: &str,
 ) -> (
     PathBuf,
-    LanceStorage,
+    LanceStorageGraph,
     DenseMatrix<f64>,
     CsMat<f64>,
     Vec<f64>,
@@ -27,7 +28,7 @@ async fn init_test_builder(
     let (dense, adjacency, norms) =
         crate::tests::test_data::make_gaussian_cliques_multi(nitems, 0.3, 5, nfeatures, 42);
     let base = tmp_dir(instance_name).await;
-    let storage = LanceStorage::new(
+    let storage = LanceStorageGraph::new(
         base.to_string_lossy().to_string(),
         instance_name.to_string(),
     );
@@ -434,8 +435,10 @@ async fn test_concurrent_storage_instances() {
     let base = tmp_dir("test_concurrent_storage_instances").await;
     let name = "concurrent";
 
-    let storage1 = LanceStorage::new(base.to_string_lossy().to_string(), "instance1".to_string());
-    let storage2 = LanceStorage::new(base.to_string_lossy().to_string(), "instance2".to_string());
+    let storage1 =
+        LanceStorageGraph::new(base.to_string_lossy().to_string(), "instance1".to_string());
+    let storage2 =
+        LanceStorageGraph::new(base.to_string_lossy().to_string(), "instance2".to_string());
 
     let data1 = vec![1.0, 2.0, 3.0, 4.0];
     let data2 = vec![5.0, 6.0, 7.0, 8.0];
@@ -488,7 +491,7 @@ async fn test_lance_storage_spawn() {
     let name_id = "test_spawn_storage";
 
     // Step 1: Create and seed initial storage with metadata
-    let storage = LanceStorage::new(base_path.clone(), name_id.to_string());
+    let storage = LanceStorageGraph::new(base_path.clone(), name_id.to_string());
 
     GeneMetadata::seed_metadata(
         name_id, 100, // nitems
@@ -515,7 +518,7 @@ async fn test_lance_storage_spawn() {
         .expect("Failed to save lambdas");
 
     // Step 3: Now spawn from the existing directory
-    let (spawned_storage, spawned_metadata) = LanceStorage::spawn(base_path.clone())
+    let (spawned_storage, spawned_metadata) = LanceStorageGraph::spawn(base_path.clone())
         .await
         .expect("Failed to spawn LanceStorage");
 
@@ -550,7 +553,7 @@ async fn test_lance_storage_spawn_missing_metadata() {
     let base_path = temp_dir.as_path().to_str().unwrap().to_string();
 
     // Attempt to spawn without metadata - should panic
-    let _result = LanceStorage::spawn(base_path)
+    let _result = LanceStorageGraph::spawn(base_path)
         .await
         .expect("Should panic before this");
 }
@@ -561,7 +564,7 @@ async fn test_lance_storage_spawn_nonexistent_directory() {
     // Try to spawn from a directory that doesn't exist
     let base_path = "/tmp/nonexistent_directory_12345".to_string();
 
-    let _result = LanceStorage::spawn(base_path)
+    let _result = LanceStorageGraph::spawn(base_path)
         .await
         .expect("Should panic before this");
 }
@@ -573,7 +576,7 @@ async fn test_lance_storage_spawn_metadata_consistency() {
     let base_path = temp_dir.as_path().to_str().unwrap().to_string();
     let name_id = "consistency_test";
 
-    let storage = LanceStorage::new(base_path.clone(), name_id.to_string());
+    let storage = LanceStorageGraph::new(base_path.clone(), name_id.to_string());
 
     let mut metadata = GeneMetadata::seed_metadata(name_id, 200, 75, &storage)
         .await
@@ -597,7 +600,7 @@ async fn test_lance_storage_spawn_metadata_consistency() {
         .expect("Failed to save metadata");
 
     // Spawn and verify all metadata fields
-    let (_spawned_storage, spawned_metadata) = LanceStorage::spawn(base_path.clone())
+    let (_spawned_storage, spawned_metadata) = LanceStorageGraph::spawn(base_path.clone())
         .await
         .expect("Failed to spawn");
 
