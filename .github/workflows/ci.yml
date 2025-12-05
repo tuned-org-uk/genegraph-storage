@@ -28,14 +28,29 @@ jobs:
           version: "25.x"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      # - name: Cache .cargo and target
-      #   uses: actions/cache@v4
-      #   with:
-      #     path: |
-      #       ~/.cargo
-      #       ./target
-      #     key: ${{ runner.os }}-cargo-${{ matrix.platform.target }}-${{ hashFiles('**/Cargo.toml') }}
-      #     restore-keys: ${{ runner.os }}-cargo-${{ matrix.platform.target }}
+      - name: Cache Cargo registry and git sources
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-registry-${{ matrix.platform.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-${{ matrix.platform.target }}-
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache target build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ./target/*/incremental/
+            ./target/*/deps/
+            ./target/*/.fingerprint/
+          key: ${{ runner.os }}-target-${{ matrix.platform.target }}-${{ hashFiles('**/Cargo.toml') }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-target-${{ matrix.platform.target }}-${{ hashFiles('**/Cargo.toml') }}-
+            ${{ runner.os }}-target-${{ matrix.platform.target }}-
 
       - name: Install Rust toolchain
         uses: actions-rs/toolchain@v1
