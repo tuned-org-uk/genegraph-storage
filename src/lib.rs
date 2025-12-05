@@ -1,5 +1,5 @@
 #![allow(async_fn_in_trait)]
-pub mod lance;
+pub mod lance_graphdata;
 pub mod metadata;
 pub mod traits;
 

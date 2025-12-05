@@ -7,7 +7,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use crate::StorageError;
-use crate::traits::{Metadata, StorageBackend};
+use crate::traits::backend::StorageBackend;
+use crate::traits::metadata::Metadata;
 
 /// Represent a single file spec in the persistence directory
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -10,9 +10,7 @@ use std::sync::Arc;
 
 use arrow::array::{Float64Array, Int64Array, UInt32Array};
 use arrow::datatypes::{DataType, Field, Schema};
-use arrow_array::{Array as ArrowArray, RecordBatch, RecordBatchIterator};
-use futures::StreamExt;
-use lance::dataset::{Dataset, WriteMode, WriteParams};
+use arrow_array::{Array as ArrowArray, RecordBatch};
 use log::{debug, info};
 use smartcore::linalg::basic::arrays::Array;
 use smartcore::linalg::basic::matrix::DenseMatrix;
@@ -20,8 +18,9 @@ use sprs::CsMat;
 
 use crate::metadata::FileInfo;
 use crate::metadata::GeneMetadata;
-use crate::traits::Metadata;
-use crate::traits::StorageBackend;
+use crate::traits::backend::StorageBackend;
+use crate::traits::lance::LanceStorage;
+use crate::traits::metadata::Metadata;
 use crate::{StorageError, StorageResult};
 
 /// Lance-based storage backend for ArrowSpace graph embeddings.
@@ -30,12 +29,12 @@ use crate::{StorageError, StorageResult};
 /// (`row`, `col`, `value` for sparse; `col_*` for dense) schema for efficient
 /// random and columnar access.
 #[derive(Debug, Clone)]
-pub struct LanceStorage {
+pub struct LanceStorageGraph {
     pub(crate) _base: String,
     pub(crate) _name: String,
 }
 
-impl LanceStorage {
+impl LanceStorageGraph {
     /// Creates a new Lance storage backend.
     ///
     /// This is used for on-the-fly creation. For proper setup use `Genefold<...>::seed`.
@@ -50,9 +49,9 @@ impl LanceStorage {
     }
 
     /// Spawn a LanceStorage from an existing seeded directory (with metadata.json)
-    pub async fn spawn(base_path: String) -> Result<(LanceStorage, GeneMetadata), StorageError> {
+    pub async fn spawn(base_path: String) -> Result<(Self, GeneMetadata), StorageError> {
         // Reuse the generic `exists` helper from the StorageBackend trait
-        let (exists, md_path) = <LanceStorage as StorageBackend>::exists(&base_path);
+        let (exists, md_path) = <Self as StorageBackend>::exists(&base_path);
         assert!(
             exists && md_path.is_some(),
             "Metadata does not exist in this base path"
@@ -62,99 +61,15 @@ impl LanceStorage {
         let metadata = GeneMetadata::read(md_path.unwrap()).await?;
 
         // Construct the LanceStorage using the metadata-provided nameid
-        let storage = LanceStorage::new(base_path.clone(), metadata.name_id.clone());
+        let storage = Self::new(base_path.clone(), metadata.name_id.clone());
 
         Ok((storage, metadata))
     }
-
-    /// Async helper: write a RecordBatch to a Lance dataset.
-    async fn write_lance_batch_async(&self, path: &Path, batch: RecordBatch) -> StorageResult<()> {
-        let uri = Self::path_to_uri(path);
-        info!("Writing Lance dataset to {}", uri);
-
-        let schema = batch.schema();
-        let batches = vec![batch];
-        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
-
-        let params = WriteParams {
-            mode: WriteMode::Create,
-            ..WriteParams::default()
-        };
-
-        Dataset::write(reader, &uri, Some(params))
-            .await
-            .map_err(|e| StorageError::Lance(e.to_string()))?;
-
-        info!("Successfully wrote Lance dataset to {}", uri);
-        Ok(())
-    }
-
-    /// Async helper: read and concatenate all RecordBatches from a Lance dataset.
-    async fn read_lance_all_batches_async(&self, path: &Path) -> StorageResult<RecordBatch> {
-        let uri = Self::path_to_uri(path);
-        info!("Reading Lance dataset from {}", uri);
-
-        let dataset = Dataset::open(&uri)
-            .await
-            .map_err(|e| StorageError::Lance(e.to_string()))?;
-        let scanner = dataset.scan();
-        let mut stream = scanner
-            .try_into_stream()
-            .await
-            .map_err(|e| StorageError::Lance(e.to_string()))?;
-
-        let mut batches = Vec::new();
-        while let Some(batch_result) = stream.next().await {
-            let batch = batch_result.map_err(|e| StorageError::Lance(e.to_string()))?;
-            batches.push(batch);
-        }
-
-        if batches.is_empty() {
-            return Err(StorageError::Invalid("Empty Lance dataset".into()));
-        }
-
-        let schema = batches[0].schema();
-        let combined = arrow::compute::concat_batches(&schema, &batches)
-            .map_err(|e| StorageError::Lance(format!("Failed to concatenate batches: {}", e)))?;
-
-        debug!(
-            "Combined Lance batch for {:?} has {} rows",
-            path,
-            combined.num_rows()
-        );
-        Ok(combined)
-    }
-
-    /// Async helper: read the first RecordBatch from a Lance dataset.
-    async fn read_lance_first_batch_async(&self, path: &Path) -> StorageResult<RecordBatch> {
-        let uri = Self::path_to_uri(path);
-        info!("Reading first batch from Lance dataset {}", uri);
-
-        let dataset = Dataset::open(&uri)
-            .await
-            .map_err(|e| StorageError::Lance(e.to_string()))?;
-        let scanner = dataset.scan();
-        let mut stream = scanner
-            .try_into_stream()
-            .await
-            .map_err(|e| StorageError::Lance(e.to_string()))?;
-
-        let batch = stream
-            .next()
-            .await
-            .ok_or_else(|| StorageError::Lance("empty Lance dataset".to_string()))?
-            .map_err(|e| StorageError::Lance(e.to_string()))?;
-
-        debug!(
-            "Read first RecordBatch for path {:?} with {} rows",
-            path,
-            batch.num_rows()
-        );
-        Ok(batch)
-    }
 }
 
-impl StorageBackend for LanceStorage {
+impl LanceStorage for LanceStorageGraph {}
+
+impl StorageBackend for LanceStorageGraph {
     fn get_base(&self) -> String {
         self._base.clone()
     }
@@ -175,24 +90,6 @@ impl StorageBackend for LanceStorage {
     /// Converts the base path for the store to a `file://` URI for Lance.
     fn basepath_to_uri(&self) -> String {
         Self::path_to_uri(PathBuf::from(self._base.clone()).as_path())
-    }
-
-    /// Converts a full file path to a `file://` URI for Lance.
-    fn path_to_uri(path: &Path) -> String {
-        path.canonicalize()
-            .unwrap_or_else(|_| {
-                if path.is_absolute() {
-                    path.to_path_buf()
-                } else if path.is_relative() {
-                    std::env::current_dir()
-                        .unwrap_or_else(|_| PathBuf::from("/"))
-                        .join(path)
-                } else {
-                    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(path)
-                }
-            })
-            .to_string_lossy()
-            .to_string()
     }
 
     // Add these methods to impl LanceStorage {} block
@@ -234,7 +131,8 @@ impl StorageBackend for LanceStorage {
         }
 
         // Write to Lance
-        self.write_lance_batch_async(&path, batch).await?;
+        let uri = Self::path_to_uri(&path);
+        self.write_lance_batch_async(uri, batch).await?;
 
         info!("Dense {} matrix saved successfully", key);
         Ok(())
@@ -254,7 +152,8 @@ impl StorageBackend for LanceStorage {
         info!("Loading dense {} matrix from {:?}", key, path);
 
         // Read all batches from Lance (may span multiple batches for large datasets)
-        let batch = self.read_lance_all_batches_async(&path).await?;
+        let uri = Self::path_to_uri(&path);
+        let batch = self.read_lance_all_batches_async(uri).await?;
 
         // Convert from FixedSizeList format to DenseMatrix
         let matrix = self.from_dense_record_batch(&batch)?;
@@ -298,11 +197,11 @@ impl StorageBackend for LanceStorage {
                     })?
                     .to_string();
 
-                let tmp_storage =
-                    crate::lance::LanceStorage::new(parent, String::from("tmp_storage"));
+                let tmp_storage = Self::new(parent, String::from("tmp_storage"));
 
                 // Reuse the async Lance reader logic.
-                let batch = tmp_storage.read_lance_all_batches_async(path).await?;
+                let uri = Self::path_to_uri(&path);
+                let batch = tmp_storage.read_lance_all_batches_async(uri).await?;
                 let matrix = tmp_storage.from_dense_record_batch(&batch)?;
                 info!(
                     "Loaded dense matrix from Lance: {} x {}",
@@ -379,8 +278,7 @@ impl StorageBackend for LanceStorage {
                         })?
                         .to_string();
 
-                    let tmp_storage =
-                        crate::lance::LanceStorage::new(parent, String::from("tmp_storage"));
+                    let tmp_storage = Self::new(parent, String::from("tmp_storage"));
                     tmp_storage.from_dense_record_batch(&combined)?
                 } else if is_wide_col {
                     // Old wide columnar: columns like col_0, col_1, ... as Float64
@@ -478,7 +376,8 @@ impl StorageBackend for LanceStorage {
         self.save_metadata(&metadata).await?;
 
         let batch = self.to_sparse_record_batch(matrix)?;
-        self.write_lance_batch_async(&path, batch).await?;
+        let uri = Self::path_to_uri(&path);
+        self.write_lance_batch_async(uri, batch).await?;
         info!("Sparse matrix {} saved successfully", filetype);
         Ok(())
     }
@@ -501,7 +400,8 @@ impl StorageBackend for LanceStorage {
         );
 
         let path = self.file_path(key);
-        let batch = self.read_lance_first_batch_async(&path).await?;
+        let uri = Self::path_to_uri(&path);
+        let batch = self.read_lance_first_batch_async(uri).await?;
         let matrix = self.from_sparse_record_batch(batch, expected_rows, expected_cols)?;
         info!(
             "Sparse {} matrix loaded: {} x {}, nnz={}",
@@ -525,7 +425,8 @@ impl StorageBackend for LanceStorage {
         )
         .map_err(|e| StorageError::Lance(e.to_string()))?;
 
-        self.write_lance_batch_async(&path, batch).await?;
+        let uri = Self::path_to_uri(&path);
+        self.write_lance_batch_async(uri, batch).await?;
         info!("Lambda values saved successfully");
         Ok(())
     }
@@ -534,7 +435,8 @@ impl StorageBackend for LanceStorage {
         let path = self.file_path("lambdas");
         info!("Loading lambda values from {:?}", path);
 
-        let batch = self.read_lance_first_batch_async(&path).await?;
+        let uri = Self::path_to_uri(&path);
+        let batch = self.read_lance_first_batch_async(uri).await?;
         let arr = batch
             .column(0)
             .as_any()
@@ -575,7 +477,8 @@ impl StorageBackend for LanceStorage {
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(float64_array) as _])
             .map_err(|e| StorageError::Lance(e.to_string()))?;
 
-        self.write_lance_batch_async(&path, batch).await?;
+        let uri = Self::path_to_uri(&path);
+        self.write_lance_batch_async(uri, batch).await?;
         info!("Index {} saved successfully", key);
         Ok(())
     }
@@ -590,7 +493,8 @@ impl StorageBackend for LanceStorage {
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(uint32_array) as _])
             .map_err(|e| StorageError::Lance(e.to_string()))?;
 
-        self.write_lance_batch_async(&path, batch).await?;
+        let uri = Self::path_to_uri(&path);
+        self.write_lance_batch_async(uri, batch).await?;
         info!("Index {} saved successfully", key);
         Ok(())
     }
@@ -599,7 +503,8 @@ impl StorageBackend for LanceStorage {
         let path = self.file_path(filename);
         info!("Loading vector {} from {:?}", filename, path);
 
-        let batch = self.read_lance_first_batch_async(&path).await?;
+        let uri = Self::path_to_uri(&path);
+        let batch = self.read_lance_first_batch_async(uri).await?;
         let arr = batch
             .column(0)
             .as_any()
@@ -615,7 +520,8 @@ impl StorageBackend for LanceStorage {
         let path = self.file_path(filename);
         info!("Loading vector {} from {:?}", filename, path);
 
-        let batch = self.read_lance_first_batch_async(&path).await?;
+        let uri = Self::path_to_uri(&path);
+        let batch = self.read_lance_first_batch_async(uri).await?;
         let arr = batch
             .column(0)
             .as_any()
@@ -643,7 +549,7 @@ impl StorageBackend for LanceStorage {
         }
 
         // Create a temporary storage only to store the file.
-        let tmp_storage = LanceStorage::new(
+        let tmp_storage = Self::new(
             String::from(path.parent().unwrap().to_str().unwrap()),
             String::from("tmp_storage"),
         );
@@ -673,7 +579,8 @@ impl StorageBackend for LanceStorage {
                     )));
                 }
 
-                tmp_storage.write_lance_batch_async(path, batch).await?;
+                let uri = Self::path_to_uri(&path);
+                tmp_storage.write_lance_batch_async(uri, batch).await?;
                 info!("Saved dense matrix to Lance: {} x {}", n_rows, n_cols);
                 Ok(())
             }
@@ -739,7 +646,8 @@ impl StorageBackend for LanceStorage {
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(uint32_array) as _])
             .map_err(|e| StorageError::Lance(e.to_string()))?;
 
-        self.write_lance_batch_async(&path, batch).await?;
+        let uri = Self::path_to_uri(&path);
+        self.write_lance_batch_async(uri, batch).await?;
         info!("Centroid map saved successfully");
         Ok(())
     }
@@ -749,7 +657,8 @@ impl StorageBackend for LanceStorage {
         let path = self.file_path("centroid_map");
         info!("Loading centroid map from {:?}", path);
 
-        let batch = self.read_lance_first_batch_async(&path).await?;
+        let uri = Self::path_to_uri(&path);
+        let batch = self.read_lance_first_batch_async(uri).await?;
         let arr = batch
             .column(0)
             .as_any()
@@ -778,7 +687,8 @@ impl StorageBackend for LanceStorage {
         )
         .map_err(|e| StorageError::Lance(e.to_string()))?;
 
-        self.write_lance_batch_async(&path, batch).await?;
+        let uri = Self::path_to_uri(&path);
+        self.write_lance_batch_async(uri, batch).await?;
         info!("Subcentroid lambda values saved successfully");
         Ok(())
     }
@@ -788,7 +698,8 @@ impl StorageBackend for LanceStorage {
         let path = self.file_path("subcentroid_lambdas");
         info!("Loading subcentroid lambda values from {:?}", path);
 
-        let batch = self.read_lance_first_batch_async(&path).await?;
+        let uri = Self::path_to_uri(&path);
+        let batch = self.read_lance_first_batch_async(uri).await?;
         let arr = batch
             .column(0)
             .as_any()
@@ -817,7 +728,8 @@ impl StorageBackend for LanceStorage {
         );
 
         let batch = self.to_dense_record_batch(subcentroids)?;
-        self.write_lance_batch_async(&path, batch).await?;
+        let uri = Self::path_to_uri(&path);
+        self.write_lance_batch_async(uri, batch).await?;
         debug!("Subcentroids matrix saved successfully");
         Ok(())
     }
@@ -827,7 +739,8 @@ impl StorageBackend for LanceStorage {
         let path = self.file_path("sub_centroids");
         info!("Loading sub_centroids from {:?}", path);
 
-        let batch = self.read_lance_all_batches_async(&path).await?;
+        let uri = Self::path_to_uri(&path);
+        let batch = self.read_lance_all_batches_async(uri).await?;
         let matrix = self.from_dense_record_batch(&batch)?;
 
         // Convert DenseMatrix to Vec<Vec<f64>>
@@ -861,7 +774,8 @@ impl StorageBackend for LanceStorage {
         )
         .map_err(|e| StorageError::Lance(e.to_string()))?;
 
-        self.write_lance_batch_async(&path, batch).await?;
+        let uri = Self::path_to_uri(&path);
+        self.write_lance_batch_async(uri, batch).await?;
         info!("Item norms saved successfully");
         Ok(())
     }
@@ -871,7 +785,8 @@ impl StorageBackend for LanceStorage {
         let path = self.file_path("item_norms");
         info!("Loading item norms from {:?}", path);
 
-        let batch = self.read_lance_first_batch_async(&path).await?;
+        let uri = Self::path_to_uri(&path);
+        let batch = self.read_lance_first_batch_async(uri).await?;
         let arr = batch
             .column(0)
             .as_any()
@@ -905,7 +820,8 @@ impl StorageBackend for LanceStorage {
         )
         .map_err(|e| StorageError::Lance(e.to_string()))?;
 
-        self.write_lance_batch_async(&path, batch).await?;
+        let uri = Self::path_to_uri(&path);
+        self.write_lance_batch_async(uri, batch).await?;
         info!("Cluster assignments saved successfully");
         Ok(())
     }
@@ -914,7 +830,8 @@ impl StorageBackend for LanceStorage {
         let path = self.file_path("cluster_assignments");
         info!("Loading cluster assignments from {:?}", path);
 
-        let batch = self.read_lance_first_batch_async(&path).await?;
+        let uri = Self::path_to_uri(&path);
+        let batch = self.read_lance_first_batch_async(uri).await?;
         let arr = batch
             .column(0)
             .as_any()

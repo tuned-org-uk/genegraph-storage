@@ -1,8 +1,9 @@
 use crate::StorageError;
-use crate::lance::LanceStorage;
+use crate::lance_graphdata::LanceStorageGraph;
 use crate::metadata::{FileInfo, GeneMetadata};
 use crate::tests::tmp_dir;
-use crate::traits::{Metadata, StorageBackend};
+use crate::traits::backend::StorageBackend;
+use crate::traits::metadata::Metadata;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -14,7 +15,8 @@ async fn test_metadata_roundtrip_basic() {
     let base_path = tmp_dir(name_id).await;
 
     // Create storage instance
-    let storage = LanceStorage::new(base_path.to_string_lossy().to_string(), name_id.to_string());
+    let storage =
+        LanceStorageGraph::new(base_path.to_string_lossy().to_string(), name_id.to_string());
 
     // Create original metadata with all fields populated
     let mut original_metadata = GeneMetadata {
@@ -93,7 +95,8 @@ async fn test_metadata_roundtrip_with_seed_metadata() {
     let name_id = "test_seed_roundtrip";
     let base_path = tmp_dir(name_id).await;
 
-    let storage = LanceStorage::new(base_path.to_string_lossy().to_string(), name_id.to_string());
+    let storage =
+        LanceStorageGraph::new(base_path.to_string_lossy().to_string(), name_id.to_string());
 
     // Use seed_metadata helper to create initial metadata
     let original_metadata = GeneMetadata::seed_metadata(
@@ -133,7 +136,8 @@ async fn test_metadata_roundtrip_empty_files() {
     let name_id = "test_empty";
     let base_path = tmp_dir(name_id).await;
 
-    let storage = LanceStorage::new(base_path.to_string_lossy().to_string(), name_id.to_string());
+    let storage =
+        LanceStorageGraph::new(base_path.to_string_lossy().to_string(), name_id.to_string());
 
     let original_metadata = GeneMetadata {
         name_id: name_id.to_string(),
@@ -167,7 +171,8 @@ async fn test_metadata_roundtrip_with_sparse_info() {
     let name_id = "test_sparse";
     let base_path = tmp_dir(name_id).await;
 
-    let storage = LanceStorage::new(base_path.to_string_lossy().to_string(), name_id.to_string());
+    let storage =
+        LanceStorageGraph::new(base_path.to_string_lossy().to_string(), name_id.to_string());
 
     let mut original_metadata = GeneMetadata {
         name_id: name_id.to_string(),

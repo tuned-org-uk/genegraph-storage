@@ -1,8 +1,6 @@
-use arrow::array::{Float64Array, Int64Array, UInt32Array};
+use arrow::array::{Float64Array, UInt32Array};
 use arrow::datatypes::{DataType, Field, Schema};
-use arrow_array::{Array as ArrowArray, FixedSizeListArray, RecordBatch, RecordBatchIterator};
-use futures::StreamExt;
-use lance::dataset::{Dataset, WriteMode, WriteParams};
+use arrow_array::{Array as ArrowArray, FixedSizeListArray, RecordBatch};
 use log::{debug, info, trace};
 use smartcore::linalg::basic::arrays::Array;
 use smartcore::linalg::basic::matrix::DenseMatrix;
@@ -11,8 +9,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::StorageResult;
 use crate::metadata::GeneMetadata;
+use crate::{StorageError, StorageResult};
 
 /// Async storage backend for Lance-based graph and embedding data.
 ///
@@ -76,8 +74,6 @@ pub trait StorageBackend: Send + Sync {
     /// Name of the instance
     fn get_name(&self) -> String;
 
-    fn path_to_uri(path: &Path) -> String;
-
     ///
     /// Returns `true` and the path to the metadata file if metadata file exists and is valid,
     /// `false` otherwise.
@@ -117,6 +113,24 @@ pub trait StorageBackend: Send + Sync {
 
     /// Compute the full Lance/parquet file path for a logical filetype.
     fn file_path(&self, key: &str) -> PathBuf;
+
+    /// Converts a full file path to a `file://` URI for Lance.
+    fn path_to_uri(path: &Path) -> String {
+        path.canonicalize()
+            .unwrap_or_else(|_| {
+                if path.is_absolute() {
+                    path.to_path_buf()
+                } else if path.is_relative() {
+                    std::env::current_dir()
+                        .unwrap_or_else(|_| PathBuf::from("/"))
+                        .join(path)
+                } else {
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(path)
+                }
+            })
+            .to_string_lossy()
+            .to_string()
+    }
 
     /// Validates that the storage directory is properly initialized with metadata.
     ///
@@ -531,38 +545,4 @@ Call save_metadata() or save_eigenmaps_all()/save_energymaps_all() first.",
     async fn load_vector(&self, key: &str) -> StorageResult<Vec<f64>>;
 
     async fn save_dense_to_file(data: &DenseMatrix<f64>, path: &Path) -> StorageResult<()>;
-}
-
-use crate::StorageError;
-use crate::metadata::FileInfo;
-
-/// A trait to create metadata structures.
-/// Instantiate structures with this trait, like for `GeneMetaData`
-pub trait Metadata {
-    /// constructor
-    fn new(name_id: &str) -> Self;
-    /// instantiate a new file info instance for this Metadata type
-    fn new_fileinfo(
-        &self,
-        key: &str,
-        filetype: &str,
-        data_shape: (usize, usize),
-        nnz: Option<usize>,
-        size_bytes: Option<u64>,
-    ) -> FileInfo;
-
-    /// Standard pipeline object
-    async fn seed_metadata<B: StorageBackend>(
-        name_id: &str,
-        nitems: usize,
-        nfeatures: usize,
-        storage: &B,
-    ) -> Result<GeneMetadata, StorageError>;
-
-    /// add a file to the metadata files
-    fn add_file(self, key: &str, info: FileInfo) -> Self;
-
-    // constructor helpers
-    fn with_base(self, base_path: PathBuf) -> Self;
-    fn with_dimensions(self, rows: usize, cols: usize) -> Self;
 }
