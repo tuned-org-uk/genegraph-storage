@@ -74,5 +74,8 @@ let md_path = storage.save_metadata(&md).await.unwrap();
 let loaded = storage.load_dense("rawinput").await.unwrap();
 ```
 
+## Extension
+Traits in `traits` module can be reused to implement other formats. Other formats can use `StorageBackend` to implement similar child-traits alike to `LanceStorage`.
+
 ## Contributing
 See `.github/` directory.
