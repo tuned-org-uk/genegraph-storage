@@ -1,5 +1,5 @@
 use crate::StorageError;
-use crate::lance_graphdata::LanceStorageGraph;
+use crate::lance_storage_graph::LanceStorageGraph;
 use crate::metadata::{FileInfo, GeneMetadata};
 use crate::tests::tmp_dir;
 use crate::traits::backend::StorageBackend;
