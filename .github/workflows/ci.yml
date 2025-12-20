@@ -20,6 +20,39 @@ jobs:
     env:
       TZ: "/usr/share/zoneinfo/your/location"
     steps:
+      # Clean up disk space BEFORE checkout to maximize available space
+      - name: Free Disk Space (Ubuntu)
+        if: matrix.platform.os == 'ubuntu'
+        uses: jlumbroso/free-disk-space@main
+        with:
+          # Remove unnecessary preinstalled software
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Free Disk Space (macOS)
+        if: matrix.platform.os == 'macos'
+        run: |
+          df -h
+          sudo rm -rf /Users/runner/Library/Android
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /usr/local/lib/node_modules
+          brew cleanup
+          df -h
+
+      - name: Free Disk Space (Windows)
+        if: matrix.platform.os == 'windows'
+        run: |
+          wmic logicaldisk get size,freespace,caption
+          Remove-Item -Path "C:\hostedtoolcache\windows\*" -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -Path "$env:ANDROID_SDK_ROOT" -Recurse -Force -ErrorAction SilentlyContinue
+          wmic logicaldisk get size,freespace,caption
+        shell: powershell
+
       - uses: actions/checkout@v4
 
       - name: Setup Protobuf
@@ -68,6 +101,20 @@ jobs:
         with:
           command: build
           args: --all-features --target ${{ matrix.platform.target }}
+
+      # Clean up intermediate build artifacts
+      - name: Clean build cache
+        if: matrix.platform.os == 'ubuntu' || matrix.platform.os == 'macos'
+        run: |
+          cargo clean -p genestore
+          df -h
+
+      - name: Clean build cache (Windows)
+        if: matrix.platform.os == 'windows'
+        run: |
+          cargo clean -p genestore
+          wmic logicaldisk get size,freespace,caption
+        shell: powershell
 
       - name: Build without features
         uses: actions-rs/cargo@v1
