@@ -106,13 +106,13 @@ jobs:
       - name: Clean build cache
         if: matrix.platform.os == 'ubuntu' || matrix.platform.os == 'macos'
         run: |
-          cargo clean -p genestore
+          cargo clean -p genegraph-storage
           df -h
 
       - name: Clean build cache (Windows)
         if: matrix.platform.os == 'windows'
         run: |
-          cargo clean -p genestore
+          cargo clean -p genegraph-storage
           wmic logicaldisk get size,freespace,caption
         shell: powershell
 
