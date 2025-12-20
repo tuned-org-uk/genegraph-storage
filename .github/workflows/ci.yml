@@ -80,6 +80,7 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install protoc
+        if: matrix.platform.os == 'ubuntu'
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
