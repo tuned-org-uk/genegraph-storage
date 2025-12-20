@@ -1,3 +1,4 @@
+use crate::StorageError;
 use crate::lance_storage_graph::LanceStorageGraph;
 use crate::metadata::FileInfo;
 use crate::metadata::GeneMetadata;
@@ -546,27 +547,70 @@ async fn test_lance_storage_spawn() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[should_panic(expected = "Metadata does not exist in this base path")]
 async fn test_lance_storage_spawn_missing_metadata() {
     // Setup: Create a temporary directory without metadata
     let temp_dir = tmp_dir("test_concurrent_storage_instances").await;
     let base_path = temp_dir.as_path().to_str().unwrap().to_string();
 
-    // Attempt to spawn without metadata - should panic
-    let _result = LanceStorageGraph::spawn(base_path)
-        .await
-        .expect("Should panic before this");
+    // Attempt to spawn without metadata - should return error
+    let result = LanceStorageGraph::spawn(base_path.clone()).await;
+
+    assert!(result.is_err(), "Expected error when metadata is missing");
+
+    let err = result.unwrap_err();
+    assert!(
+        matches!(err, StorageError::Invalid(_)),
+        "Expected StorageError::Invalid, got: {:?}",
+        err
+    );
+
+    // Verify error message contains relevant information
+    if let StorageError::Invalid(msg) = err {
+        assert!(
+            msg.contains("Metadata does not exist"),
+            "Error message should mention missing metadata, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains(&base_path),
+            "Error message should include the base path, got: {}",
+            msg
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[should_panic(expected = "Metadata does not exist in this base path")]
 async fn test_lance_storage_spawn_nonexistent_directory() {
     // Try to spawn from a directory that doesn't exist
     let base_path = "/tmp/nonexistent_directory_12345".to_string();
 
-    let _result = LanceStorageGraph::spawn(base_path)
-        .await
-        .expect("Should panic before this");
+    let result = LanceStorageGraph::spawn(base_path.clone()).await;
+
+    assert!(
+        result.is_err(),
+        "Expected error when directory doesn't exist"
+    );
+
+    let err = result.unwrap_err();
+    assert!(
+        matches!(err, StorageError::Invalid(_)),
+        "Expected StorageError::Invalid, got: {:?}",
+        err
+    );
+
+    // Verify error message contains relevant information
+    if let StorageError::Invalid(msg) = err {
+        assert!(
+            msg.contains("Metadata does not exist"),
+            "Error message should mention missing metadata, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains(&base_path),
+            "Error message should include the base path, got: {}",
+            msg
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

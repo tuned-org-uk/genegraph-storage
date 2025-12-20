@@ -50,18 +50,21 @@ impl LanceStorageGraph {
     /// Spawn a LanceStorage from an existing seeded directory (with metadata.json)
     pub async fn spawn(base_path: String) -> Result<(Self, GeneMetadata), StorageError> {
         // Reuse the generic `exists` helper from the StorageBackend trait
-        let (exists, md_path) = <Self as StorageBackend>::exists(&base_path);
-        assert!(
-            exists && md_path.is_some(),
-            "Metadata does not exist in this base path"
-        );
+        let (exists, md_path) = Self::exists(&base_path);
+
+        // Replace assert! with proper error handling
+        if !exists || md_path.is_none() {
+            return Err(StorageError::Invalid(format!(
+                "Metadata does not exist in base path: {}",
+                base_path
+            )));
+        }
 
         // Load metadata from the discovered metadata.json
         let metadata = GeneMetadata::read(md_path.unwrap()).await?;
 
         // Construct the LanceStorage using the metadata-provided nameid
         let storage = Self::new(base_path.clone(), metadata.name_id.clone());
-
         Ok((storage, metadata))
     }
 }
@@ -90,8 +93,6 @@ impl StorageBackend for LanceStorageGraph {
     fn basepath_to_uri(&self) -> String {
         Self::path_to_uri(PathBuf::from(self._base.clone()).as_path())
     }
-
-    // Add these methods to impl LanceStorage {} block
 
     /// Save dense matrix using Lance-optimized vector format.
     ///
