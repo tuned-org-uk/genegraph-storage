@@ -49,23 +49,23 @@ jobs:
         run: |
           # Display disk space before cleanup
           Get-PSDrive -PSProvider FileSystem | Select-Object Name, @{Name="Used(GB)";Expression={[math]::Round($_.Used/1GB,2)}}, @{Name="Free(GB)";Expression={[math]::Round($_.Free/1GB,2)}}, @{Name="Total(GB)";Expression={[math]::Round(($_.Used+$_.Free)/1GB,2)}} | Format-Table
-          
+
           # Remove hosted tool cache
           Write-Host "Removing hostedtoolcache..."
           Remove-Item -Path "C:\hostedtoolcache\windows\*" -Recurse -Force -ErrorAction SilentlyContinue
-          
+
           # Remove Android SDK
           if ($env:ANDROID_SDK_ROOT) {
             Write-Host "Removing Android SDK from $env:ANDROID_SDK_ROOT..."
             Remove-Item -Path "$env:ANDROID_SDK_ROOT" -Recurse -Force -ErrorAction SilentlyContinue
           }
-          
+
           # Remove additional large packages
           Write-Host "Removing additional unused packages..."
           Remove-Item -Path "C:\Program Files\dotnet" -Recurse -Force -ErrorAction SilentlyContinue
           Remove-Item -Path "C:\Program Files (x86)\Microsoft Visual Studio\2019" -Recurse -Force -ErrorAction SilentlyContinue
           Remove-Item -Path "C:\ProgramData\chocolatey" -Recurse -Force -ErrorAction SilentlyContinue
-          
+
           # Display disk space after cleanup
           Write-Host "`nDisk space after cleanup:"
           Get-PSDrive -PSProvider FileSystem | Select-Object Name, @{Name="Used(GB)";Expression={[math]::Round($_.Used/1GB,2)}}, @{Name="Free(GB)";Expression={[math]::Round($_.Free/1GB,2)}}, @{Name="Total(GB)";Expression={[math]::Round(($_.Used+$_.Free)/1GB,2)}} | Format-Table
@@ -78,6 +78,12 @@ jobs:
         with:
           version: "25.x"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+          protoc --version
 
       - name: Cache Cargo registry and git sources
         uses: actions/cache@v4
