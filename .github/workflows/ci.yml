@@ -80,6 +80,7 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install protoc
+        if: matrix.platform.os == 'ubuntu'
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
@@ -137,7 +138,6 @@ jobs:
         if: matrix.platform.os == 'windows'
         run: |
           cargo clean -p genegraph-storage
-          wmic logicaldisk get size,freespace,caption
         shell: powershell
 
       - name: Build without features
