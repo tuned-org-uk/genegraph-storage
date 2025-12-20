@@ -138,7 +138,6 @@ jobs:
         if: matrix.platform.os == 'windows'
         run: |
           cargo clean -p genegraph-storage
-          wmic logicaldisk get size,freespace,caption
         shell: powershell
 
       - name: Build without features
