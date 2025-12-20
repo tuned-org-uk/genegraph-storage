@@ -87,29 +87,8 @@ async fn test_metadata_simple() {
     assert_eq!(loaded_md.nrows, nitems, "Metadata rows should match");
     assert_eq!(loaded_md.ncols, nfeatures, "Metadata cols should match");
 
-    // Verify file entries
-    assert!(
-        loaded_md.files.contains_key("rawinput"),
-        "Metadata should contain rawinput entry"
-    );
-
-    let rawinput = loaded_md.files.get("rawinput").unwrap();
-    assert_eq!(rawinput.filetype, "dense", "File type should be dense");
-    assert!(rawinput.filename.contains("rawinput"));
-    assert_eq!(rawinput.rows, nitems, "File info rows should match");
-    assert_eq!(rawinput.cols, nfeatures, "File info cols should match");
-    assert_eq!(
-        rawinput.filename, md.files["rawinput"].filename,
-        "File info filenames should match {} != {}",
-        rawinput.filename, md.files["rawinput"].filename,
-    );
-
     // Verify the files HashMap structure
-    assert_eq!(
-        loaded_md.files.len(),
-        1,
-        "Should have exactly one file entry"
-    );
+    assert_eq!(loaded_md.files.len(), 0, "Should have no file entry");
 
     // Verify metadata is valid JSON by checking file size
     let metadata = std::fs::metadata(md_path.clone()).unwrap();
@@ -144,35 +123,6 @@ async fn test_metadata_simple() {
         "JSON should have 'created_at' timestamp"
     );
 
-    // Verify the files object in JSON has the correct structure
-    let files_obj = json_value.get("files").unwrap().as_object().unwrap();
-    assert!(
-        files_obj.contains_key("rawinput"),
-        "JSON files object should have 'rawinput' key"
-    );
-
-    let rawinput = files_obj.get("rawinput").unwrap().as_object().unwrap();
-    assert_eq!(
-        rawinput.get("filename").unwrap().as_str().unwrap(),
-        md.files["rawinput"].filename,
-        "JSON filename should match"
-    );
-    assert_eq!(
-        rawinput.get("filetype").unwrap().as_str().unwrap(),
-        "dense",
-        "JSON filetype should be 'dense'"
-    );
-    assert_eq!(
-        rawinput.get("rows").unwrap().as_u64().unwrap(),
-        nitems as u64,
-        "JSON rows should match"
-    );
-    assert_eq!(
-        rawinput.get("cols").unwrap().as_u64().unwrap(),
-        nfeatures as u64,
-        "JSON cols should match"
-    );
-
     // Verify JSON is pretty-printed (contains newlines)
     assert!(
         json_str.contains('\n'),
@@ -185,7 +135,6 @@ async fn test_metadata_simple() {
     debug!("✓ Files HashMap validated with correct key-value pair");
     debug!("  Location: {:?}", md_path);
     debug!("  Size: {} bytes", metadata.len());
-    debug!("  Rawdata file: {}", md.files["rawinput"].filename);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -211,31 +160,25 @@ async fn test_lance_dense_roundtrip() {
     let (_, storage, data, _, _) = init_test_builder(name).await;
     let (nitems, nfeatures) = data.shape();
 
-    // Create expected filename for rawinput
-    let expected_filename = format!("{}_rawinput.lance", name);
-
     // Save metadata FIRST to initialize the storage directory
     let md = GeneMetadata::seed_metadata(name, nitems, nfeatures, &storage.clone())
         .await
         .unwrap()
-        .with_dimensions(nitems, nfeatures)
-        .add_file(
-            "rawinput",
-            FileInfo::new(
-                expected_filename.clone(),
-                "dense",
-                (nitems, nfeatures),
-                None,
-                None,
-            ),
-        );
+        .with_dimensions(nitems, nfeatures);
 
     let md_path = storage.save_metadata(&md).await.unwrap();
+
+    assert!(md.files.is_empty());
 
     storage
         .save_dense("rawinput", &data, &md_path)
         .await
         .unwrap();
+
+    let md = storage.load_metadata().await.unwrap();
+    let expected_filename = format!("{}_rawinput.lance", name);
+    assert!(md.files.get("rawinput").unwrap().filename == expected_filename);
+
     let loaded = storage.load_dense("rawinput").await.unwrap();
 
     assert_eq!(data.shape(), loaded.shape());
@@ -275,6 +218,11 @@ async fn test_lance_sparse_roundtrip() {
         .save_sparse("adjacency", &adjacency, &md_path)
         .await
         .unwrap();
+
+    let md = storage.load_metadata().await.unwrap();
+    let expected_filename = format!("{}_adjacency.lance", name);
+    assert!(md.files.get("adjacency").unwrap().filename == expected_filename);
+
     let loaded: CsMat<f64> = storage.load_sparse("adjacency").await.unwrap();
 
     assert_eq!(adjacency.rows(), loaded.rows());
@@ -302,6 +250,11 @@ async fn test_lambdas_roundtrip() {
         .save_lambdas(norms.as_slice(), &md_path)
         .await
         .unwrap();
+
+    let md = storage.load_metadata().await.unwrap();
+    let expected_filename = format!("{}_lambdas.lance", name_id);
+    assert!(md.files.get("lambdas").unwrap().filename == expected_filename);
+
     let loaded = storage.load_lambdas().await.unwrap();
 
     assert_eq!(norms.len(), loaded.len());
@@ -325,23 +278,6 @@ async fn test_metadata_and_files_layout() {
 
     let md_path = storage.metadata_path();
     assert!(md_path.exists());
-
-    // load and add files to metadata
-    let mut md: GeneMetadata = storage.load_metadata().await.unwrap();
-
-    let mock_info_adj = md.new_fileinfo(
-        "adjacency",
-        "sparse",
-        (nitems, nitems),
-        Some(adjacency.nnz()),
-        None,
-    );
-
-    let mock_info_norms = md.new_fileinfo("norms", "vector", (nitems, 1), None, None);
-
-    md = md.add_file("adjacency", mock_info_adj);
-    md = md.add_file("norms", mock_info_norms);
-    let md_path = storage.save_metadata(&md).await.unwrap();
 
     storage
         .save_dense("rawinput", &data, &md_path)
@@ -427,7 +363,7 @@ async fn test_metadata_persistence() {
     assert_eq!(loaded_md.nrows, nitems);
     assert_eq!(loaded_md.ncols, nfeatures);
 
-    assert!(loaded_md.files.contains_key("rawinput"));
+    assert!(loaded_md.name_id == name);
 }
 
 #[tokio::test(flavor = "multi_thread")]

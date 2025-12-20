@@ -62,10 +62,12 @@ impl FileInfo {
     /// Assign the right filetype to the keyname of the file
     pub fn which_filetype(filetype: &str) -> String {
         match filetype {
-            "rawinput" | "sub_centroids" => String::from("dense"),
-            "adjacency" | "laplacian" | "signals" => String::from("sparse"),
-            "lambdas" | "item_norms" | "norms" => String::from("vector"),
-            _ => panic!("key not recognised {}", filetype),
+            "rawinput" | "sub_centroids" | "dense" => String::from("dense"),
+            "adjacency" | "laplacian" | "signals" | "sparse" => String::from("sparse"),
+            "lambdas" | "item_norms" | "norms" | "vector" => String::from("vector"),
+            _ => panic!(
+                "Wrong filetype: use specific types or generic ('dense', 'sparse', 'vector')"
+            ),
         }
     }
 }
@@ -138,27 +140,9 @@ impl Metadata for GeneMetadata {
             name_id, nitems, nfeatures
         );
 
-        let mut md = Self::new(name_id)
+        let md = Self::new(name_id)
             .with_base(storage.base_path())
             .with_dimensions(nitems, nfeatures);
-
-        debug!("GeneMetadata::seed_metadata: registering files");
-
-        let (key, filetype, rows, cols, nnz) = ("rawinput", "dense", nitems, nfeatures, None);
-        debug!(
-            "SpaceMetadata::seed_metadata_eigen: adding file {} ({}x{}, nnz={:?})",
-            filetype, rows, cols, nnz
-        );
-        md = md.add_file(
-            key,
-            FileInfo::new(
-                format!("{}_{}.lance", name_id, key),
-                filetype,
-                (rows, cols),
-                nnz,
-                None,
-            ),
-        );
 
         debug!("GeneMetadata::seed_metadata: saving metadata to storage");
         storage.save_metadata(&md).await?;

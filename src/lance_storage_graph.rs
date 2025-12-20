@@ -100,7 +100,7 @@ impl StorageBackend for LanceStorageGraph {
     /// This format is optimized for vector search and enables Lance's full-zip encoding.
     ///
     /// # Arguments
-    /// * `filename` - Type identifier (e.g., "rawinput", "sub_centroids")
+    /// * `filename` - any name
     /// * `matrix` - Dense matrix to save (N rows × F cols)
     /// * `md_path` - Metadata file path for validation
     async fn save_dense(
@@ -130,11 +130,24 @@ impl StorageBackend for LanceStorageGraph {
             )));
         }
 
-        // Write to Lance
-        let uri = Self::path_to_uri(&path);
-        self.write_lance_batch_async(uri, batch).await?;
-
-        info!("Dense {} matrix saved successfully", key);
+        {
+            // Write to Lance
+            let uri = Self::path_to_uri(&path);
+            self.write_lance_batch_async(uri, batch).await?;
+            let mut md = self.load_metadata().await?;
+            md = md.add_file(
+                key,
+                FileInfo::new(
+                    format!("{}_{}.lance", self.get_name(), key),
+                    "dense",
+                    matrix.shape(),
+                    None,
+                    None,
+                ),
+            );
+            self.save_metadata(&md).await?;
+            info!("Dense {} matrix saved successfully", key);
+        }
         Ok(())
     }
 
@@ -143,7 +156,7 @@ impl StorageBackend for LanceStorageGraph {
     /// Reads FixedSizeList vectors and reconstructs a column-major DenseMatrix.
     ///
     /// # Arguments
-    /// * `filename` - Type identifier (e.g., "rawinput", "sub_centroids")
+    /// * `filename` - any name previously assigned
     ///
     /// # Returns
     /// Column-major DenseMatrix matching smartcore conventions
@@ -361,23 +374,25 @@ impl StorageBackend for LanceStorageGraph {
             path
         );
 
-        let mut metadata = self.load_metadata().await?;
         let filetype = FileInfo::which_filetype(key);
-        metadata.files.insert(
-            key.to_string(),
-            metadata.new_fileinfo(
+        {
+            let mut metadata = self.load_metadata().await?;
+            metadata = metadata.add_file(
                 key,
-                filetype.as_str(),
-                (matrix.rows(), matrix.cols()),
-                Some(matrix.nnz()),
-                None,
-            ),
-        );
-        self.save_metadata(&metadata).await?;
+                FileInfo::new(
+                    format!("{}_{}.lance", self.get_name(), key),
+                    filetype.as_str(),
+                    (matrix.rows(), matrix.cols()),
+                    Some(matrix.nnz()),
+                    None,
+                ),
+            );
+            self.save_metadata(&metadata).await?;
 
-        let batch = self.to_sparse_record_batch(matrix)?;
-        let uri = Self::path_to_uri(&path);
-        self.write_lance_batch_async(uri, batch).await?;
+            let batch = self.to_sparse_record_batch(matrix)?;
+            let uri = Self::path_to_uri(&path);
+            self.write_lance_batch_async(uri, batch).await?;
+        }
         info!("Sparse matrix {} saved successfully", filetype);
         Ok(())
     }
@@ -415,6 +430,7 @@ impl StorageBackend for LanceStorageGraph {
 
     async fn save_lambdas(&self, lambdas: &[f64], md_path: &Path) -> StorageResult<()> {
         self.validate_initialized(md_path)?;
+        let key = "lambdas";
         let path = self.file_path("lambdas");
         info!("Saving {} lambda values", lambdas.len());
 
@@ -425,8 +441,23 @@ impl StorageBackend for LanceStorageGraph {
         )
         .map_err(|e| StorageError::Lance(e.to_string()))?;
 
-        let uri = Self::path_to_uri(&path);
-        self.write_lance_batch_async(uri, batch).await?;
+        {
+            let mut metadata = self.load_metadata().await?;
+            metadata = metadata.add_file(
+                key,
+                FileInfo::new(
+                    format!("{}_{}.lance", self.get_name(), key),
+                    "vector",
+                    (lambdas.len(), 1),
+                    None,
+                    None,
+                ),
+            );
+            self.save_metadata(&metadata).await?;
+
+            let uri = Self::path_to_uri(&path);
+            self.write_lance_batch_async(uri, batch).await?;
+        }
         info!("Lambda values saved successfully");
         Ok(())
     }
@@ -458,8 +489,23 @@ impl StorageBackend for LanceStorageGraph {
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(float64_array) as _])
             .map_err(|e| StorageError::Lance(e.to_string()))?;
 
-        let uri = Self::path_to_uri(&path);
-        self.write_lance_batch_async(uri, batch).await?;
+        {
+            let mut metadata = self.load_metadata().await?;
+            metadata = metadata.add_file(
+                key,
+                FileInfo::new(
+                    format!("{}_{}.lance", self.get_name(), key),
+                    "vector",
+                    (vector.len(), 1),
+                    None,
+                    None,
+                ),
+            );
+            self.save_metadata(&metadata).await?;
+
+            let uri = Self::path_to_uri(&path);
+            self.write_lance_batch_async(uri, batch).await?;
+        }
         info!("Index {} saved successfully", key);
         Ok(())
     }
@@ -474,8 +520,23 @@ impl StorageBackend for LanceStorageGraph {
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(uint32_array) as _])
             .map_err(|e| StorageError::Lance(e.to_string()))?;
 
-        let uri = Self::path_to_uri(&path);
-        self.write_lance_batch_async(uri, batch).await?;
+        {
+            let mut metadata = self.load_metadata().await?;
+            metadata = metadata.add_file(
+                key,
+                FileInfo::new(
+                    format!("{}_{}.lance", self.get_name(), key),
+                    "vector",
+                    (vector.len(), 1),
+                    None,
+                    None,
+                ),
+            );
+            self.save_metadata(&metadata).await?;
+
+            let uri = Self::path_to_uri(&path);
+            self.write_lance_batch_async(uri, batch).await?;
+        }
         info!("Index {} saved successfully", key);
         Ok(())
     }
@@ -619,7 +680,8 @@ impl StorageBackend for LanceStorageGraph {
     /// Save centroid_map (item-to-centroid assignments)
     async fn save_centroid_map(&self, map: &[usize], md_path: &Path) -> StorageResult<()> {
         self.validate_initialized(md_path)?;
-        let path = self.file_path("centroid_map");
+        let key = "centroid_map";
+        let path = self.file_path(key);
         info!("Saving {} centroid map entries", map.len());
 
         let schema = Schema::new(vec![Field::new("centroid_id", DataType::UInt32, false)]);
@@ -627,8 +689,23 @@ impl StorageBackend for LanceStorageGraph {
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(uint32_array) as _])
             .map_err(|e| StorageError::Lance(e.to_string()))?;
 
-        let uri = Self::path_to_uri(&path);
-        self.write_lance_batch_async(uri, batch).await?;
+        {
+            let mut metadata = self.load_metadata().await?;
+            metadata = metadata.add_file(
+                key,
+                FileInfo::new(
+                    format!("{}_{}.lance", self.get_name(), key),
+                    "vector",
+                    (map.len(), 1),
+                    None,
+                    None,
+                ),
+            );
+            self.save_metadata(&metadata).await?;
+
+            let uri = Self::path_to_uri(&path);
+            self.write_lance_batch_async(uri, batch).await?;
+        }
         info!("Centroid map saved successfully");
         Ok(())
     }
@@ -654,7 +731,8 @@ impl StorageBackend for LanceStorageGraph {
     /// Save subcentroid_lambdas (tau values for subcentroids)
     async fn save_subcentroid_lambdas(&self, lambdas: &[f64], md_path: &Path) -> StorageResult<()> {
         self.validate_initialized(md_path)?;
-        let path = self.file_path("subcentroid_lambdas");
+        let key = "subcentroid_lambdas";
+        let path = self.file_path(key);
         info!("Saving {} subcentroid lambda values", lambdas.len());
 
         let schema = Schema::new(vec![Field::new(
@@ -667,9 +745,23 @@ impl StorageBackend for LanceStorageGraph {
             vec![Arc::new(Float64Array::from(lambdas.to_vec())) as _],
         )
         .map_err(|e| StorageError::Lance(e.to_string()))?;
+        {
+            let mut metadata = self.load_metadata().await?;
+            metadata = metadata.add_file(
+                key,
+                FileInfo::new(
+                    format!("{}_{}.lance", self.get_name(), key),
+                    "vector",
+                    (lambdas.len(), 1),
+                    None,
+                    None,
+                ),
+            );
+            self.save_metadata(&metadata).await?;
 
-        let uri = Self::path_to_uri(&path);
-        self.write_lance_batch_async(uri, batch).await?;
+            let uri = Self::path_to_uri(&path);
+            self.write_lance_batch_async(uri, batch).await?;
+        }
         info!("Subcentroid lambda values saved successfully");
         Ok(())
     }
@@ -701,7 +793,8 @@ impl StorageBackend for LanceStorageGraph {
         md_path: &Path,
     ) -> StorageResult<()> {
         self.validate_initialized(md_path)?;
-        let path = self.file_path("sub_centroids");
+        let key = "sub_centroids";
+        let path = self.file_path(key);
         let (n_rows, n_cols) = subcentroids.shape();
         info!(
             "Saving subcentroids matrix {} x {} at {:?}",
@@ -709,8 +802,23 @@ impl StorageBackend for LanceStorageGraph {
         );
 
         let batch = self.to_dense_record_batch(subcentroids)?;
-        let uri = Self::path_to_uri(&path);
-        self.write_lance_batch_async(uri, batch).await?;
+        {
+            let mut metadata = self.load_metadata().await?;
+            metadata = metadata.add_file(
+                key,
+                FileInfo::new(
+                    format!("{}_{}.lance", self.get_name(), key),
+                    "vector",
+                    subcentroids.shape(),
+                    None,
+                    None,
+                ),
+            );
+            self.save_metadata(&metadata).await?;
+
+            let uri = Self::path_to_uri(&path);
+            self.write_lance_batch_async(uri, batch).await?;
+        }
         debug!("Subcentroids matrix saved successfully");
         Ok(())
     }
@@ -745,7 +853,8 @@ impl StorageBackend for LanceStorageGraph {
     /// Save item norms vector
     async fn save_item_norms(&self, item_norms: &[f64], md_path: &Path) -> StorageResult<()> {
         self.validate_initialized(md_path)?;
-        let path = self.file_path("item_norms");
+        let key = "item_norms";
+        let path = self.file_path(key);
         info!("Saving {} item norm values", item_norms.len());
 
         let schema = Schema::new(vec![Field::new("norm", DataType::Float64, false)]);
@@ -755,8 +864,23 @@ impl StorageBackend for LanceStorageGraph {
         )
         .map_err(|e| StorageError::Lance(e.to_string()))?;
 
-        let uri = Self::path_to_uri(&path);
-        self.write_lance_batch_async(uri, batch).await?;
+        {
+            let mut metadata = self.load_metadata().await?;
+            metadata = metadata.add_file(
+                key,
+                FileInfo::new(
+                    format!("{}_{}.lance", self.get_name(), key),
+                    "vector",
+                    (item_norms.len(), 1),
+                    None,
+                    None,
+                ),
+            );
+            self.save_metadata(&metadata).await?;
+
+            let uri = Self::path_to_uri(&path);
+            self.write_lance_batch_async(uri, batch).await?;
+        }
         info!("Item norms saved successfully");
         Ok(())
     }
@@ -785,7 +909,8 @@ impl StorageBackend for LanceStorageGraph {
         md_path: &Path,
     ) -> StorageResult<()> {
         self.validate_initialized(md_path)?;
-        let path = self.file_path("cluster_assignments");
+        let key = "cluster_assignments";
+        let path = self.file_path(key);
         info!("Saving {} cluster assignments", assignments.len());
 
         // Convert Option<usize> to i64 (-1 for None)
@@ -801,8 +926,23 @@ impl StorageBackend for LanceStorageGraph {
         )
         .map_err(|e| StorageError::Lance(e.to_string()))?;
 
-        let uri = Self::path_to_uri(&path);
-        self.write_lance_batch_async(uri, batch).await?;
+        {
+            let mut metadata = self.load_metadata().await?;
+            metadata = metadata.add_file(
+                key,
+                FileInfo::new(
+                    format!("{}_{}.lance", self.get_name(), key),
+                    "vector",
+                    (assignments.len(), 1),
+                    None,
+                    None,
+                ),
+            );
+            self.save_metadata(&metadata).await?;
+
+            let uri = Self::path_to_uri(&path);
+            self.write_lance_batch_async(uri, batch).await?;
+        }
         info!("Cluster assignments saved successfully");
         Ok(())
     }

@@ -123,11 +123,7 @@ async fn test_metadata_roundtrip_with_seed_metadata() {
     assert_eq!(loaded_metadata.base, original_metadata.base);
 
     // Verify the rawinput file entry was created by seed_metadata
-    assert!(loaded_metadata.files.contains_key("rawinput"));
-    let rawinput_info = loaded_metadata.files.get("rawinput").unwrap();
-    assert_eq!(rawinput_info.filetype, "dense");
-    assert_eq!(rawinput_info.rows, 1000);
-    assert_eq!(rawinput_info.cols, 256);
+    assert!(loaded_metadata.files.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]

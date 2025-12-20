@@ -51,27 +51,17 @@ let data =
 let md = GeneMetadata::seed_metadata(name, nitems, nfeatures, &storage.clone())
     .await
     .unwrap()
-    .with_dimensions(nitems, nfeatures)
-    .add_file(
-        "rawinput",
-        FileInfo::new(
-            expected_filename.clone(),
-            "dense",
-            (nitems, nfeatures),
-            None,
-            None,
-        ),
-    );
+    .with_dimensions(nitems, nfeatures);
 
 // your data is saved in an efficient format
 storage
-    .save_dense("rawinput", &data, &md_path)
+    .save_dense("my_dataset", &data, &md_path)
     .await
     .unwrap();
 
 // Loading back
 let md_path = storage.save_metadata(&md).await.unwrap();
-let loaded = storage.load_dense("rawinput").await.unwrap();
+let loaded = storage.load_dense("my_dataset").await.unwrap();
 ```
 
 ## Extending and traits
