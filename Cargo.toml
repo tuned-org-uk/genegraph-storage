@@ -32,7 +32,7 @@ log = "0.4.29"
 env_logger = "0.11.8"
 chrono = "0.4.42"
 uuid = { version = "1.19.0", features = ["v4", "serde"] }
-lance = { version = "1.0.0", default-features = false }
+lance = { version = "1.0.4", default-features = false }
 serde = { version = "^1.0.228", features = ["derive"] }
 serde_json = { version = "^1.0.145"}
 futures = "0.3.31"
