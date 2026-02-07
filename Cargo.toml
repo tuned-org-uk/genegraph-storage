@@ -36,7 +36,7 @@ lance = { version = "1.0.0", default-features = false }
 serde = { version = "^1.0.228", features = ["derive"] }
 serde_json = { version = "^1.0.149"}
 futures = "0.3.31"
-arrow-array = "^56.1.0"
+arrow-array = "^57.3.0"
 arrow = { version = "^56.1.0" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 parquet = { version = "^56.1.0" }
