@@ -1,9 +1,11 @@
 use crate::{StorageError, StorageResult};
-use arrow::record_batch::{RecordBatch, RecordBatchIterator};
+use arrow::record_batch::RecordBatchIterator;
+use arrow_array::RecordBatch;
+use log::{debug, info};
+
 use futures::StreamExt;
 use lance::Dataset;
 use lance::dataset::{WriteMode, WriteParams};
-use log::{debug, info};
 
 pub trait LanceStorage {
     /// Async helper: write a RecordBatch to a Lance dataset.
