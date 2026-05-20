@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use arrow::array::{Array as ArrowArray, Float64Array, Int64Array, UInt32Array};
+use arrow::array::{Array as ArrowArray, Float64Array, UInt32Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use log::{debug, info};
@@ -306,16 +306,13 @@ impl StorageBackend for LanceStorageGraph {
                     let mut data = Vec::with_capacity(n_rows * n_cols);
                     for col_idx in 0..n_cols {
                         let col = combined.column(col_idx);
-                        let arr = col
-                            .as_any()
-                            .downcast_ref::<Float64Array>()
-                            .ok_or_else(|| {
-                                StorageError::Invalid(format!(
-                                    "Wide-column parquet expects Float64, got {:?} in column {}",
-                                    col.data_type(),
-                                    col_idx
-                                ))
-                            })?;
+                        let arr = col.as_any().downcast_ref::<Float64Array>().ok_or_else(|| {
+                            StorageError::Invalid(format!(
+                                "Wide-column parquet expects Float64, got {:?} in column {}",
+                                col.data_type(),
+                                col_idx
+                            ))
+                        })?;
                         // Build column-major storage: all rows for col 0, then col 1, ...
                         for row_idx in 0..n_rows {
                             data.push(arr.value(row_idx));

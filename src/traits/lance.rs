@@ -1,6 +1,6 @@
 use crate::{StorageError, StorageResult};
+use arrow::record_batch::RecordBatch;
 use arrow::record_batch::RecordBatchIterator;
-use arrow_array::RecordBatch;
 use log::{debug, info};
 
 use futures::StreamExt;
