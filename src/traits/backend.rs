@@ -1,6 +1,6 @@
-use arrow::array::{Float64Array, UInt32Array};
+use arrow::array::{Array as ArrowArray, FixedSizeListArray, Float64Array, UInt32Array};
 use arrow::datatypes::{DataType, Field, Schema};
-use arrow_array::{Array as ArrowArray, FixedSizeListArray, RecordBatch};
+use arrow::record_batch::RecordBatch;
 use log::{debug, info, trace};
 use smartcore::linalg::basic::arrays::Array;
 use smartcore::linalg::basic::matrix::DenseMatrix;
@@ -370,8 +370,6 @@ pub trait StorageBackend: Send + Sync {
         expected_rows: usize,
         expected_cols: usize,
     ) -> StorageResult<CsMat<f64>> {
-        use arrow::array::UInt32Array;
-
         debug!("Reconstructing sparse matrix from RecordBatch");
 
         let row_arr = batch
