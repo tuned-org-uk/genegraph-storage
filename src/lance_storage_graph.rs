@@ -7,9 +7,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use arrow::array::{Float64Array, Int64Array, UInt32Array};
+use arrow::array::{Array as ArrowArray, Float64Array, Int64Array, UInt32Array};
 use arrow::datatypes::{DataType, Field, Schema};
-use arrow_array::{Array as ArrowArray, RecordBatch};
+use arrow::record_batch::RecordBatch;
 use log::{debug, info};
 use smartcore::linalg::basic::arrays::Array;
 use smartcore::linalg::basic::matrix::DenseMatrix;
@@ -224,7 +224,6 @@ impl StorageBackend for LanceStorageGraph {
                 Ok(matrix)
             }
             "parquet" => {
-                use arrow::datatypes::DataType;
                 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
                 use std::fs::File;
 
@@ -309,7 +308,7 @@ impl StorageBackend for LanceStorageGraph {
                         let col = combined.column(col_idx);
                         let arr = col
                             .as_any()
-                            .downcast_ref::<arrow_array::Float64Array>()
+                            .downcast_ref::<Float64Array>()
                             .ok_or_else(|| {
                                 StorageError::Invalid(format!(
                                     "Wide-column parquet expects Float64, got {:?} in column {}",
@@ -919,6 +918,7 @@ impl StorageBackend for LanceStorageGraph {
             .map(|opt| opt.map(|v| v as i64).unwrap_or(-1))
             .collect();
 
+        use arrow::array::Int64Array;
         let schema = Schema::new(vec![Field::new("cluster_id", DataType::Int64, false)]);
         let batch = RecordBatch::try_new(
             Arc::new(schema),
@@ -948,6 +948,7 @@ impl StorageBackend for LanceStorageGraph {
     }
 
     async fn load_cluster_assignments(&self) -> StorageResult<Vec<Option<usize>>> {
+        use arrow::array::Int64Array;
         let path = self.file_path("cluster_assignments");
         info!("Loading cluster assignments from {:?}", path);
 
@@ -961,11 +962,10 @@ impl StorageBackend for LanceStorageGraph {
 
         let assignments: Vec<Option<usize>> = (0..arr.len())
             .map(|i| {
-                let val = arr.value(i);
-                if val < 0 { None } else { Some(val as usize) }
+                let v = arr.value(i);
+                if v < 0 { None } else { Some(v as usize) }
             })
             .collect();
-
         info!("Loaded {} cluster assignments", assignments.len());
         Ok(assignments)
     }
