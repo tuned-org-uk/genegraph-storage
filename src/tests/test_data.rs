@@ -32,7 +32,7 @@ pub fn make_gaussian_cliques_multi(
     let spacing = 20.0;
 
     // Use up to 4 dims for separation, at least 2.
-    let separation_dims = dims.min(4).max(2);
+    let separation_dims = dims.clamp(2, 4);
 
     let mut clique_centers = Vec::new();
     for i in 0..n_cliques {
@@ -48,23 +48,28 @@ pub fn make_gaussian_cliques_multi(
 
         // For at least 2/3 of clusters, add distinct patterns in extra dims.
         if i < (n_cliques * 2 / 3).max(1) {
-            for d in 2..separation_dims {
+            for (d, slot) in center
+                .iter_mut()
+                .enumerate()
+                .skip(2)
+                .take(separation_dims - 2)
+            {
                 let pattern_offset = match d {
                     2 => (i % 3) as f64 * spacing * 0.8,
                     3 => ((i / 3) % 3) as f64 * spacing * 0.6,
                     _ => ((i / 9) % 2) as f64 * spacing * 0.4,
                 };
-                center[d] = pattern_offset;
+                *slot = pattern_offset;
             }
 
             let small_offset = Uniform::new(-spacing * 0.2, spacing * 0.2).unwrap();
-            for d in separation_dims..dims {
-                center[d] = small_offset.sample(&mut rng);
+            for slot in center.iter_mut().skip(separation_dims) {
+                *slot = small_offset.sample(&mut rng);
             }
         } else {
             let medium_offset = Uniform::new(-spacing * 0.3, spacing * 0.3).unwrap();
-            for d in 2..dims {
-                center[d] = medium_offset.sample(&mut rng);
+            for slot in center.iter_mut().skip(2) {
+                *slot = medium_offset.sample(&mut rng);
             }
         }
 
@@ -167,8 +172,8 @@ pub fn make_gaussian_cliques_multi(
 
     for i in 0..n_points {
         if let Some(ci) = shuffled_memberships[i] {
-            for j in (i + 1)..n_points {
-                if shuffled_memberships[j] == Some(ci) {
+            for (j, other) in shuffled_memberships.iter().enumerate().skip(i + 1) {
+                if *other == Some(ci) {
                     // Undirected edge (i,j) and (j,i) with weight 1.0.
                     triplets.add_triplet(i, j, 1.0);
                     triplets.add_triplet(j, i, 1.0);

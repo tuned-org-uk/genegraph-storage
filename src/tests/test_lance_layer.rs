@@ -7,7 +7,7 @@ use crate::traits::backend::StorageBackend;
 use crate::traits::metadata::Metadata;
 
 use log::debug;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use approx::{assert_relative_eq, relative_eq};
 use smartcore::linalg::basic::arrays::{Array, Array2};
@@ -35,7 +35,7 @@ async fn init_test_builder(
     );
 
     let data =
-        DenseMatrix::<f64>::from_iterator(dense.iter().flatten().map(|x| *x), nitems, nfeatures, 0);
+        DenseMatrix::<f64>::from_iterator(dense.iter().flatten().copied(), nitems, nfeatures, 0);
 
     (base, storage, data, adjacency, norms)
 }
@@ -59,7 +59,7 @@ async fn test_metadata_simple() {
     let (nitems, nfeatures) = data.shape();
 
     // Create metadata
-    let md = GeneMetadata::seed_metadata(&name_id, nitems, nfeatures, &storage.clone())
+    let md = GeneMetadata::seed_metadata(name_id, nitems, nfeatures, &storage.clone())
         .await
         .unwrap();
     debug!("Saving metadata first to initialize storage directory");
@@ -69,7 +69,7 @@ async fn test_metadata_simple() {
     assert!(
         md_path.exists(),
         "Metadata file should exist at {:?}",
-        &md_path
+        md_path
     );
 
     // Assert metadata file is in the expected location
@@ -240,7 +240,7 @@ async fn test_lambdas_roundtrip() {
     let (nitems, nfeatures) = data.shape();
 
     // Create metadata
-    let md = GeneMetadata::seed_metadata(&name_id, nitems, nfeatures, &storage)
+    let md = GeneMetadata::seed_metadata(name_id, nitems, nfeatures, &storage)
         .await
         .unwrap();
     debug!("Saving metadata first to initialize storage directory");
@@ -271,7 +271,7 @@ async fn test_metadata_and_files_layout() {
     let (nitems, nfeatures) = data.shape();
 
     // Create metadata
-    GeneMetadata::seed_metadata(&name_id, nitems, nfeatures, &storage)
+    GeneMetadata::seed_metadata(name_id, nitems, nfeatures, &storage)
         .await
         .unwrap();
     debug!("Saving metadata first to initialize storage directory");
@@ -353,7 +353,7 @@ async fn test_metadata_persistence() {
     let (_, storage, data, _, _) = init_test_builder(name).await;
     let (nitems, nfeatures) = data.shape();
 
-    GeneMetadata::seed_metadata(&name, nitems, nfeatures, &storage)
+    GeneMetadata::seed_metadata(name, nitems, nfeatures, &storage)
         .await
         .unwrap();
 
@@ -390,10 +390,10 @@ async fn test_concurrent_storage_instances() {
 
     debug!("Saving:\n{:?}\n{:?}", path1, path2);
     // Create metadata
-    let md1 = GeneMetadata::seed_metadata(&name, nitems1, nfeatures1, &storage1)
+    let md1 = GeneMetadata::seed_metadata(name, nitems1, nfeatures1, &storage1)
         .await
         .unwrap();
-    let md2 = GeneMetadata::seed_metadata(&name, nitems2, nfeatures2, &storage2)
+    let md2 = GeneMetadata::seed_metadata(name, nitems2, nfeatures2, &storage2)
         .await
         .unwrap();
     debug!("Saving metadata first to initialize storage directory");
@@ -589,4 +589,82 @@ async fn test_lance_storage_spawn_metadata_consistency() {
     assert_eq!(spawned_metadata.ncols, metadata.ncols);
     assert_eq!(spawned_metadata.base, metadata.base);
     assert_eq!(spawned_metadata.files.len(), metadata.files.len());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_load_lambdas_reads_all_batches() {
+    crate::tests::init();
+    let name_id = "multi_batch_lambdas";
+    let (_, storage, _, _, _) = init_test_builder(name_id).await;
+
+    let md = GeneMetadata::seed_metadata(name_id, 1, 1, &storage.clone())
+        .await
+        .unwrap();
+    let md_path = storage.save_metadata(&md).await.unwrap();
+
+    // 10_000 rows exceeds the scan default batch size (8192), forcing a
+    // multi-batch read on load.
+    let n = 10_000;
+    let lambdas: Vec<f64> = (0..n).map(|i| (i % 100) as f64 / 100.0).collect();
+    storage.save_lambdas(&lambdas, &md_path).await.unwrap();
+
+    let loaded = storage.load_lambdas().await.unwrap();
+    assert_eq!(
+        loaded.len(),
+        n,
+        "load_lambdas must read all batches, not just the first"
+    );
+    assert_relative_eq!(loaded[9999], 99.0 / 100.0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_load_sparse_reads_all_batches() {
+    crate::tests::init();
+    let name_id = "multi_batch_sparse";
+    let (_, storage, _, _, _) = init_test_builder(name_id).await;
+
+    let md = GeneMetadata::seed_metadata(name_id, 1, 1, &storage.clone())
+        .await
+        .unwrap();
+    let md_path = storage.save_metadata(&md).await.unwrap();
+
+    // 10_000 triplets exceed the scan default batch size (8192).
+    let n = 10_000;
+    let rows: Vec<usize> = (0..n).collect();
+    let cols: Vec<usize> = (0..n).map(|i| i % 1000).collect();
+    let vals: Vec<f64> = (0..n).map(|i| (i % 7) as f64 + 1.0).collect();
+    let matrix = sprs::TriMat::from_triplets((n, 1000), rows, cols, vals).to_csr();
+
+    storage
+        .save_sparse("laplacian", &matrix, &md_path)
+        .await
+        .unwrap();
+    let loaded = storage.load_sparse("laplacian").await.unwrap();
+    assert_eq!(
+        loaded.nnz(),
+        n,
+        "load_sparse must read all batches, not just the first"
+    );
+}
+
+#[test]
+fn test_path_to_uri_rejects_relative_paths() {
+    let err = <LanceStorageGraph as StorageBackend>::path_to_uri(Path::new("relative/no.lance"))
+        .unwrap_err();
+    assert!(
+        matches!(err, StorageError::Invalid(ref msg) if msg.contains("relative")),
+        "expected Invalid for relative path, got: {err}"
+    );
+}
+
+#[test]
+fn test_path_to_uri_absolute_missing_path_is_ok() {
+    let uri = <LanceStorageGraph as StorageBackend>::path_to_uri(Path::new(
+        "/tmp/genegraph-definitely-not-yet-written.lance",
+    ))
+    .unwrap();
+    assert_eq!(
+        uri,
+        "file:///tmp/genegraph-definitely-not-yet-written.lance"
+    );
 }

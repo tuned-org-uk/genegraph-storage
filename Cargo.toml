@@ -31,12 +31,13 @@ sprs = "0.11.4"
 log = "0.4.29"
 env_logger = "0.11.9"
 chrono = "0.4.45"
-lance = { version = "6.0.0", default-features = false }
+lance = { version = "11.0.0", default-features = false }
 serde = { version = "^1.0.228", features = ["derive"] }
 serde_json = { version = "^1.0.150"}
 arrow = { version = "^58.0.0" }
 uuid = { version = "1.21.0", features = ["v4", "serde"] }
 futures = "0.3.32"
+url = "2.5.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 parquet = { version = "^58.0.0" }
 

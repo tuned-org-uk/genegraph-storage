@@ -105,7 +105,7 @@ pub trait StorageBackend: Send + Sync {
     /// Returns the metadata path.
     fn metadata_path(&self) -> PathBuf;
     /// return the base path as file:// string
-    fn basepath_to_uri(&self) -> String;
+    fn basepath_to_uri(&self) -> StorageResult<String>;
 
     /// Load initial data using columnar format from a file path.
     /// Implementations may use this as a helper for async `load_dense`.
@@ -115,21 +115,24 @@ pub trait StorageBackend: Send + Sync {
     fn file_path(&self, key: &str) -> PathBuf;
 
     /// Converts a full file path to a `file://` URI for Lance.
-    fn path_to_uri(path: &Path) -> String {
-        path.canonicalize()
-            .unwrap_or_else(|_| {
-                if path.is_absolute() {
-                    path.to_path_buf()
-                } else if path.is_relative() {
-                    std::env::current_dir()
-                        .unwrap_or_else(|_| PathBuf::from("/"))
-                        .join(path)
-                } else {
-                    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(path)
-                }
+    ///
+    /// The path must be absolute; relative paths are rejected instead of
+    /// being silently joined against a guessed working directory.
+    /// Non-existing paths are allowed (saves write to fresh locations);
+    /// existing ones are canonicalised first.
+    fn path_to_uri(path: &Path) -> StorageResult<String> {
+        let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        if !resolved.is_absolute() {
+            return Err(StorageError::Invalid(format!(
+                "cannot convert relative path {:?} to a file:// URI; pass an absolute path",
+                path
+            )));
+        }
+        url::Url::from_file_path(&resolved)
+            .map(|u| u.to_string())
+            .map_err(|_| {
+                StorageError::Invalid(format!("cannot express {:?} as a file:// URI", resolved))
             })
-            .to_string_lossy()
-            .to_string()
     }
 
     /// Validates that the storage directory is properly initialized with metadata.
