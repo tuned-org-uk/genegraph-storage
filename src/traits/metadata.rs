@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use crate::StorageError;
+use crate::StorageResult;
 use crate::metadata::FileInfo;
 use crate::metadata::GeneMetadata;
 use crate::traits::backend::StorageBackend;
@@ -18,7 +19,7 @@ pub trait Metadata {
         data_shape: (usize, usize),
         nnz: Option<usize>,
         size_bytes: Option<u64>,
-    ) -> FileInfo;
+    ) -> StorageResult<FileInfo>;
 
     /// Standard pipeline object
     async fn seed_metadata<B: StorageBackend>(

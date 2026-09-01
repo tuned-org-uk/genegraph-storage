@@ -19,17 +19,19 @@ A storage layer for:
 cargo add genegraph_storage
 ```
 
-Simple example:
+Simple example (kept in sync with the compile-checked doc-test on `LanceStorageGraph`):
 
 ```rust
-use genegraph_storage::lance::LanceStorage;
-use genegraph_storage::metadata::{FileInfo, GeneMetadata};
-use genegraph_storage::traits::StorageBackend;
+use genegraph_storage::lance_storage_graph::LanceStorageGraph;
+use genegraph_storage::metadata::GeneMetadata;
+use genegraph_storage::traits::backend::StorageBackend;
+use genegraph_storage::traits::metadata::Metadata;
+use smartcore::linalg::basic::arrays::{Array, Array2};
 use smartcore::linalg::basic::matrix::DenseMatrix;
 
 // instantiate a storage
-let storage = LanceStorage::new(
-    "/tmp".to_string_lossy().to_string(),
+let storage = LanceStorageGraph::new(
+    "/tmp".to_string(),
     "basic_test".to_string(),
 );
 
@@ -42,16 +44,15 @@ let dense: Vec<Vec<f64>> = vec![
     vec![0.05, 0.4, 0.2, 0.3, 0.7]
 ];
 
-let (nitems, nfeatures) = dense.len(), dense[0].len(); 
-let data =
-    DenseMatrix::<f64>::from_iterator(
-        dense.iter().flatten().map(|x| *x), nitems, nfeatures, 0);
+let (nitems, nfeatures) = (dense.len(), dense[0].len());
+let data = DenseMatrix::<f64>::from_iterator(
+    dense.iter().flatten().copied(), nitems, nfeatures, 0);
 
-// Save metadata FIRST to initialize the storage directory
-let md = GeneMetadata::seed_metadata(name, nitems, nfeatures, &storage.clone())
+// seed metadata FIRST to initialize the storage directory
+let md = GeneMetadata::seed_metadata("basic_test", nitems, nfeatures, &storage)
     .await
-    .unwrap()
-    .with_dimensions(nitems, nfeatures);
+    .unwrap();
+let md_path = storage.save_metadata(&md).await.unwrap();
 
 // your data is saved in an efficient format
 storage
@@ -60,7 +61,6 @@ storage
     .unwrap();
 
 // Loading back
-let md_path = storage.save_metadata(&md).await.unwrap();
 let loaded = storage.load_dense("my_dataset").await.unwrap();
 ```
 

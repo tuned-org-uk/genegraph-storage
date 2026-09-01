@@ -31,12 +31,16 @@ async fn test_metadata_roundtrip_basic() {
     // Add file entries to test HashMap serialization
     original_metadata.files.insert(
         "rawinput".to_string(),
-        original_metadata.new_fileinfo("rawinput", "dense", (500, 128), None, Some(65536)),
+        original_metadata
+            .new_fileinfo("rawinput", "dense", (500, 128), None, Some(65536))
+            .expect("dense is a known filetype"),
     );
 
     original_metadata.files.insert(
         "lambdas".to_string(),
-        original_metadata.new_fileinfo("lambdas", "vector", (500, 128), None, Some(65536)),
+        original_metadata
+            .new_fileinfo("lambdas", "vector", (500, 128), None, Some(65536))
+            .expect("vector is a known filetype"),
     );
 
     // Save metadata using StorageBackend trait
@@ -228,4 +232,112 @@ async fn test_metadata_read_nonexistent_file() {
         }
         _ => panic!("Expected StorageError::Io, got {:?}", result),
     }
+}
+
+// ===== Issue #47: validate_initialized must return an error, not assert_eq!-panic =====
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_validate_initialized_mismatched_md_path_returns_error() {
+    let name_id = "validate_mismatch";
+    let base_path = tmp_dir(name_id).await;
+    let storage =
+        LanceStorageGraph::new(base_path.to_string_lossy().to_string(), name_id.to_string());
+
+    let wrong_path = base_path.join("other_instance_metadata.json");
+    let result = storage.validate_initialized(&wrong_path);
+
+    match result {
+        Err(StorageError::InvalidState(msg)) => {
+            assert!(
+                msg.contains("mismatch"),
+                "message should mention the mismatch: {}",
+                msg
+            );
+            assert!(
+                msg.contains(&wrong_path.to_string_lossy().to_string()),
+                "message should include the found path: {}",
+                msg
+            );
+        }
+        other => panic!(
+            "expected StorageError::InvalidState for mismatched path, got {:?}",
+            other.err()
+        ),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_validate_initialized_matching_path_without_metadata_returns_invalid() {
+    let name_id = "validate_missing";
+    let base_path = tmp_dir(name_id).await;
+    let storage =
+        LanceStorageGraph::new(base_path.to_string_lossy().to_string(), name_id.to_string());
+
+    let result = storage.validate_initialized(&storage.metadata_path());
+    assert!(
+        matches!(result, Err(StorageError::Invalid(_))),
+        "expected Invalid (metadata missing), got {:?}",
+        result.err()
+    );
+}
+
+// ===== Issue #45: FileInfo classification must return errors, not panic =====
+
+#[test]
+fn test_which_format_maps_known_filetypes() {
+    assert_eq!(FileInfo::which_format("dense").unwrap(), "lance fixed-row");
+    assert_eq!(FileInfo::which_format("sparse").unwrap(), "lance row-major");
+    assert_eq!(FileInfo::which_format("vector").unwrap(), "lance row-major");
+}
+
+#[test]
+fn test_which_format_rejects_unknown_filetype_with_error() {
+    let result = FileInfo::which_format("bogus_format");
+    assert!(
+        matches!(result, Err(StorageError::UnsupportedFormat(ref s)) if s == "bogus_format"),
+        "expected UnsupportedFormat error, got {:?}",
+        result
+    );
+}
+
+#[test]
+fn test_which_filetype_maps_known_keys() {
+    assert_eq!(FileInfo::which_filetype("rawinput").unwrap(), "dense");
+    assert_eq!(FileInfo::which_filetype("sub_centroids").unwrap(), "dense");
+    assert_eq!(FileInfo::which_filetype("adjacency").unwrap(), "sparse");
+    assert_eq!(FileInfo::which_filetype("laplacian").unwrap(), "sparse");
+    assert_eq!(FileInfo::which_filetype("signals").unwrap(), "sparse");
+    assert_eq!(FileInfo::which_filetype("lambdas").unwrap(), "vector");
+    assert_eq!(FileInfo::which_filetype("item_norms").unwrap(), "vector");
+    assert_eq!(FileInfo::which_filetype("norms").unwrap(), "vector");
+}
+
+#[test]
+fn test_which_filetype_rejects_unknown_key_with_error() {
+    let result = FileInfo::which_filetype("bogus_key");
+    assert!(
+        matches!(result, Err(StorageError::UnsupportedFiletype(ref s)) if s == "bogus_key"),
+        "expected UnsupportedFiletype error, got {:?}",
+        result
+    );
+}
+
+#[test]
+fn test_fileinfo_new_rejects_unknown_filetype_with_error() {
+    let result = FileInfo::new("bogus.lance".to_string(), "bogus", (10, 10), None, None);
+    assert!(
+        matches!(result, Err(StorageError::UnsupportedFormat(_))),
+        "expected UnsupportedFormat error, got {:?}",
+        result
+    );
+}
+
+#[test]
+fn test_fileinfo_new_accepts_known_filetype() {
+    let info = FileInfo::new("f.lance".to_string(), "dense", (4, 2), None, None)
+        .expect("dense is a known filetype");
+    assert_eq!(info.filetype, "dense");
+    assert_eq!(info.storage_format, "lance fixed-row");
+    assert_eq!(info.rows, 4);
+    assert_eq!(info.cols, 2);
 }

@@ -41,14 +41,22 @@ async fn init_test_builder(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[should_panic]
 async fn test_no_metadata() {
     crate::tests::init();
     let name = "meta_layout";
     let (_, storage, data, _, _) = init_test_builder(name).await;
 
-    let path = storage.file_path("test");
-    storage.save_dense("rawinput", &data, &path).await.unwrap();
+    // Correct metadata path, but metadata was never seeded: the save must
+    // fail with an error instead of writing outside an initialized store.
+    let md_path = storage.metadata_path();
+    let err = storage
+        .save_dense("rawinput", &data, &md_path)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, StorageError::Invalid(_)),
+        "expected Invalid (metadata missing), got {err:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -138,19 +146,23 @@ async fn test_metadata_simple() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[should_panic]
 async fn test_lance_dense_missing_metadata() {
     crate::tests::init();
     let name = "missing_metadata";
-    let (_, storage, data, _, _) = init_test_builder(name).await;
+    let (base, storage, data, _, _) = init_test_builder(name).await;
 
-    // Use row-major ordering (true parameter)
-    let path = storage.file_path("dense");
-
-    storage
-        .save_dense("missing_data", &data, &path)
+    // A data file path is not a metadata path: validate_initialized must
+    // report the mismatch as an error instead of asserting (issue #47).
+    let wrong_path = storage.file_path("dense");
+    let err = storage
+        .save_dense("missing_data", &data, &wrong_path)
         .await
-        .unwrap();
+        .unwrap_err();
+    assert!(
+        matches!(err, StorageError::InvalidState(ref msg) if msg.contains(wrong_path.to_string_lossy().as_ref())),
+        "expected InvalidState (metadata path mismatch), got {err:?}"
+    );
+    drop(base);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -571,7 +583,8 @@ async fn test_lance_storage_spawn_metadata_consistency() {
             (200, 75),
             None,
             None,
-        ),
+        )
+        .expect("dense is a known filetype"),
     );
 
     storage
@@ -667,4 +680,284 @@ fn test_path_to_uri_absolute_missing_path_is_ok() {
         uri,
         "file:///tmp/genegraph-definitely-not-yet-written.lance"
     );
+}
+
+#[test]
+#[cfg(unix)]
+fn test_path_to_uri_unresolvable_path_returns_error() {
+    // Issue #48: a symlink loop makes canonicalize() fail with ELOOP (not
+    // NotFound). The failure must surface as an error instead of being
+    // silently replaced by the unresolved path.
+    let base = std::env::temp_dir().join(format!("gg_uri_loop_{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&base).unwrap();
+    // Self-referential symlink: canonicalize() fails with ELOOP (not NotFound)
+    std::os::unix::fs::symlink("loop", base.join("loop")).unwrap();
+    let path = base.join("loop");
+
+    let result = <LanceStorageGraph as StorageBackend>::path_to_uri(&path);
+    assert!(
+        result.is_err(),
+        "expected error for unresolvable path, got {:?}",
+        result
+    );
+
+    std::fs::remove_dir_all(&base).ok();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_from_sparse_batch_dimension_mismatch_returns_error() {
+    // Issue #46: schema metadata dimensions that disagree with storage
+    // metadata must produce a typed error, not a panic.
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use arrow::array::{Float64Array, UInt32Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+
+    crate::tests::init();
+    let name_id = "sparse_dim_mismatch";
+    let base = tmp_dir(name_id).await;
+    let storage = LanceStorageGraph::new(base.to_string_lossy().to_string(), name_id.to_string());
+
+    // Batch schema metadata claims a 5x5 matrix...
+    let mut schema_metadata = HashMap::new();
+    schema_metadata.insert("rows".to_string(), "5".to_string());
+    schema_metadata.insert("cols".to_string(), "5".to_string());
+    let schema = Schema::new(vec![
+        Field::new("row", DataType::UInt32, false),
+        Field::new("col", DataType::UInt32, false),
+        Field::new("value", DataType::Float64, false),
+    ])
+    .with_metadata(schema_metadata);
+    let batch = RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(UInt32Array::from(vec![0u32, 1u32])) as _,
+            Arc::new(UInt32Array::from(vec![1u32, 2u32])) as _,
+            Arc::new(Float64Array::from(vec![1.0, 2.0])) as _,
+        ],
+    )
+    .unwrap();
+
+    // ...but storage metadata expects 10x10.
+    let result = storage.from_sparse_record_batch(batch, 10, 10);
+    assert!(
+        matches!(result, Err(StorageError::DimensionMismatch { .. })),
+        "expected DimensionMismatch, got {:?}",
+        result
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_save_index_rejects_values_exceeding_u32_max() {
+    // Issue #51: usize values above u32::MAX must not be silently truncated.
+    crate::tests::init();
+    let name_id = "index_overflow";
+    let (_, storage, _, _, _) = init_test_builder(name_id).await;
+
+    let md = GeneMetadata::seed_metadata(name_id, 1, 1, &storage)
+        .await
+        .unwrap();
+    let md_path = storage.save_metadata(&md).await.unwrap();
+
+    let too_big = u32::MAX as usize + 1;
+    let err = storage
+        .save_index("big_index", &[0, 1, too_big], &md_path)
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, StorageError::Overflow(ref msg) if msg.contains(&too_big.to_string())),
+        "expected Overflow error mentioning {}, got {:?}",
+        too_big,
+        err
+    );
+
+    // The failed save must not register anything in metadata
+    let md = storage.load_metadata().await.unwrap();
+    assert!(
+        !md.files.contains_key("big_index"),
+        "failed save must not register the file in metadata"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_save_centroid_map_rejects_values_exceeding_u32_max() {
+    // Issue #51: same checked-conversion contract as save_index.
+    crate::tests::init();
+    let name_id = "centroid_overflow";
+    let (_, storage, _, _, _) = init_test_builder(name_id).await;
+
+    let md = GeneMetadata::seed_metadata(name_id, 1, 1, &storage)
+        .await
+        .unwrap();
+    let md_path = storage.save_metadata(&md).await.unwrap();
+
+    let too_big = u32::MAX as usize + 7;
+    let err = storage
+        .save_centroid_map(&[0, 1, too_big], &md_path)
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, StorageError::Overflow(ref msg) if msg.contains(&too_big.to_string())),
+        "expected Overflow error mentioning {}, got {:?}",
+        too_big,
+        err
+    );
+
+    let md = storage.load_metadata().await.unwrap();
+    assert!(
+        !md.files.contains_key("centroid_map"),
+        "failed save must not register the file in metadata"
+    );
+}
+
+// ===== Issue #50 guard tests: round-trips that must keep working while the
+// duplicated save/load pattern is consolidated into a shared helper. =====
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_index_roundtrip() {
+    crate::tests::init();
+    let name_id = "index_roundtrip";
+    let (_, storage, data, _, _) = init_test_builder(name_id).await;
+    let (nitems, _) = data.shape();
+
+    let md = GeneMetadata::seed_metadata(name_id, nitems, 1, &storage)
+        .await
+        .unwrap();
+    let md_path = storage.save_metadata(&md).await.unwrap();
+
+    let index: Vec<usize> = (0..nitems).rev().collect();
+    storage
+        .save_index("ordering", &index, &md_path)
+        .await
+        .unwrap();
+
+    let loaded = storage.load_index("ordering").await.unwrap();
+    assert_eq!(loaded, index);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_centroid_map_roundtrip() {
+    crate::tests::init();
+    let name_id = "centroid_map_roundtrip";
+    let (_, storage, data, _, _) = init_test_builder(name_id).await;
+    let (nitems, _) = data.shape();
+
+    let md = GeneMetadata::seed_metadata(name_id, nitems, 1, &storage)
+        .await
+        .unwrap();
+    let md_path = storage.save_metadata(&md).await.unwrap();
+
+    let map: Vec<usize> = (0..nitems).map(|i| i % 5).collect();
+    storage.save_centroid_map(&map, &md_path).await.unwrap();
+
+    let loaded = storage.load_centroid_map().await.unwrap();
+    assert_eq!(loaded, map);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_item_norms_roundtrip() {
+    crate::tests::init();
+    let name_id = "item_norms_roundtrip";
+    let (_, storage, data, _, norms) = init_test_builder(name_id).await;
+    let (nitems, nfeatures) = data.shape();
+
+    let md = GeneMetadata::seed_metadata(name_id, nitems, nfeatures, &storage)
+        .await
+        .unwrap();
+    let md_path = storage.save_metadata(&md).await.unwrap();
+
+    storage.save_item_norms(&norms, &md_path).await.unwrap();
+
+    let loaded = storage.load_item_norms().await.unwrap();
+    assert_eq!(loaded.len(), norms.len());
+    for (a, b) in norms.iter().zip(loaded.iter()) {
+        assert_relative_eq!(a, b, epsilon = 1e-10);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_subcentroids_roundtrip() {
+    crate::tests::init();
+    let name_id = "subcentroids_roundtrip";
+    let (_, storage, data, _, _) = init_test_builder(name_id).await;
+    let (nitems, nfeatures) = data.shape();
+
+    let md = GeneMetadata::seed_metadata(name_id, nitems, nfeatures, &storage)
+        .await
+        .unwrap();
+    let md_path = storage.save_metadata(&md).await.unwrap();
+
+    let subcentroids = DenseMatrix::new(
+        3,
+        nfeatures,
+        (0..3 * nfeatures).map(|i| (i % 7) as f64 * 0.25).collect(),
+        true,
+    )
+    .unwrap();
+    storage
+        .save_subcentroids(&subcentroids, &md_path)
+        .await
+        .unwrap();
+
+    let loaded = storage.load_subcentroids().await.unwrap();
+    assert_eq!(loaded.len(), 3);
+    assert_eq!(loaded[0].len(), nfeatures);
+    for (r, row) in loaded.iter().enumerate() {
+        for (c, value) in row.iter().enumerate() {
+            assert_relative_eq!(value, subcentroids.get((r, c)), epsilon = 1e-10);
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_subcentroid_lambdas_roundtrip() {
+    crate::tests::init();
+    let name_id = "subcentroid_lambdas_roundtrip";
+    let (_, storage, data, _, _) = init_test_builder(name_id).await;
+    let (nitems, nfeatures) = data.shape();
+
+    let md = GeneMetadata::seed_metadata(name_id, nitems, nfeatures, &storage)
+        .await
+        .unwrap();
+    let md_path = storage.save_metadata(&md).await.unwrap();
+
+    let lambdas: Vec<f64> = (0..nitems).map(|i| i as f64 * 0.01).collect();
+    storage
+        .save_subcentroid_lambdas(&lambdas, &md_path)
+        .await
+        .unwrap();
+
+    let loaded = storage.load_subcentroid_lambdas().await.unwrap();
+    assert_eq!(loaded.len(), lambdas.len());
+    for (a, b) in lambdas.iter().zip(loaded.iter()) {
+        assert_relative_eq!(a, b, epsilon = 1e-10);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_cluster_assignments_roundtrip() {
+    crate::tests::init();
+    let name_id = "cluster_assignments_roundtrip";
+    let (_, storage, data, _, _) = init_test_builder(name_id).await;
+    let (nitems, nfeatures) = data.shape();
+
+    let md = GeneMetadata::seed_metadata(name_id, nitems, nfeatures, &storage)
+        .await
+        .unwrap();
+    let md_path = storage.save_metadata(&md).await.unwrap();
+
+    let assignments: Vec<Option<usize>> = (0..nitems)
+        .map(|i| if i % 4 == 3 { None } else { Some(i % 5) })
+        .collect();
+    storage
+        .save_cluster_assignments(&assignments, &md_path)
+        .await
+        .unwrap();
+
+    let loaded = storage.load_cluster_assignments().await.unwrap();
+    assert_eq!(loaded, assignments);
 }
