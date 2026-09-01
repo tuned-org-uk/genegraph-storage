@@ -30,7 +30,7 @@ rayon = "1.11.0"
 sprs = "0.11.4"
 log = "0.4.29"
 env_logger = "0.11.9"
-chrono = "0.4.42"
+chrono = "0.4.45"
 lance = { version = "6.0.0", default-features = false }
 serde = { version = "^1.0.228", features = ["derive"] }
 serde_json = { version = "^1.0.150"}
