@@ -9,7 +9,11 @@ mod tests;
 use std::fmt;
 
 // Error Handling harness
+//
+// `#[non_exhaustive]` lets this crate add error variants in future releases
+// without breaking downstream `match` expressions that carry a wildcard arm.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum StorageError {
     Io(String),
     Serde(serde_json::Error),
@@ -17,6 +21,21 @@ pub enum StorageError {
     Invalid(String),
     Lance(String),
     QueryError(String),
+    /// A storage resource is in an unexpected state (e.g. the metadata path
+    /// passed to a `save_*` call does not match the instance metadata path).
+    InvalidState(String),
+    /// A filetype does not map to a known storage format.
+    UnsupportedFormat(String),
+    /// A key/filetype is not recognised as one of the supported file types.
+    UnsupportedFiletype(String),
+    /// Dimensions recorded in schema metadata do not match the dimensions
+    /// recorded in storage metadata.
+    DimensionMismatch {
+        expected: String,
+        found: String,
+    },
+    /// A numeric value exceeds the range of the storage type it is written to.
+    Overflow(String),
 }
 
 impl fmt::Display for StorageError {
@@ -28,6 +47,17 @@ impl fmt::Display for StorageError {
             StorageError::Invalid(msg) => write!(f, "Invalid data: {}", msg),
             StorageError::Lance(msg) => write!(f, "Lance error: {}", msg),
             StorageError::QueryError(msg) => write!(f, "Query error: {}", msg),
+            StorageError::InvalidState(msg) => write!(f, "Invalid state: {}", msg),
+            StorageError::UnsupportedFormat(msg) => write!(f, "Unsupported format: {}", msg),
+            StorageError::UnsupportedFiletype(msg) => write!(f, "Unsupported filetype: {}", msg),
+            StorageError::DimensionMismatch { expected, found } => {
+                write!(
+                    f,
+                    "Dimension mismatch: expected {}, found {}",
+                    expected, found
+                )
+            }
+            StorageError::Overflow(msg) => write!(f, "Overflow error: {}", msg),
         }
     }
 }

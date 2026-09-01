@@ -5,10 +5,9 @@
 //! - Callers (CLI, tests, services) are responsible for providing a Tokio runtime.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use arrow::array::{Array as ArrowArray, Float64Array, UInt32Array};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Float64Type, Int64Type, UInt32Type};
 use arrow::record_batch::RecordBatch;
 use log::{debug, info};
 use smartcore::linalg::basic::arrays::Array;
@@ -22,15 +21,80 @@ use crate::traits::lance::LanceStorage;
 use crate::traits::metadata::Metadata;
 use crate::{StorageError, StorageResult};
 
+/// Checked `usize -> u32` conversion.
+///
+/// Values above `u32::MAX` must surface an error instead of being silently
+/// truncated into wrong stored data (issue #51).
+fn checked_u32_values(values: &[usize], what: &str) -> StorageResult<Vec<u32>> {
+    values
+        .iter()
+        .map(|&v| {
+            u32::try_from(v).map_err(|_| {
+                StorageError::Overflow(format!(
+                    "{} value {} exceeds u32::MAX and would be silently truncated",
+                    what, v
+                ))
+            })
+        })
+        .collect()
+}
+
 /// Lance-based storage backend for ArrowSpace graph embeddings.
 ///
 /// Stores dense and sparse matrices as Lance datasets using a columnar format
 /// (`row`, `col`, `value` for sparse; `col_*` for dense) schema for efficient
 /// random and columnar access.
+///
+/// Metadata must be seeded before any `save_*` call so the storage directory
+/// is initialized; the example below is executed as a doc-test on every
+/// `cargo test` run so it cannot go stale.
+///
+/// # Examples
+///
+/// ```
+/// use genegraph_storage::lance_storage_graph::LanceStorageGraph;
+/// use genegraph_storage::metadata::GeneMetadata;
+/// use genegraph_storage::traits::backend::StorageBackend;
+/// use genegraph_storage::traits::metadata::Metadata;
+/// use smartcore::linalg::basic::arrays::{Array, Array2};
+/// use smartcore::linalg::basic::matrix::DenseMatrix;
+///
+/// let base = std::env::temp_dir().join(format!("genegraph_doc_{}", std::process::id()));
+/// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+/// let storage = LanceStorageGraph::new(
+///     base.to_string_lossy().to_string(),
+///     "doc_example".to_string(),
+/// );
+///
+/// // some 2D data
+/// let dense: Vec<Vec<f64>> = vec![vec![0.1, 0.4], vec![0.5, 0.2], vec![0.03, 0.8]];
+/// let (nitems, nfeatures) = (dense.len(), dense[0].len());
+/// let data = DenseMatrix::<f64>::from_iterator(
+///     dense.iter().flatten().copied(),
+///     nitems,
+///     nfeatures,
+///     0,
+/// );
+///
+/// // seed metadata FIRST to initialize the storage directory
+/// let md = GeneMetadata::seed_metadata("doc_example", nitems, nfeatures, &storage)
+///     .await
+///     .unwrap();
+/// let md_path = storage.save_metadata(&md).await.unwrap();
+///
+/// // your data is saved in an efficient Lance format
+/// storage.save_dense("my_dataset", &data, &md_path).await.unwrap();
+///
+/// // Loading back
+/// let loaded = storage.load_dense("my_dataset").await.unwrap();
+/// assert_eq!(loaded.shape(), (nitems, nfeatures));
+/// # });
+/// # std::fs::remove_dir_all(&base).ok();
+/// ```
 #[derive(Debug, Clone)]
 pub struct LanceStorageGraph {
-    pub(crate) _base: String,
-    pub(crate) _name: String,
+    pub(crate) base: String,
+    pub(crate) name: String,
 }
 
 impl LanceStorageGraph {
@@ -40,11 +104,11 @@ impl LanceStorageGraph {
     ///
     /// # Arguments
     ///
-    /// * `_base` - Base directory path for all storage files
-    /// * `_name` - Name prefix for this storage instance
-    pub fn new(_base: String, _name: String) -> Self {
-        info!("Creating LanceStorage at base={}, name={}", _base, _name);
-        Self { _base, _name }
+    /// * `base` - Base directory path for all storage files
+    /// * `name` - Name prefix for this storage instance
+    pub fn new(base: String, name: String) -> Self {
+        info!("Creating LanceStorage at base={}, name={}", base, name);
+        Self { base, name }
     }
 
     /// Spawn a LanceStorage from an existing seeded directory (with metadata.json)
@@ -73,25 +137,25 @@ impl LanceStorage for LanceStorageGraph {}
 
 impl StorageBackend for LanceStorageGraph {
     fn get_base(&self) -> String {
-        self._base.clone()
+        self.base.clone()
     }
 
     fn get_name(&self) -> String {
-        self._name.clone()
+        self.name.clone()
     }
 
     fn base_path(&self) -> PathBuf {
-        PathBuf::from(&self._base)
+        PathBuf::from(&self.base)
     }
 
     fn metadata_path(&self) -> PathBuf {
         self.base_path()
-            .join(format!("{}_metadata.json", self._name))
+            .join(format!("{}_metadata.json", self.name))
     }
 
     /// Converts the base path for the store to a `file://` URI for Lance.
     fn basepath_to_uri(&self) -> StorageResult<String> {
-        Self::path_to_uri(PathBuf::from(self._base.clone()).as_path())
+        Self::path_to_uri(PathBuf::from(self.base.clone()).as_path())
     }
 
     /// Save dense matrix using Lance-optimized vector format.
@@ -143,7 +207,7 @@ impl StorageBackend for LanceStorageGraph {
                     matrix.shape(),
                     None,
                     None,
-                ),
+                )?,
             );
             self.save_metadata(&md).await?;
             info!("Dense {} matrix saved successfully", key);
@@ -225,41 +289,58 @@ impl StorageBackend for LanceStorageGraph {
             }
             "parquet" => {
                 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-                use std::fs::File;
 
-                // 1. Read from Parquet into a single RecordBatch
-                let file = File::open(path)
-                    .map_err(|e| StorageError::Io(format!("Failed to open parquet file: {}", e)))?;
+                // Parquet readers require a synchronous `Read` impl; run the
+                // blocking open/read/concat on the dedicated blocking pool so
+                // the async executor thread is not stalled (issue #52).
+                let owned_path = path.to_path_buf();
+                let combined =
+                    tokio::task::spawn_blocking(move || -> StorageResult<RecordBatch> {
+                        let file = std::fs::File::open(&owned_path).map_err(|e| {
+                            StorageError::Io(format!("Failed to open parquet file: {}", e))
+                        })?;
 
-                let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| {
-                    StorageError::Parquet(format!("Failed to create parquet reader: {}", e))
-                })?;
-                let mut reader = builder.build().map_err(|e| {
-                    StorageError::Parquet(format!("Failed to build parquet reader: {}", e))
-                })?;
+                        let builder =
+                            ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| {
+                                StorageError::Parquet(format!(
+                                    "Failed to create parquet reader: {}",
+                                    e
+                                ))
+                            })?;
+                        let reader = builder.build().map_err(|e| {
+                            StorageError::Parquet(format!("Failed to build parquet reader: {}", e))
+                        })?;
 
-                let mut batches = Vec::new();
-                #[allow(clippy::while_let_on_iterator)]
-                while let Some(batch) = reader.next() {
-                    let batch = batch.map_err(|e| {
-                        StorageError::Parquet(format!("Failed to read parquet batch: {}", e))
-                    })?;
-                    batches.push(batch);
-                }
+                        let batches: Vec<RecordBatch> =
+                            reader.collect::<Result<Vec<_>, _>>().map_err(|e| {
+                                StorageError::Parquet(format!(
+                                    "Failed to read parquet batch: {}",
+                                    e
+                                ))
+                            })?;
 
-                if batches.is_empty() {
-                    return Err(StorageError::Invalid(format!(
-                        "Empty parquet dataset at {:?}",
-                        path
-                    )));
-                }
+                        if batches.is_empty() {
+                            return Err(StorageError::Invalid(format!(
+                                "Empty parquet dataset at {:?}",
+                                owned_path
+                            )));
+                        }
 
-                let schema = batches[0].schema();
-                let combined = arrow::compute::concat_batches(&schema, &batches).map_err(|e| {
-                    StorageError::Parquet(format!("Failed to concatenate parquet batches: {}", e))
-                })?;
+                        let schema = batches[0].schema();
+                        arrow::compute::concat_batches(&schema, &batches).map_err(|e| {
+                            StorageError::Parquet(format!(
+                                "Failed to concatenate parquet batches: {}",
+                                e
+                            ))
+                        })
+                    })
+                    .await
+                    .map_err(|e| {
+                        StorageError::Io(format!("Parquet reader task failed: {}", e))
+                    })??;
 
                 // 2. Detect layout: vector (FixedSizeList) vs old wide columnar (col_* Float64)
+                let schema = combined.schema();
                 let fields = schema.fields();
                 let is_vector = fields.len() == 1
                     && matches!(
@@ -346,7 +427,7 @@ impl StorageBackend for LanceStorageGraph {
 
     fn file_path(&self, key: &str) -> PathBuf {
         self.base_path()
-            .join(format!("{}_{}.lance", self._name, key))
+            .join(format!("{}_{}.lance", self.name, key))
     }
 
     // =========
@@ -370,7 +451,7 @@ impl StorageBackend for LanceStorageGraph {
             path
         );
 
-        let filetype = FileInfo::which_filetype(key);
+        let filetype = FileInfo::which_filetype(key)?;
         {
             let mut metadata = self.load_metadata().await?;
             metadata = metadata.add_file(
@@ -381,7 +462,7 @@ impl StorageBackend for LanceStorageGraph {
                     (matrix.rows(), matrix.cols()),
                     Some(matrix.nnz()),
                     None,
-                ),
+                )?,
             );
             self.save_metadata(&metadata).await?;
 
@@ -397,7 +478,7 @@ impl StorageBackend for LanceStorageGraph {
         info!("Loading sparse {} matrix", key);
 
         let metadata = self.load_metadata().await?;
-        let filetype = FileInfo::which_filetype(key);
+        let filetype = FileInfo::which_filetype(key)?;
         let file_info = metadata
             .files
             .get(key)
@@ -425,37 +506,9 @@ impl StorageBackend for LanceStorageGraph {
     }
 
     async fn save_lambdas(&self, lambdas: &[f64], md_path: &Path) -> StorageResult<()> {
-        self.validate_initialized(md_path)?;
-        let key = "lambdas";
-        let path = self.file_path("lambdas");
         info!("Saving {} lambda values", lambdas.len());
-
-        let schema = Schema::new(vec![Field::new("lambda", DataType::Float64, false)]);
-        let batch = RecordBatch::try_new(
-            Arc::new(schema),
-            vec![Arc::new(Float64Array::from(lambdas.to_vec())) as _],
-        )
-        .map_err(|e| StorageError::Lance(e.to_string()))?;
-
-        {
-            let mut metadata = self.load_metadata().await?;
-            metadata = metadata.add_file(
-                key,
-                FileInfo::new(
-                    format!("{}_{}.lance", self.get_name(), key),
-                    "vector",
-                    (lambdas.len(), 1),
-                    None,
-                    None,
-                ),
-            );
-            self.save_metadata(&metadata).await?;
-
-            let uri = Self::path_to_uri(&path)?;
-            self.write_lance_batch_async(uri, batch).await?;
-        }
-        info!("Lambda values saved successfully");
-        Ok(())
+        self.save_primitive_column::<Float64Type>("lambdas", "lambda", lambdas.to_vec(), md_path)
+            .await
     }
 
     async fn load_lambdas(&self) -> StorageResult<Vec<f64>> {
@@ -476,65 +529,18 @@ impl StorageBackend for LanceStorageGraph {
     }
 
     async fn save_vector(&self, key: &str, vector: &[f64], md_path: &Path) -> StorageResult<()> {
-        self.validate_initialized(md_path)?;
-        let path = self.file_path(key);
         info!("Saving {} values for vector {}", vector.len(), key);
-
-        let schema = Schema::new(vec![Field::new("element", DataType::Float64, false)]);
-        let float64_array = Float64Array::from_iter_values::<Vec<f64>>(vector.into());
-        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(float64_array) as _])
-            .map_err(|e| StorageError::Lance(e.to_string()))?;
-
-        {
-            let mut metadata = self.load_metadata().await?;
-            metadata = metadata.add_file(
-                key,
-                FileInfo::new(
-                    format!("{}_{}.lance", self.get_name(), key),
-                    "vector",
-                    (vector.len(), 1),
-                    None,
-                    None,
-                ),
-            );
-            self.save_metadata(&metadata).await?;
-
-            let uri = Self::path_to_uri(&path)?;
-            self.write_lance_batch_async(uri, batch).await?;
-        }
-        info!("Index {} saved successfully", key);
-        Ok(())
+        self.save_primitive_column::<Float64Type>(key, "element", vector.to_vec(), md_path)
+            .await
     }
 
     async fn save_index(&self, key: &str, vector: &[usize], md_path: &Path) -> StorageResult<()> {
-        self.validate_initialized(md_path)?;
-        let path = self.file_path(key);
         info!("Saving {} values for index {}", vector.len(), key);
-
-        let schema = Schema::new(vec![Field::new("id", DataType::UInt32, false)]);
-        let uint32_array = UInt32Array::from_iter_values(vector.iter().map(|&x| x as u32));
-        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(uint32_array) as _])
-            .map_err(|e| StorageError::Lance(e.to_string()))?;
-
-        {
-            let mut metadata = self.load_metadata().await?;
-            metadata = metadata.add_file(
-                key,
-                FileInfo::new(
-                    format!("{}_{}.lance", self.get_name(), key),
-                    "vector",
-                    (vector.len(), 1),
-                    None,
-                    None,
-                ),
-            );
-            self.save_metadata(&metadata).await?;
-
-            let uri = Self::path_to_uri(&path)?;
-            self.write_lance_batch_async(uri, batch).await?;
-        }
-        info!("Index {} saved successfully", key);
-        Ok(())
+        // Checked cast: usize values above u32::MAX must not be silently
+        // truncated (issue #51).
+        let values = checked_u32_values(vector, "index")?;
+        self.save_primitive_column::<UInt32Type>(key, "id", values, md_path)
+            .await
     }
 
     async fn load_vector(&self, filename: &str) -> StorageResult<Vec<f64>> {
@@ -675,35 +681,12 @@ impl StorageBackend for LanceStorageGraph {
 
     /// Save centroid_map (item-to-centroid assignments)
     async fn save_centroid_map(&self, map: &[usize], md_path: &Path) -> StorageResult<()> {
-        self.validate_initialized(md_path)?;
-        let key = "centroid_map";
-        let path = self.file_path(key);
         info!("Saving {} centroid map entries", map.len());
-
-        let schema = Schema::new(vec![Field::new("centroid_id", DataType::UInt32, false)]);
-        let uint32_array = UInt32Array::from_iter_values(map.iter().map(|&x| x as u32));
-        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(uint32_array) as _])
-            .map_err(|e| StorageError::Lance(e.to_string()))?;
-
-        {
-            let mut metadata = self.load_metadata().await?;
-            metadata = metadata.add_file(
-                key,
-                FileInfo::new(
-                    format!("{}_{}.lance", self.get_name(), key),
-                    "vector",
-                    (map.len(), 1),
-                    None,
-                    None,
-                ),
-            );
-            self.save_metadata(&metadata).await?;
-
-            let uri = Self::path_to_uri(&path)?;
-            self.write_lance_batch_async(uri, batch).await?;
-        }
-        info!("Centroid map saved successfully");
-        Ok(())
+        // Checked cast: usize values above u32::MAX must not be silently
+        // truncated (issue #51).
+        let values = checked_u32_values(map, "centroid map")?;
+        self.save_primitive_column::<UInt32Type>("centroid_map", "centroid_id", values, md_path)
+            .await
     }
 
     /// Load centroid_map
@@ -726,40 +709,14 @@ impl StorageBackend for LanceStorageGraph {
 
     /// Save subcentroid_lambdas (tau values for subcentroids)
     async fn save_subcentroid_lambdas(&self, lambdas: &[f64], md_path: &Path) -> StorageResult<()> {
-        self.validate_initialized(md_path)?;
-        let key = "subcentroid_lambdas";
-        let path = self.file_path(key);
         info!("Saving {} subcentroid lambda values", lambdas.len());
-
-        let schema = Schema::new(vec![Field::new(
+        self.save_primitive_column::<Float64Type>(
+            "subcentroid_lambdas",
             "subcentroid_lambda",
-            DataType::Float64,
-            false,
-        )]);
-        let batch = RecordBatch::try_new(
-            Arc::new(schema),
-            vec![Arc::new(Float64Array::from(lambdas.to_vec())) as _],
+            lambdas.to_vec(),
+            md_path,
         )
-        .map_err(|e| StorageError::Lance(e.to_string()))?;
-        {
-            let mut metadata = self.load_metadata().await?;
-            metadata = metadata.add_file(
-                key,
-                FileInfo::new(
-                    format!("{}_{}.lance", self.get_name(), key),
-                    "vector",
-                    (lambdas.len(), 1),
-                    None,
-                    None,
-                ),
-            );
-            self.save_metadata(&metadata).await?;
-
-            let uri = Self::path_to_uri(&path)?;
-            self.write_lance_batch_async(uri, batch).await?;
-        }
-        info!("Subcentroid lambda values saved successfully");
-        Ok(())
+        .await
     }
 
     /// Load subcentroid_lambdas
@@ -808,7 +765,7 @@ impl StorageBackend for LanceStorageGraph {
                     subcentroids.shape(),
                     None,
                     None,
-                ),
+                )?,
             );
             self.save_metadata(&metadata).await?;
 
@@ -848,37 +805,14 @@ impl StorageBackend for LanceStorageGraph {
 
     /// Save item norms vector
     async fn save_item_norms(&self, item_norms: &[f64], md_path: &Path) -> StorageResult<()> {
-        self.validate_initialized(md_path)?;
-        let key = "item_norms";
-        let path = self.file_path(key);
         info!("Saving {} item norm values", item_norms.len());
-
-        let schema = Schema::new(vec![Field::new("norm", DataType::Float64, false)]);
-        let batch = RecordBatch::try_new(
-            Arc::new(schema),
-            vec![Arc::new(Float64Array::from(item_norms.to_vec())) as _],
+        self.save_primitive_column::<Float64Type>(
+            "item_norms",
+            "norm",
+            item_norms.to_vec(),
+            md_path,
         )
-        .map_err(|e| StorageError::Lance(e.to_string()))?;
-
-        {
-            let mut metadata = self.load_metadata().await?;
-            metadata = metadata.add_file(
-                key,
-                FileInfo::new(
-                    format!("{}_{}.lance", self.get_name(), key),
-                    "vector",
-                    (item_norms.len(), 1),
-                    None,
-                    None,
-                ),
-            );
-            self.save_metadata(&metadata).await?;
-
-            let uri = Self::path_to_uri(&path)?;
-            self.write_lance_batch_async(uri, batch).await?;
-        }
-        info!("Item norms saved successfully");
-        Ok(())
+        .await
     }
 
     /// Load item norms vector
@@ -904,9 +838,6 @@ impl StorageBackend for LanceStorageGraph {
         assignments: &[Option<usize>],
         md_path: &Path,
     ) -> StorageResult<()> {
-        self.validate_initialized(md_path)?;
-        let key = "cluster_assignments";
-        let path = self.file_path(key);
         info!("Saving {} cluster assignments", assignments.len());
 
         // Convert Option<usize> to i64 (-1 for None)
@@ -915,33 +846,13 @@ impl StorageBackend for LanceStorageGraph {
             .map(|opt| opt.map(|v| v as i64).unwrap_or(-1))
             .collect();
 
-        use arrow::array::Int64Array;
-        let schema = Schema::new(vec![Field::new("cluster_id", DataType::Int64, false)]);
-        let batch = RecordBatch::try_new(
-            Arc::new(schema),
-            vec![Arc::new(Int64Array::from(values)) as _],
+        self.save_primitive_column::<Int64Type>(
+            "cluster_assignments",
+            "cluster_id",
+            values,
+            md_path,
         )
-        .map_err(|e| StorageError::Lance(e.to_string()))?;
-
-        {
-            let mut metadata = self.load_metadata().await?;
-            metadata = metadata.add_file(
-                key,
-                FileInfo::new(
-                    format!("{}_{}.lance", self.get_name(), key),
-                    "vector",
-                    (assignments.len(), 1),
-                    None,
-                    None,
-                ),
-            );
-            self.save_metadata(&metadata).await?;
-
-            let uri = Self::path_to_uri(&path)?;
-            self.write_lance_batch_async(uri, batch).await?;
-        }
-        info!("Cluster assignments saved successfully");
-        Ok(())
+        .await
     }
 
     async fn load_cluster_assignments(&self) -> StorageResult<Vec<Option<usize>>> {

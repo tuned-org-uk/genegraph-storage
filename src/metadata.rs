@@ -3,10 +3,10 @@
 use log::{debug, info};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs;
 use std::path::PathBuf;
 
 use crate::StorageError;
+use crate::StorageResult;
 use crate::traits::backend::StorageBackend;
 use crate::traits::metadata::Metadata;
 
@@ -27,47 +27,48 @@ pub struct FileInfo {
 
 impl FileInfo {
     /// Create a file spec to add to the persistence directory
+    ///
+    /// Fails with `StorageError::UnsupportedFormat` for unrecognised
+    /// filetypes instead of panicking (issue #45).
     pub fn new(
         filename: String,
         filetype: &str,
         data_shape: (usize, usize),
         nnz: Option<usize>,
         size_bytes: Option<u64>,
-    ) -> Self {
+    ) -> StorageResult<Self> {
         debug!(
             "FileInfo::new: filename={}, filetype={}, shape={}x{}, nnz={:?}",
             filename, filetype, data_shape.0, data_shape.1, nnz
         );
-        Self {
+        Ok(Self {
             filename,
             filetype: filetype.into(),
-            storage_format: Self::which_format(filetype),
+            storage_format: Self::which_format(filetype)?,
             rows: data_shape.0,
             cols: data_shape.1,
             nnz,
             size_bytes,
-        }
+        })
     }
 
     /// Assign the right format to the file type
-    pub fn which_format(filetype: &str) -> String {
+    pub fn which_format(filetype: &str) -> StorageResult<String> {
         match filetype {
-            "dense" => String::from("lance fixed-row"),
-            "sparse" => String::from("lance row-major"),
-            "vector" => String::from("lance row-major"),
-            _ => panic!("filetype not recognised {}", filetype),
+            "dense" => Ok(String::from("lance fixed-row")),
+            "sparse" => Ok(String::from("lance row-major")),
+            "vector" => Ok(String::from("lance row-major")),
+            other => Err(StorageError::UnsupportedFormat(other.to_string())),
         }
     }
 
     /// Assign the right filetype to the keyname of the file
-    pub fn which_filetype(filetype: &str) -> String {
+    pub fn which_filetype(filetype: &str) -> StorageResult<String> {
         match filetype {
-            "rawinput" | "sub_centroids" | "dense" => String::from("dense"),
-            "adjacency" | "laplacian" | "signals" | "sparse" => String::from("sparse"),
-            "lambdas" | "item_norms" | "norms" | "vector" => String::from("vector"),
-            _ => panic!(
-                "Wrong filetype: use specific types or generic ('dense', 'sparse', 'vector')"
-            ),
+            "rawinput" | "sub_centroids" | "dense" => Ok(String::from("dense")),
+            "adjacency" | "laplacian" | "signals" | "sparse" => Ok(String::from("sparse")),
+            "lambdas" | "item_norms" | "norms" | "vector" => Ok(String::from("vector")),
+            other => Err(StorageError::UnsupportedFiletype(other.to_string())),
         }
     }
 }
@@ -89,7 +90,9 @@ impl GeneMetadata {
     /// Read metadata file from JSON
     pub async fn read(path: PathBuf) -> Result<Self, StorageError> {
         info!("Reading metadata from {:?}", path);
-        let s = fs::read_to_string(path).map_err(|e| StorageError::Io(e.to_string()))?;
+        let s = tokio::fs::read_to_string(path)
+            .await
+            .map_err(|e| StorageError::Io(e.to_string()))?;
         let md: GeneMetadata = serde_json::from_str(&s).map_err(StorageError::Serde)?;
         info!("Metadata read successfully");
         Ok(md)
@@ -118,7 +121,7 @@ impl Metadata for GeneMetadata {
         data_shape: (usize, usize),
         nnz: Option<usize>,
         size_bytes: Option<u64>,
-    ) -> FileInfo {
+    ) -> StorageResult<FileInfo> {
         FileInfo::new(
             format!("{}_{}.lance", self.name_id, key),
             filetype,

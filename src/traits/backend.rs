@@ -5,7 +5,6 @@ use log::{debug, info, trace};
 use smartcore::linalg::basic::arrays::Array;
 use smartcore::linalg::basic::matrix::DenseMatrix;
 use sprs::{CsMat, TriMat};
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -118,10 +117,22 @@ pub trait StorageBackend: Send + Sync {
     ///
     /// The path must be absolute; relative paths are rejected instead of
     /// being silently joined against a guessed working directory.
-    /// Non-existing paths are allowed (saves write to fresh locations);
-    /// existing ones are canonicalised first.
+    /// Non-existing paths are allowed (saves write to fresh locations) and
+    /// fall back to the given absolute path; any other resolution failure
+    /// (permissions, symlink loops, ...) is surfaced as an error instead of
+    /// being silently replaced by the unresolved path.
     fn path_to_uri(path: &Path) -> StorageResult<String> {
-        let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let resolved = match path.canonicalize() {
+            Ok(canonical) => canonical,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => path.to_path_buf(),
+            Err(e) => {
+                return Err(StorageError::Io(format!(
+                    "Failed to resolve path `{}`: {}",
+                    path.display(),
+                    e
+                )));
+            }
+        };
         if !resolved.is_absolute() {
             return Err(StorageError::Invalid(format!(
                 "cannot convert relative path {:?} to a file:// URI; pass an absolute path",
@@ -141,7 +152,14 @@ pub trait StorageBackend: Send + Sync {
     ///
     /// Returns `Ok(())` if metadata file exists, otherwise returns an error.
     fn validate_initialized(&self, md_path: &Path) -> StorageResult<()> {
-        assert_eq!(self.metadata_path(), *md_path);
+        let expected = self.metadata_path();
+        if expected != *md_path {
+            return Err(StorageError::InvalidState(format!(
+                "metadata path mismatch: expected `{}`, found `{}`",
+                expected.display(),
+                md_path.display()
+            )));
+        }
         if !md_path.exists() {
             return Err(StorageError::Invalid(format!(
                 "Storage not initialized: metadata file missing at {:?}. \
@@ -409,10 +427,16 @@ pub trait StorageBackend: Send + Sync {
             let schema_rows = rows_str.parse::<usize>().ok();
             let schema_cols = cols_str.parse::<usize>().ok();
             if schema_rows != Some(expected_rows) || schema_cols != Some(expected_cols) {
-                panic!(
-                    "Schema metadata dimensions ({:?}x{:?}) don't match storage metadata ({}x{})",
-                    schema_rows, schema_cols, expected_rows, expected_cols
-                );
+                return Err(StorageError::DimensionMismatch {
+                    expected: format!("{}x{}", expected_rows, expected_cols),
+                    found: match (schema_rows, schema_cols) {
+                        (Some(r), Some(c)) => format!("{}x{}", r, c),
+                        _ => format!(
+                            "unparseable schema metadata {:?}x{:?}",
+                            schema_rows, schema_cols
+                        ),
+                    },
+                });
             } else {
                 debug!(
                     "Schema metadata matches storage metadata: {}x{}",
@@ -489,9 +513,13 @@ pub trait StorageBackend: Send + Sync {
     async fn save_metadata(&self, metadata: &GeneMetadata) -> StorageResult<PathBuf> {
         let path = self.metadata_path();
         info!("Saving metadata to {:?}", path);
-        fs::create_dir_all(self.base_path()).map_err(|e| StorageError::Io(e.to_string()))?;
+        tokio::fs::create_dir_all(self.base_path())
+            .await
+            .map_err(|e| StorageError::Io(e.to_string()))?;
         let s = serde_json::to_string_pretty(metadata).map_err(StorageError::Serde)?;
-        fs::write(&path, s).map_err(|e| StorageError::Io(e.to_string()))?;
+        tokio::fs::write(&path, s)
+            .await
+            .map_err(|e| StorageError::Io(e.to_string()))?;
         info!("Metadata saved successfully");
         Ok(path)
     }
@@ -500,7 +528,9 @@ pub trait StorageBackend: Send + Sync {
     async fn load_metadata(&self) -> StorageResult<GeneMetadata> {
         let filename = self.metadata_path();
         info!("Loading metadata from {:?}", filename);
-        let s = fs::read_to_string(filename).map_err(|e| StorageError::Io(e.to_string()))?;
+        let s = tokio::fs::read_to_string(filename)
+            .await
+            .map_err(|e| StorageError::Io(e.to_string()))?;
         let md: GeneMetadata = serde_json::from_str(&s).map_err(StorageError::Serde)?;
         info!("Metadata loaded successfully");
         Ok(md)
