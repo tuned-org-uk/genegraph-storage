@@ -412,7 +412,7 @@ impl StorageBackend for LanceStorageGraph {
 
         let path = self.file_path(key);
         let uri = Self::path_to_uri(&path);
-        let batch = self.read_lance_first_batch_async(uri).await?;
+        let batch = self.read_lance_all_batches_async(uri).await?;
         let matrix = self.from_sparse_record_batch(batch, expected_rows, expected_cols)?;
         info!(
             "Sparse {} matrix loaded: {} x {}, nnz={}",
@@ -463,7 +463,7 @@ impl StorageBackend for LanceStorageGraph {
         info!("Loading lambda values from {:?}", path);
 
         let uri = Self::path_to_uri(&path);
-        let batch = self.read_lance_first_batch_async(uri).await?;
+        let batch = self.read_lance_all_batches_async(uri).await?;
         let arr = batch
             .column(0)
             .as_any()
@@ -542,7 +542,7 @@ impl StorageBackend for LanceStorageGraph {
         info!("Loading vector {} from {:?}", filename, path);
 
         let uri = Self::path_to_uri(&path);
-        let batch = self.read_lance_first_batch_async(uri).await?;
+        let batch = self.read_lance_all_batches_async(uri).await?;
         let arr = batch
             .column(0)
             .as_any()
@@ -559,7 +559,7 @@ impl StorageBackend for LanceStorageGraph {
         info!("Loading vector {} from {:?}", filename, path);
 
         let uri = Self::path_to_uri(&path);
-        let batch = self.read_lance_first_batch_async(uri).await?;
+        let batch = self.read_lance_all_batches_async(uri).await?;
         let arr = batch
             .column(0)
             .as_any()
@@ -712,7 +712,7 @@ impl StorageBackend for LanceStorageGraph {
         info!("Loading centroid map from {:?}", path);
 
         let uri = Self::path_to_uri(&path);
-        let batch = self.read_lance_first_batch_async(uri).await?;
+        let batch = self.read_lance_all_batches_async(uri).await?;
         let arr = batch
             .column(0)
             .as_any()
@@ -768,7 +768,7 @@ impl StorageBackend for LanceStorageGraph {
         info!("Loading subcentroid lambda values from {:?}", path);
 
         let uri = Self::path_to_uri(&path);
-        let batch = self.read_lance_first_batch_async(uri).await?;
+        let batch = self.read_lance_all_batches_async(uri).await?;
         let arr = batch
             .column(0)
             .as_any()
@@ -887,7 +887,7 @@ impl StorageBackend for LanceStorageGraph {
         info!("Loading item norms from {:?}", path);
 
         let uri = Self::path_to_uri(&path);
-        let batch = self.read_lance_first_batch_async(uri).await?;
+        let batch = self.read_lance_all_batches_async(uri).await?;
         let arr = batch
             .column(0)
             .as_any()
@@ -950,7 +950,7 @@ impl StorageBackend for LanceStorageGraph {
         info!("Loading cluster assignments from {:?}", path);
 
         let uri = Self::path_to_uri(&path);
-        let batch = self.read_lance_first_batch_async(uri).await?;
+        let batch = self.read_lance_all_batches_async(uri).await?;
         let arr = batch
             .column(0)
             .as_any()

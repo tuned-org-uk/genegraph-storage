@@ -590,3 +590,57 @@ async fn test_lance_storage_spawn_metadata_consistency() {
     assert_eq!(spawned_metadata.base, metadata.base);
     assert_eq!(spawned_metadata.files.len(), metadata.files.len());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_load_lambdas_reads_all_batches() {
+    crate::tests::init();
+    let name_id = "multi_batch_lambdas";
+    let (_, storage, _, _, _) = init_test_builder(name_id).await;
+
+    let md = GeneMetadata::seed_metadata(name_id, 1, 1, &storage.clone())
+        .await
+        .unwrap();
+    let md_path = storage.save_metadata(&md).await.unwrap();
+
+    // 10_000 rows exceeds the scan default batch size (8192), forcing a
+    // multi-batch read on load.
+    let n = 10_000;
+    let lambdas: Vec<f64> = (0..n).map(|i| (i % 100) as f64 / 100.0).collect();
+    storage.save_lambdas(&lambdas, &md_path).await.unwrap();
+
+    let loaded = storage.load_lambdas().await.unwrap();
+    assert_eq!(
+        loaded.len(),
+        n,
+        "load_lambdas must read all batches, not just the first"
+    );
+    assert_relative_eq!(loaded[9999], 99.0 / 100.0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_load_sparse_reads_all_batches() {
+    crate::tests::init();
+    let name_id = "multi_batch_sparse";
+    let (_, storage, _, _, _) = init_test_builder(name_id).await;
+
+    let md = GeneMetadata::seed_metadata(name_id, 1, 1, &storage.clone())
+        .await
+        .unwrap();
+    let md_path = storage.save_metadata(&md).await.unwrap();
+
+    // 10_000 triplets exceed the scan default batch size (8192).
+    let n = 10_000;
+    let rows: Vec<usize> = (0..n).collect();
+    let cols: Vec<usize> = (0..n).map(|i| i % 1000).collect();
+    let vals: Vec<f64> = (0..n).map(|i| (i % 7) as f64 + 1.0).collect();
+    let matrix = sprs::TriMat::from_triplets((n, 1000), rows, cols, vals).to_csr();
+
+    storage.save_sparse("laplacian", &matrix, &md_path).await.unwrap();
+    let loaded = storage.load_sparse("laplacian").await.unwrap();
+    assert_eq!(
+        loaded.nnz(),
+        n,
+        "load_sparse must read all batches, not just the first"
+    );
+}
+

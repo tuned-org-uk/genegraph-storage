@@ -63,31 +63,4 @@ pub trait LanceStorage {
         );
         Ok(combined)
     }
-
-    /// Async helper: read the first RecordBatch from a Lance dataset.
-    async fn read_lance_first_batch_async(&self, uri: String) -> StorageResult<RecordBatch> {
-        info!("Reading first batch from Lance dataset {}", uri);
-
-        let dataset = Dataset::open(&uri)
-            .await
-            .map_err(|e| StorageError::Lance(e.to_string()))?;
-        let scanner = dataset.scan();
-        let mut stream = scanner
-            .try_into_stream()
-            .await
-            .map_err(|e| StorageError::Lance(e.to_string()))?;
-
-        let batch = stream
-            .next()
-            .await
-            .ok_or_else(|| StorageError::Lance("empty Lance dataset".to_string()))?
-            .map_err(|e| StorageError::Lance(e.to_string()))?;
-
-        debug!(
-            "Read first RecordBatch for path {:?} with {} rows",
-            uri,
-            batch.num_rows()
-        );
-        Ok(batch)
-    }
 }
