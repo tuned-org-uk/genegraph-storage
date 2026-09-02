@@ -1,6 +1,7 @@
 mod lancefmt_common;
 mod test_catalog;
 mod test_data;
+mod test_generations;
 mod test_lance_layer;
 mod test_lancefmt_impl;
 mod test_metadata;

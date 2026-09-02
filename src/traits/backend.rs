@@ -519,13 +519,10 @@ pub trait StorageBackend: Send + Sync {
     async fn save_metadata(&self, metadata: &GeneMetadata) -> StorageResult<PathBuf> {
         let path = self.metadata_path();
         info!("Saving metadata to {:?}", path);
-        tokio::fs::create_dir_all(self.base_path())
-            .await
-            .map_err(|e| StorageError::Io(e.to_string()))?;
         let s = serde_json::to_string_pretty(metadata).map_err(StorageError::Serde)?;
-        tokio::fs::write(&path, s)
-            .await
-            .map_err(|e| StorageError::Io(e.to_string()))?;
+        // Atomic publish (#93): tmp + fsync + rename — the file is the
+        // single commit pointer and must never be observed half-written.
+        crate::generations::write_json_atomic(&path, &s)?;
         info!("Metadata saved successfully");
         Ok(path)
     }
