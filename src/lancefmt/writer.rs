@@ -472,24 +472,83 @@ fn page_layout(page: &EncodedPage) -> lfv2::Encoding {
     direct_encoding("/lance.encodings21.PageLayout", layout.encode_to_vec())
 }
 
+/// Durable file write (#95-3): write to a unique tmp file next to `path`,
+/// fsync, then rename over `path`. The rename is the atomic publish point;
+/// the fsync makes the payload durable before the directory entry appears.
+fn write_durable(path: &Path, bytes: &[u8]) -> StorageResult<()> {
+    use std::io::Write;
+
+    let mut name = path
+        .file_name()
+        .ok_or_else(|| StorageError::Invalid(format!("bad artifact path {path:?}")))?
+        .to_os_string();
+    name.push(format!(".{}.tmp", uuid::Uuid::new_v4().simple()));
+    let tmp = path.with_file_name(name);
+
+    {
+        let mut f = std::fs::File::create(&tmp)
+            .map_err(|e| StorageError::Io(format!("create tmp for {path:?}: {e}")))?;
+        f.write_all(bytes)
+            .map_err(|e| StorageError::Io(format!("write tmp for {path:?}: {e}")))?;
+        f.sync_all()
+            .map_err(|e| StorageError::Io(format!("fsync tmp for {path:?}: {e}")))?;
+    }
+    std::fs::rename(&tmp, path).map_err(|e| StorageError::Io(format!("publish {path:?}: {e}")))?;
+    Ok(())
+}
+
+/// fsyncs a directory so a completed rename is itself durable
+/// (directory-entry durability, #95-3). No-op off unix.
+fn fsync_dir(dir: &Path) -> StorageResult<()> {
+    #[cfg(unix)]
+    {
+        let f = std::fs::File::open(dir)
+            .map_err(|e| StorageError::Io(format!("open dir {dir:?} for fsync: {e}")))?;
+        f.sync_all()
+            .map_err(|e| StorageError::Io(format!("fsync dir {dir:?}: {e}")))?;
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
 /// Writes `batch` as a single-fragment Lance v2.1 dataset rooted at `dir`.
+///
+/// Durability & concurrency (#95-3): the whole write — manifest-version
+/// allocation through commit-point publish — runs under a per-dataset write
+/// mailbox, and every artifact (data file, txn, manifest, version hint) is
+/// written tmp + fsync + rename with a directory fsync, in the order
+/// data → txn → manifest (commit) → hint. Readers observe either the
+/// previous or the complete new dataset version.
 pub fn write_dataset(batch: &RecordBatch, dir: &Path) -> StorageResult<()> {
     if batch.num_rows() == 0 {
         return Err(StorageError::Invalid(
             "lancefmt writer: empty batches are not supported".into(),
         ));
     }
-    let arrow_schema = batch.schema().as_ref().clone();
-    let (fields, schema_meta) = to_lance_schema(&arrow_schema)?;
 
     std::fs::create_dir_all(dir)
-        .map_err(|e| StorageError::Io(format!("create dataset dir {:?}: {e}", dir)))?;
+        .map_err(|e| StorageError::Io(format!("create dataset dir {dir:?}: {e}")))?;
     let data_dir = dir.join("data");
     let versions_dir = dir.join("_versions");
     let txn_dir = dir.join("_transactions");
     for d in [&data_dir, &versions_dir, &txn_dir] {
-        std::fs::create_dir_all(d).map_err(|e| StorageError::Io(format!("create {:?}: {e}", d)))?;
+        std::fs::create_dir_all(d).map_err(|e| StorageError::Io(format!("create {d:?}: {e}")))?;
     }
+
+    crate::commit::with_dataset_write_lock(dir, || {
+        write_dataset_locked(batch, &data_dir, &versions_dir, &txn_dir)
+    })
+}
+
+fn write_dataset_locked(
+    batch: &RecordBatch,
+    data_dir: &Path,
+    versions_dir: &Path,
+    txn_dir: &Path,
+) -> StorageResult<()> {
+    let arrow_schema = batch.schema().as_ref().clone();
+    let (fields, schema_meta) = to_lance_schema(&arrow_schema)?;
 
     let uuid = uuid::Uuid::new_v4();
     let data_file_name = format!("{:024b}{}.lance", 0, uuid.simple());
@@ -586,14 +645,14 @@ pub fn write_dataset(batch: &RecordBatch, dir: &Path) -> StorageResult<()> {
     file_bytes.extend_from_slice(b"LANC");
 
     let data_path = data_dir.join(&data_file_name);
-    std::fs::write(&data_path, &file_bytes)
-        .map_err(|e| StorageError::Io(format!("write {data_path:?}: {e}")))?;
+    write_durable(&data_path, &file_bytes)?;
+    fsync_dir(data_dir)?;
 
     // ---- manifest + transaction -----------------------------------------
     // Overwrite semantics (M4): an existing dataset receives a new manifest
     // version whose fragment set fully replaces the previous one; readers
     // (ours and official) open the highest version.
-    let prev_version = latest_manifest_version(&versions_dir)?;
+    let prev_version = latest_manifest_version(versions_dir)?;
     let next_version = prev_version + 1;
     // Fragment ids are unique per dataset; version numbering gives us a
     // deterministic fresh id per overwrite (fresh dataset -> 0).
@@ -670,11 +729,11 @@ pub fn write_dataset(batch: &RecordBatch, dir: &Path) -> StorageResult<()> {
         })),
     };
     let txn_bytes = transaction.encode_to_vec();
-    std::fs::write(
-        txn_dir.join(format!("{prev_version}-{uuid}.txn")),
+    write_durable(
+        &txn_dir.join(format!("{prev_version}-{uuid}.txn")),
         &txn_bytes,
-    )
-    .map_err(|e| StorageError::Io(format!("write txn: {e}")))?;
+    )?;
+    fsync_dir(txn_dir)?;
 
     let manifest_bytes = manifest.encode_to_vec();
     let mut out: Vec<u8> = Vec::new();
@@ -688,13 +747,17 @@ pub fn write_dataset(batch: &RecordBatch, dir: &Path) -> StorageResult<()> {
     out.extend_from_slice(&FILE_MAJOR.to_le_bytes());
     out.extend_from_slice(b"LANC");
 
-    std::fs::write(versions_dir.join(format!("{next_version}.manifest")), &out)
-        .map_err(|e| StorageError::Io(format!("write manifest: {e}")))?;
-    std::fs::write(
-        versions_dir.join("latest_version_hint.json"),
-        format!("{{\"version\":{next_version}}}"),
-    )
-    .map_err(|e| StorageError::Io(format!("write hint: {e}")))?;
+    // The manifest rename is the dataset's commit point; the directory
+    // fsync right after makes the published version durable.
+    write_durable(&versions_dir.join(format!("{next_version}.manifest")), &out)?;
+    fsync_dir(versions_dir)?;
+    // The hint is a discovery accelerator, not the commit pointer; it is
+    // still published atomically so a concurrent open never reads a
+    // truncated hint (#95).
+    write_durable(
+        &versions_dir.join("latest_version_hint.json"),
+        format!("{{\"version\":{next_version}}}").as_bytes(),
+    )?;
 
     Ok(())
 }

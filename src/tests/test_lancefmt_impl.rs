@@ -540,3 +540,71 @@ fn impl_rejects_fsl_row_beyond_chunk_limit() {
         "expected UnsupportedFormat, got {err:?}"
     );
 }
+
+/// #95-3: concurrent write_dataset calls to the same dataset dir are
+/// serialized by the per-dataset write mailbox — manifest versions strictly
+/// increase (no lost overwrite) and the dataset stays readable.
+#[test]
+fn impl_concurrent_dataset_writes_keep_versions_monotonic() {
+    use std::sync::Arc as StdArc;
+    let dir = tmp_dir_sync("lancefmt_impl_concurrent_writes");
+
+    let make_batch = |v: f64| {
+        let schema = arrow::datatypes::Schema::new(vec![arrow::datatypes::Field::new(
+            "value",
+            arrow::datatypes::DataType::Float64,
+            false,
+        )]);
+        RecordBatch::try_new(
+            std::sync::Arc::new(schema),
+            vec![std::sync::Arc::new(Float64Array::from(vec![v; 4])) as _],
+        )
+        .unwrap()
+    };
+
+    let dir = StdArc::new(dir);
+    let mut handles = Vec::new();
+    for t in 0..8u32 {
+        let dir = dir.clone();
+        handles.push(std::thread::spawn(move || {
+            for k in 0..5u32 {
+                let batch = make_batch((t * 10 + k) as f64);
+                write_dataset(&batch, dir.as_path())
+                    .unwrap_or_else(|e| panic!("write {t}.{k} failed: {e}"));
+            }
+        }));
+    }
+    for h in handles {
+        h.join().expect("writer thread");
+    }
+
+    // exactly 8*5 manifest versions, strictly 1..=40
+    let versions_dir = dir.join("_versions");
+    let mut versions: Vec<u64> = std::fs::read_dir(&versions_dir)
+        .unwrap()
+        .filter_map(|e| {
+            let name = e.unwrap().file_name().to_string_lossy().to_string();
+            name.strip_suffix(".manifest")
+                .and_then(|stem| stem.parse().ok())
+        })
+        .collect();
+    versions.sort_unstable();
+    let expected: Vec<u64> = (1..=40).collect();
+    assert_eq!(versions, expected, "manifest versions must be 1..=40");
+
+    // the dataset is readable and corresponds to the highest version
+    let loaded = scan_all(&dir).expect("scan after concurrent writes");
+    assert_eq!(loaded.num_rows(), 4);
+
+    // no tmp staging residue left behind (#95-3)
+    for sub in ["data", "_versions", "_transactions"] {
+        let residue: Vec<_> = std::fs::read_dir(dir.join(sub))
+            .unwrap()
+            .filter_map(|e| {
+                let name = e.unwrap().file_name().to_string_lossy().to_string();
+                name.contains(".tmp").then_some(name)
+            })
+            .collect();
+        assert!(residue.is_empty(), "tmp residue in {sub}: {residue:?}");
+    }
+}
