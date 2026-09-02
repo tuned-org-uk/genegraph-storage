@@ -119,6 +119,19 @@ it serializes across processes but does not compose with the in-process
 actor. Every writer of a given metadata file must take the same lock file
 before mutating it — arbitration is only as strong as the convention.
 
+**Operational note.** The flock wait is unbounded and runs through
+`spawn_blocking`: a parked waiter cannot be aborted, and many long-lived
+waiters can exhaust the runtime's blocking-thread capacity. That is a
+sound trade for metadata commits *if* cycles stay short, contention is
+normally brief, nothing under the lock does lengthy compute/network I/O
+or waits indefinitely, and you understand shutdown behavior with a stuck
+holder (blocked `spawn_blocking` tasks are abandoned by
+`Runtime::shutdown_timeout`, awaited by `shutdown_background`; process
+exit always releases the flock). If waits could be prolonged or numerous,
+prefer a dedicated lock-management thread, an explicit timeout or
+cancellation strategy, or a storage system with transactional
+coordination.
+
 ## Lance format
 
 The default build runs the in-house Lance v2.1 implementation (`lancefmt`) for all `StorageBackend` I/O: manifest with inline Overwrite transactions, txn files, version hints, MiniBlock pages with Flat / InlineBitpacking / FixedSizeList value compression. Encodings outside the supported subset are rejected with `StorageError::UnsupportedFormat` (never guessed). Interop conformance is fixture-based: golden fixtures written by the official lance crate are read back by the in-house reader's suite.

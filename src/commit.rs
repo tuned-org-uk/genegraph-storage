@@ -93,6 +93,10 @@
 //! commit artifact: it carries no data and is left in place after release.
 //! Arbitration is only as strong as the convention — every writer of the
 //! same metadata file must take the same lock file before mutating it.
+//!
+//! Both lock forms wait on the blocking pool; see the operational caution
+//! on [`with_metadata_file_lock`] for the assumptions this puts on commit
+//! cycles and what to prefer when waits could be prolonged or numerous.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -185,6 +189,10 @@ where
 /// [`with_metadata_file_lock`] when both are required. Off unix this fails
 /// with [`StorageError::UnsupportedFormat`] rather than silently skipping
 /// arbitration.
+///
+/// The blocking-pool caveats documented on [`with_metadata_file_lock`]
+/// apply here identically: unbounded waits, non-abortable waiters,
+/// blocking-thread capacity.
 pub async fn with_file_lock<T, F>(lock_path: &Path, f: F) -> StorageResult<T>
 where
     T: Send + 'static,
@@ -290,6 +298,32 @@ impl FileLock {
 /// For consumers whose RMW is entirely synchronous, [`with_file_lock`]
 /// wraps the same lock file — but a sync closure cannot await the commit
 /// actor; only this helper composes the two locks.
+///
+/// # Operational caution (blocking-pool waits)
+///
+/// The flock wait is unbounded and runs through `spawn_blocking`, which
+/// Tokio documents for blocking work that is bounded and eventually
+/// completes: a waiter that has already parked cannot be reliably
+/// aborted, and many long-lived blocked waiters can exhaust the runtime's
+/// blocking-thread capacity. This design is reasonable for metadata
+/// commits when:
+///
+/// - commit cycles are short — the hold scope is a JSON load → mutate →
+///   publish, not compute;
+/// - contention is normally brief;
+/// - callers do not hold the lock across lengthy compute, network I/O,
+///   user interaction, or indefinite waits;
+/// - shutdown behavior with a stuck lock holder is understood: blocked
+///   `spawn_blocking` tasks are not aborted by task cancellation;
+///   [`tokio::runtime::Runtime::shutdown_timeout`] abandons them after a
+///   grace period while [`tokio::runtime::Runtime::shutdown_background`]
+///   waits them out — and process exit always closes the descriptor,
+///   releasing the flock.
+///
+/// If lock waits could be prolonged or numerous, prefer a dedicated
+/// lock-management thread, an explicit timeout/cancellation strategy
+/// (bounded wait before acquisition), or a storage system with
+/// transactional coordination over unbounded `flock` waits here.
 pub async fn with_metadata_file_lock<T, F, Fut>(
     metadata_path: &Path,
     cycle: F,
