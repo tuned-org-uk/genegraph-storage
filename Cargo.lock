@@ -1879,7 +1879,7 @@ dependencies = [
 
 [[package]]
 name = "genegraph-storage"
-version = "0.13.2"
+version = "0.13.3"
 dependencies = [
  "approx 0.5.1",
  "arrow",
@@ -1887,9 +1887,12 @@ dependencies = [
  "env_logger",
  "futures",
  "lance",
+ "lance-bitpacking",
  "log",
  "ordered-float 5.3.0",
  "parquet",
+ "prost",
+ "prost-types",
  "rand 0.9.4",
  "rand_distr",
  "rayon",

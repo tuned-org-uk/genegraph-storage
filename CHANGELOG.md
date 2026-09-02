@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.13.3 (2026-09-02)
+
+**Added**
+
+- M1: in-house Lance v2.1 **writer** (`lancefmt::write_dataset`) for the
+  artifact schema subset (`Float64`, `UInt32`, `FixedSizeList<Float64>`,
+  non-null): MiniBlock pages with Flat value compression, manifest v1 with
+  inline Overwrite transaction, txn file, version hint. Byte-layout mirrors
+  the official writer.
+- M2: in-house Lance v2.1 **full-scan reader** (`lancefmt::scan_all`):
+  manifest open, footer parse, MiniBlock chunk walk; decodes Flat,
+  InlineBitpacking (FastLanes via `lance-bitpacking`) and FixedSizeList
+  value compressions over all-valid repdef layers.
+- 3-way interop proof (15 tests): ours->ours round-trips, official lance 11
+  reads our files, our reader reads the official golden fixtures.
+- Arrow schema <-> `lance.file.Field` mapping (logical types `double`,
+  `uint32`, `fixed_size_list:double:N`) incl. schema-metadata round-trip.
+- Generated protobuf types committed under `src/lancefmt/pb/` (prost 0.14,
+  provenance headers; consumers need no `protoc`); vendored
+  `transaction.proto`.
+
+**Changed**
+
+- New runtime dependencies: `prost`, `prost-types`, `lance-bitpacking`
+  (all Apache-2.0; `lance-bitpacking` is a leaf crate).
+
+**Notes**
+
+- `StorageBackend` still routes to the official `lance` crate; the swap to
+  `lancefmt` internals is M5 of #75.
+- Encodings outside the supported subset are rejected with
+  `StorageError::UnsupportedFormat` (never guessed, per #75).
+
 ## 0.13.2 (2026-09-02)
 
 **Added**

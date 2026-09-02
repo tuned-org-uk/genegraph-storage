@@ -50,6 +50,15 @@ pub(crate) fn f64_multipage_batch(b: usize) -> Vec<f64> {
         .collect()
 }
 
+/// All multipage rows in a single RecordBatch (the impl writer takes one batch).
+pub(crate) fn f64_multipage_record_batch() -> RecordBatch {
+    let mut values = Vec::new();
+    for b in 0..F64_MULTIPAGE_BATCHES {
+        values.extend(f64_multipage_batch(b));
+    }
+    f64_batch_from(values)
+}
+
 pub(crate) fn f64_small_values() -> Vec<f64> {
     (0..F64_SMALL_ROWS).map(|i| i as f64 * 0.5).collect()
 }
