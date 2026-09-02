@@ -44,7 +44,7 @@ static DATASET_LOCKS: OnceLock<StdMutex<HashMap<String, Weak<StdMutex<()>>>>> = 
 
 /// Shared weak-registry lookup (#98): reuse the live mailbox for `key` if
 /// one exists, otherwise sweep dead entries and insert `fresh`.
-fn weak_lookup<T>(
+pub(crate) fn weak_lookup<T>(
     registry: &'static OnceLock<StdMutex<HashMap<String, Weak<T>>>>,
     key: String,
     fresh: Arc<T>,

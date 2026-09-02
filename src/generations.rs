@@ -12,11 +12,15 @@
 //! - The commit itself is a single atomic filesystem operation
 //!   ([`write_json_atomic`]): readers observe either the previous file or
 //!   the complete new one, never a partial write.
+//! - Reader isolation (#97): pin acquisition (validation + registration) and
+//!   the sweep's check-to-retirement transition are serialized by a
+//!   per-generation state lock — a sweep never removes artifacts under a
+//!   registered reader, and a pin never registers for a retired generation.
 //! - `__g{digits}` at the end of an instance name is reserved.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex as StdMutex, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 
 use crate::{StorageError, StorageResult};
 
@@ -111,116 +115,141 @@ pub async fn list_artifact_generations(base: &Path, logical: &str) -> StorageRes
 /// `{logical}__g{gen}_`, so sibling datasets (`ds` vs `ds2`) are untouched.
 /// Safe to call on orphaned generations (no metadata) and on missing ones.
 ///
-/// Reader isolation (#97): if any [`GenerationGuard`] pin is alive for this
-/// generation, the sweep is refused with
-/// [`StorageError::InvalidState`] — it never removes artifacts under an
-/// in-flight reader. Callers retry once their readers have released.
+/// Reader isolation (#97): the pin check through the *complete removal* runs
+/// inside one per-generation state lock — the retirement transition is
+/// atomic with respect to [`pin_generation`], which validates and registers
+/// under that same lock. A pin attempt that races a sweep either precedes
+/// the sweep's lock acquisition (the sweep then sees the pin and is refused
+/// with [`StorageError::InvalidState`]) or waits for retirement to finish
+/// (and then fails validation, because the commit pointer is gone). A sweep
+/// can therefore never delete underneath a registered reader. Callers retry
+/// a refused sweep once their readers have released.
 pub async fn delete_generation(base: &Path, logical: &str, generation: u64) -> StorageResult<()> {
     let prefix = format!("{logical}{GENERATION_SEP}{generation}_");
     let metadata_path = base.join(format!("{prefix}metadata.json"));
-    if generation_pin_count(&metadata_path) > 0 {
-        return Err(StorageError::InvalidState(format!(
-            "generation {generation} of '{logical}' is pinned by an in-flight reader; \
-             sweep refused until all readers release"
-        )));
-    }
-    let mut rd = tokio::fs::read_dir(base)
-        .await
-        .map_err(|e| StorageError::Io(e.to_string()))?;
-    while let Some(entry) = rd
-        .next_entry()
-        .await
-        .map_err(|e| StorageError::Io(e.to_string()))?
-    {
-        if !entry.file_name().to_string_lossy().starts_with(&prefix) {
-            continue;
+    // Resolve (or mint) the generation's state lock up front, then run the
+    // whole check-to-retirement critical section synchronously under it on
+    // the blocking pool: std locks must not be held across awaits.
+    let state = crate::commit::weak_lookup(
+        &GENERATION_STATES,
+        metadata_path.to_string_lossy().to_string(),
+        Arc::new(StdMutex::new(GenerationState::default())),
+    );
+    sweep_gate(SWEEP_GATE_PRE_LOCK);
+    let base = base.to_path_buf();
+    let logical = logical.to_string();
+    tokio::task::spawn_blocking(move || -> StorageResult<()> {
+        let state = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.pins > 0 {
+            return Err(StorageError::InvalidState(format!(
+                "generation {generation} of '{logical}' is pinned by an in-flight reader; \
+                 sweep refused until all readers release"
+            )));
         }
-        let path = entry.path();
-        if path.is_dir() {
-            tokio::fs::remove_dir_all(&path)
-                .await
-                .map_err(|e| StorageError::Io(e.to_string()))?;
-        } else {
-            tokio::fs::remove_file(&path)
-                .await
-                .map_err(|e| StorageError::Io(e.to_string()))?;
+        // Past the check and still under the lock: no pin can register for
+        // this generation until the removals complete (test hook forces a
+        // pin attempt exactly in this window).
+        sweep_gate(SWEEP_GATE_POST_CHECK);
+        let rd = std::fs::read_dir(&base)
+            .map_err(|e| StorageError::Io(format!("read {base:?}: {e}")))?;
+        let mut removed = Vec::new();
+        for entry in rd {
+            let entry = entry.map_err(|e| StorageError::Io(e.to_string()))?;
+            if !entry.file_name().to_string_lossy().starts_with(&prefix) {
+                continue;
+            }
+            removed.push(entry.path());
         }
-    }
-    Ok(())
+        for path in removed {
+            if path.is_dir() {
+                std::fs::remove_dir_all(&path)
+                    .map_err(|e| StorageError::Io(format!("remove {path:?}: {e}")))?;
+            } else {
+                std::fs::remove_file(&path)
+                    .map_err(|e| StorageError::Io(format!("remove {path:?}: {e}")))?;
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| StorageError::Io(format!("generation sweep task failed: {e}")))?
 }
 
 // ---------------------------------------------------------------------------
 // Reader pins (#97)
 // ---------------------------------------------------------------------------
 
-/// Process-wide pin registry: metadata-path → live pin count. Counts hit
-/// zero only transiently (the dropping guard removes the entry), so the
-/// map stays bounded by the number of pinned generations.
-fn pin_registry() -> &'static StdMutex<HashMap<String, usize>> {
-    static PINS: OnceLock<StdMutex<HashMap<String, usize>>> = OnceLock::new();
-    PINS.get_or_init(|| StdMutex::new(HashMap::new()))
+/// Per-generation pin state; the lock guarding the state serializes pin
+/// registration/validation against the sweep's retirement transition.
+#[derive(Debug, Default)]
+struct GenerationState {
+    pins: usize,
 }
+
+/// Weak-valued registry of per-generation state locks (the #98 discipline):
+/// entries live only while a pin or an in-flight sweep holds the `Arc`.
+static GENERATION_STATES: OnceLock<StdMutex<HashMap<String, Weak<StdMutex<GenerationState>>>>> =
+    OnceLock::new();
 
 /// RAII pin on a committed generation (#97).
 ///
 /// Acquired through [`pin_generation`]; while alive, it keeps one reference
-/// on the generation so a concurrent [`delete_generation`] refuses to touch
-/// it. Dropping the guard releases the reference; the last drop for a
-/// generation unregisters it.
+/// on the generation's state so a concurrent [`delete_generation`] refuses
+/// to touch it. Dropping the guard releases the reference.
 #[derive(Debug)]
 pub struct GenerationGuard {
-    key: String,
+    state: Arc<StdMutex<GenerationState>>,
 }
 
 impl Drop for GenerationGuard {
     fn drop(&mut self) {
-        let mut pins = pin_registry()
+        let mut state = self
+            .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(count) = pins.get_mut(&self.key) {
-            *count -= 1;
-            if *count == 0 {
-                pins.remove(&self.key);
-            }
-        }
+        state.pins -= 1;
     }
 }
 
 /// Pins a committed generation for the duration of a read (#97).
 ///
-/// Registration is process-wide and refcounted: several readers may pin the
+/// Registration is refcounted per generation: several readers may pin the
 /// same generation concurrently and all succeed; a sweep is refused while
-/// any pin is alive. Fails with [`StorageError::Invalid`] if the
-/// generation's metadata file (the commit pointer) does not exist —
-/// orphaned generations cannot be pinned.
+/// any pin is alive. Validation (commit pointer exists) and registration
+/// happen atomically with respect to [`delete_generation`]'s retirement
+/// transition — both hold the generation's state lock, so a racing sweep
+/// either observes this pin (and is refused) or has already retired the
+/// generation (and this call fails validation).
 ///
-/// Pin and sweep must address the generation through the same `base` path:
-/// the registry is keyed by the metadata file path.
+/// Fails with [`StorageError::Invalid`] if the generation's metadata file
+/// (the commit pointer) does not exist — orphaned generations cannot be
+/// pinned. Pin and sweep must address the generation through the same
+/// `base` path: state is keyed by the metadata file path.
 pub fn pin_generation(info: &GenerationInfo) -> StorageResult<GenerationGuard> {
-    if !info.metadata_path.is_file() {
-        return Err(StorageError::Invalid(format!(
-            "generation {} is not committed (no metadata at {:?}); \
-             only committed generations can be pinned",
-            info.generation, info.metadata_path
-        )));
+    let state = crate::commit::weak_lookup(
+        &GENERATION_STATES,
+        info.metadata_path.to_string_lossy().to_string(),
+        Arc::new(StdMutex::new(GenerationState::default())),
+    );
+    {
+        let mut guard = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Validation under the state lock: a concurrent sweep either
+        // finished its retirement (metadata gone -> rejected here) or waits
+        // for this pin to register (and is then refused).
+        if !info.metadata_path.is_file() {
+            return Err(StorageError::Invalid(format!(
+                "generation {} is not committed (no metadata at {:?}); \
+                 only committed generations can be pinned",
+                info.generation, info.metadata_path
+            )));
+        }
+        guard.pins += 1;
     }
-    let key = info.metadata_path.to_string_lossy().to_string();
-    let mut pins = pin_registry()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    *pins.entry(key.clone()).or_insert(0) += 1;
-    Ok(GenerationGuard { key })
-}
-
-/// Live pin count for a generation, keyed by its metadata file path.
-fn generation_pin_count(metadata_path: &Path) -> usize {
-    let key = metadata_path.to_string_lossy().to_string();
-    pin_registry()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .get(&key)
-        .copied()
-        .unwrap_or(0)
+    Ok(GenerationGuard { state })
 }
 
 /// Atomic JSON publish: write to a unique `{path}.tmp`, fsync, rename over
@@ -276,4 +305,64 @@ async fn scan_generation_paths(base: &Path, logical: &str) -> StorageResult<Vec<
         }
     }
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Test-only sweep gates (PR #99 review): force deterministic interleavings
+// of pin attempts against the sweep's critical section.
+// ---------------------------------------------------------------------------
+
+pub(crate) const SWEEP_GATE_PRE_LOCK: usize = 0;
+pub(crate) const SWEEP_GATE_POST_CHECK: usize = 1;
+
+// Non-test builds compile the gate calls away entirely.
+#[cfg(not(test))]
+fn sweep_gate(_stage: usize) {}
+
+#[cfg(test)]
+fn sweep_gates() -> &'static StdMutex<[Option<SweepGate>; 2]> {
+    static GATES: OnceLock<StdMutex<[Option<SweepGate>; 2]>> = OnceLock::new();
+    GATES.get_or_init(|| StdMutex::new([None, None]))
+}
+
+/// A gate the sweep must pass through: it signals `arrived` (so tests know
+/// the sweep is parked exactly at the stage) and blocks until `release`.
+#[cfg(test)]
+struct SweepGate {
+    arrived: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+/// Arms a gate: the next sweep to reach `stage` signals the returned
+/// receiver and parks until the returned sender fires. Fires once.
+#[cfg(test)]
+pub(crate) fn arm_sweep_gate(
+    stage: usize,
+) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+    let (arrived_tx, arrived_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let mut gates = sweep_gates()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    gates[stage] = Some(SweepGate {
+        arrived: arrived_tx,
+        release: release_rx,
+    });
+    (arrived_rx, release_tx)
+}
+
+/// Blocks the sweep at `stage` if a gate is armed there (consumes it).
+#[cfg(test)]
+fn sweep_gate(stage: usize) {
+    let gate = sweep_gates()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get_mut(stage)
+        .unwrap()
+        .take();
+    if let Some(gate) = gate {
+        // park: the test now knows exactly where the sweep is
+        let _ = gate.arrived.send(());
+        let _ = gate.release.recv();
+    }
 }

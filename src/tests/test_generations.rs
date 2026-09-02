@@ -348,3 +348,87 @@ fn lock_registries_stay_bounded_under_instance_churn() {
     let (a, b) = crate::commit::registry_sizes();
     assert!((a + b) < 4096, "after real churn: commit={a}, dataset={b}");
 }
+
+// ---------------------------------------------------------------------------
+// PR #99 review: the pin/sweep protocol must be race-free. Both gates force
+// the exact interleavings a channel test alone cannot reach.
+// ---------------------------------------------------------------------------
+
+use crate::generations::{SWEEP_GATE_POST_CHECK, SWEEP_GATE_PRE_LOCK, arm_sweep_gate};
+
+/// Pin attempt lands *between* the sweep's pin check and its first removal.
+/// The state lock serializes them: the pin blocks until retirement
+/// completes, then fails validation (commit pointer gone) — it never
+/// receives a guard for deleted artifacts.
+#[tokio::test(flavor = "multi_thread")]
+async fn pin_during_sweep_removal_window_is_rejected_not_orphaned() {
+    let base = tmp_dir("gen_race_post_check").await;
+    let logical = "race_ds";
+    let (md_path, artifact) = seed_committed_generation(&base, logical, 4);
+
+    let infos = list_generations(&base, logical).await.unwrap();
+    let info = infos.into_iter().next().unwrap();
+
+    // park the sweep between its pin check and its first removal — the
+    // state lock is held for the whole critical section
+    let (arrived, release) = arm_sweep_gate(SWEEP_GATE_POST_CHECK);
+    let sweep_base = base.clone();
+    let sweep = tokio::spawn(async move { delete_generation(&sweep_base, logical, 4).await });
+    arrived
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("sweep parks at the post-check gate");
+
+    // the racing pin: blocks on the state lock, then must fail validation
+    let pin = std::thread::spawn(move || pin_generation(&info));
+
+    release.send(()).unwrap();
+    sweep
+        .await
+        .unwrap()
+        .expect("sweep completes once the gate opens");
+    let pin_result = pin.join().unwrap();
+    assert!(
+        matches!(pin_result, Err(crate::StorageError::Invalid(_))),
+        "pin after retirement must fail validation, got {pin_result:?}"
+    );
+    assert!(!md_path.exists(), "generation was retired");
+    assert!(!artifact.exists());
+}
+
+/// Pin registers while the sweep has not yet acquired the state lock: the
+/// sweep then observes the live pin and is refused (InvalidState), leaving
+/// the artifacts intact.
+#[tokio::test(flavor = "multi_thread")]
+async fn pin_registered_before_sweep_lock_wins_the_race() {
+    let base = tmp_dir("gen_race_pre_lock").await;
+    let logical = "race_ds2";
+    let (md_path, artifact) = seed_committed_generation(&base, logical, 5);
+
+    let infos = list_generations(&base, logical).await.unwrap();
+    let info = infos.into_iter().next().unwrap();
+
+    // park the sweep before it touches the state lock
+    let (arrived, release) = arm_sweep_gate(SWEEP_GATE_PRE_LOCK);
+    let sweep_base = base.clone();
+    let sweep = tokio::spawn(async move { delete_generation(&sweep_base, logical, 5).await });
+    arrived
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("sweep parks at the pre-lock gate");
+
+    // the pin acquires the lock first and registers
+    let guard = pin_generation(&info).expect("pin wins the race to the lock");
+
+    release.send(()).unwrap();
+    let err = sweep.await.unwrap().unwrap_err();
+    assert!(
+        matches!(err, crate::StorageError::InvalidState(_)),
+        "sweep must refuse a registered pin, got {err:?}"
+    );
+    assert!(md_path.exists());
+    assert!(artifact.exists());
+
+    // release the reader, then the sweep succeeds
+    drop(guard);
+    delete_generation(&base, logical, 5).await.unwrap();
+    assert!(!md_path.exists());
+}
