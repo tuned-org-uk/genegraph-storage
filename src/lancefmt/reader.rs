@@ -155,24 +155,24 @@ fn decode_chunk(
                         "bitpacked chunk not word-aligned".into(),
                     ));
                 }
-                let words: &[u32] = unsafe {
-                    std::slice::from_raw_parts(packed.as_ptr() as *const u32, packed.len() / 4)
-                };
-                if words.len() < (1024usize * width).div_ceil(32) {
+                let words: Vec<u32> = packed
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| u32::from_le_bytes(*b))
+                    .collect();
+                let block_words = (1024usize * width).div_ceil(32);
+                if words.len() < block_words {
                     return Err(StorageError::Invalid(
                         "bitpacked chunk shorter than one FL block".into(),
                     ));
                 }
                 let mut out = vec![0u32; 1024];
-                // SAFETY: `out` has exactly the FL block size for u32 and the
-                // input slice holds one full block of packed words.
+                // SAFETY: `out` has exactly the FL block size for u32 and
+                // `words` holds one full block of packed words.
                 unsafe {
                     use lance_bitpacking::BitPacking;
-                    <u32 as BitPacking>::unchecked_unpack(
-                        width,
-                        &words[..(1024 * width).div_ceil(32)],
-                        &mut out,
-                    );
+                    <u32 as BitPacking>::unchecked_unpack(width, &words[..block_words], &mut out);
                 }
                 let n = values_in_chunk as usize;
                 if n > 1024 {
