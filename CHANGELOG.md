@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.25.0 (2026-09-02)
+
+Version line for the post-M5 development cycle (in-house Lance v2.1
+implementation shipped and verified in 0.20.0; see #75 close-out and
+RFC #81 for the generic vector-space + graph storage plan).
+
+**Added**
+
+- (cycle opens) RFC #81: named collections, generic dense vector
+  widths, first-class graph storage (edges + weights), vector-space to
+  graph linkage.
+
 ## 0.20.0 (2026-09-02)
 
 The in-house Lance milestone (#75 M4 + M5 + M-C1): the default build no
