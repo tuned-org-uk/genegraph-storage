@@ -237,3 +237,374 @@ fn assert_batch_i64(batch: &RecordBatch, expected: &[i64], col: usize, what: &st
         assert_eq!(arr.value(i), *e, "{what}: value mismatch at row {i}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// RFC #81-P2: width-generic leaves (Float32 / UInt64 / UInt8 Flat, FSL<Float32>)
+// ---------------------------------------------------------------------------
+
+fn f32_values() -> Vec<f32> {
+    // bit-exact round-trip: include negatives, subnormals and infinities
+    [
+        0.0f32,
+        -0.0,
+        1.5,
+        -2.25,
+        f32::MIN_POSITIVE / 4.0,
+        f32::MAX,
+        f32::MIN,
+        f32::INFINITY,
+        0.123_456_79,
+        -0.9999999,
+    ]
+    .to_vec()
+}
+
+fn assert_batch_f32(batch: &RecordBatch, expected: &[f32], col: usize, what: &str) {
+    let arr = batch
+        .column(col)
+        .as_any()
+        .downcast_ref::<arrow::array::Float32Array>()
+        .unwrap_or_else(|| panic!("{what}: expected f32 column"));
+    assert_eq!(arr.len(), expected.len(), "{what}: row count");
+    for (i, e) in expected.iter().enumerate() {
+        assert_eq!(
+            arr.value(i).to_bits(),
+            e.to_bits(),
+            "{what}: bit-exact value mismatch at row {i}"
+        );
+    }
+}
+
+#[test]
+fn impl_roundtrip_float32_nonnull() {
+    let values = f32_values();
+    let arr = arrow::array::Float32Array::from(values.clone());
+    let schema = arrow::datatypes::Schema::new(vec![arrow::datatypes::Field::new(
+        "weight",
+        arrow::datatypes::DataType::Float32,
+        false,
+    )]);
+    let batch = RecordBatch::try_new(
+        std::sync::Arc::new(schema),
+        vec![std::sync::Arc::new(arr) as _],
+    )
+    .unwrap();
+    let dir = tmp_dir_sync("lancefmt_impl_f32");
+    write_dataset(&batch, &dir).expect("write");
+    let loaded = scan_all(&dir).expect("our scan");
+    assert_batch_f32(&loaded, &values, 0, "ours->ours f32");
+}
+
+#[test]
+fn impl_roundtrip_uint64_nonnull() {
+    let values: Vec<u64> = vec![0, 1, u32::MAX as u64, u32::MAX as u64 + 7, u64::MAX];
+    let arr = arrow::array::UInt64Array::from(values.clone());
+    let schema = arrow::datatypes::Schema::new(vec![arrow::datatypes::Field::new(
+        "id",
+        arrow::datatypes::DataType::UInt64,
+        false,
+    )]);
+    let batch = RecordBatch::try_new(
+        std::sync::Arc::new(schema),
+        vec![std::sync::Arc::new(arr) as _],
+    )
+    .unwrap();
+    let dir = tmp_dir_sync("lancefmt_impl_u64");
+    write_dataset(&batch, &dir).expect("write");
+    let loaded = scan_all(&dir).expect("our scan");
+    let out = loaded
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::UInt64Array>()
+        .expect("u64 column");
+    for (i, e) in values.iter().enumerate() {
+        assert_eq!(out.value(i), *e, "u64 value mismatch at {i}");
+    }
+}
+
+#[test]
+fn impl_roundtrip_uint8_nonnull() {
+    let values: Vec<u8> = vec![0, 1, 42, 127, 128, 254, 255];
+    let arr = arrow::array::UInt8Array::from(values.clone());
+    let schema = arrow::datatypes::Schema::new(vec![arrow::datatypes::Field::new(
+        "q",
+        arrow::datatypes::DataType::UInt8,
+        false,
+    )]);
+    let batch = RecordBatch::try_new(
+        std::sync::Arc::new(schema),
+        vec![std::sync::Arc::new(arr) as _],
+    )
+    .unwrap();
+    let dir = tmp_dir_sync("lancefmt_impl_u8");
+    write_dataset(&batch, &dir).expect("write");
+    let loaded = scan_all(&dir).expect("our scan");
+    let out = loaded
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::UInt8Array>()
+        .expect("u8 column");
+    for (i, e) in values.iter().enumerate() {
+        assert_eq!(out.value(i), *e, "u8 value mismatch at {i}");
+    }
+}
+
+#[test]
+fn impl_roundtrip_fsl_float32_nonnull() {
+    let dim = 3i32;
+    let values: Vec<f32> = (0..9).map(|i| i as f32 * 0.5 - 1.0).collect();
+    let child = std::sync::Arc::new(arrow::datatypes::Field::new(
+        "item",
+        arrow::datatypes::DataType::Float32,
+        false,
+    ));
+    let list = FixedSizeListArray::new(
+        child,
+        dim,
+        std::sync::Arc::new(arrow::array::Float32Array::from(values.clone())),
+        None,
+    );
+    let schema = arrow::datatypes::Schema::new(vec![arrow::datatypes::Field::new(
+        "vector",
+        arrow::datatypes::DataType::FixedSizeList(
+            std::sync::Arc::new(arrow::datatypes::Field::new(
+                "item",
+                arrow::datatypes::DataType::Float32,
+                false,
+            )),
+            dim,
+        ),
+        false,
+    )]);
+    let batch = RecordBatch::try_new(
+        std::sync::Arc::new(schema),
+        vec![std::sync::Arc::new(list) as _],
+    )
+    .unwrap();
+    let dir = tmp_dir_sync("lancefmt_impl_fsl_f32");
+    write_dataset(&batch, &dir).expect("write");
+    let loaded = scan_all(&dir).expect("our scan");
+    let list = loaded
+        .column(0)
+        .as_any()
+        .downcast_ref::<FixedSizeListArray>()
+        .expect("fsl column");
+    assert_eq!(list.value_length(), dim);
+    let out = list
+        .values()
+        .as_any()
+        .downcast_ref::<arrow::array::Float32Array>()
+        .expect("fsl child f32");
+    for (i, e) in values.iter().enumerate() {
+        assert_eq!(
+            out.value(i).to_bits(),
+            e.to_bits(),
+            "fsl f32 item mismatch at {i}"
+        );
+    }
+}
+
+/// Graph edge-list columns (RFC #81-P3) across chunk boundaries: 2500 rows
+/// with `src`/`dst` UInt32 and `weight` Float32 exercise multiple 512/1024-
+/// value chunks in one page.
+#[test]
+fn impl_roundtrip_graph_edge_list_multichunk() {
+    let n = 2500usize;
+    let src: Vec<u32> = (0..n as u32).map(|i| i % 97).collect();
+    let dst: Vec<u32> = (0..n as u32).map(|i| (i * 31 + 5) % 97).collect();
+    let weight: Vec<f32> = (0..n as u32).map(|i| (i as f32 / 97.0) - 12.5).collect();
+
+    let schema = arrow::datatypes::Schema::new(vec![
+        arrow::datatypes::Field::new("src", arrow::datatypes::DataType::UInt32, false),
+        arrow::datatypes::Field::new("dst", arrow::datatypes::DataType::UInt32, false),
+        arrow::datatypes::Field::new("weight", arrow::datatypes::DataType::Float32, false),
+    ]);
+    let batch = RecordBatch::try_new(
+        std::sync::Arc::new(schema),
+        vec![
+            std::sync::Arc::new(arrow::array::UInt32Array::from(src.clone())) as _,
+            std::sync::Arc::new(arrow::array::UInt32Array::from(dst.clone())) as _,
+            std::sync::Arc::new(arrow::array::Float32Array::from(weight.clone())) as _,
+        ],
+    )
+    .unwrap();
+    let dir = tmp_dir_sync("lancefmt_impl_graph_edges");
+    write_dataset(&batch, &dir).expect("write");
+    let loaded = scan_all(&dir).expect("our scan");
+    assert_eq!(loaded.num_rows(), n);
+
+    let s = loaded
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::UInt32Array>()
+        .unwrap();
+    let d = loaded
+        .column(1)
+        .as_any()
+        .downcast_ref::<arrow::array::UInt32Array>()
+        .unwrap();
+    let w = loaded
+        .column(2)
+        .as_any()
+        .downcast_ref::<arrow::array::Float32Array>()
+        .unwrap();
+    for i in 0..n {
+        assert_eq!(s.value(i), src[i], "src mismatch at {i}");
+        assert_eq!(d.value(i), dst[i], "dst mismatch at {i}");
+        assert_eq!(
+            w.value(i).to_bits(),
+            weight[i].to_bits(),
+            "weight mismatch at {i}"
+        );
+    }
+}
+
+/// #95: wide vectors where the 16KiB budget cannot hold two rows
+/// (`rows_per_chunk` collapses to 1) must still round-trip — one page per
+/// row, each page a single final chunk.
+#[test]
+fn impl_roundtrip_fsl_wide_vectors() {
+    let dim = 3000i32; // 16KiB / (3000*8) == 0 -> rows_per_chunk would be 1
+    let values: Vec<f64> = (0..dim * 3).map(|i| (i % 17) as f64 - 8.0).collect();
+    let child = std::sync::Arc::new(arrow::datatypes::Field::new(
+        "item",
+        arrow::datatypes::DataType::Float64,
+        false,
+    ));
+    let list = FixedSizeListArray::new(
+        child.clone(),
+        dim,
+        std::sync::Arc::new(Float64Array::from(values.clone())),
+        None,
+    );
+    let schema = arrow::datatypes::Schema::new(vec![arrow::datatypes::Field::new(
+        "vector",
+        arrow::datatypes::DataType::FixedSizeList(child, dim),
+        false,
+    )]);
+    let batch = RecordBatch::try_new(
+        std::sync::Arc::new(schema),
+        vec![std::sync::Arc::new(list) as _],
+    )
+    .unwrap();
+    let dir = tmp_dir_sync("lancefmt_impl_fsl_wide");
+    write_dataset(&batch, &dir).expect("write wide fsl");
+    let loaded = scan_all(&dir).expect("our scan");
+    let out = loaded
+        .column(0)
+        .as_any()
+        .downcast_ref::<FixedSizeListArray>()
+        .expect("fsl column");
+    assert_eq!(out.value_length(), dim);
+    assert_eq!(out.len(), 3, "three wide rows");
+    let flat = out
+        .values()
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("fsl child f64");
+    for (i, e) in values.iter().enumerate() {
+        assert_eq!(flat.value(i), *e, "wide fsl value mismatch at {i}");
+    }
+}
+
+/// A single row wider than the 32768-byte chunk-metadata limit is rejected
+/// explicitly instead of being mis-encoded.
+#[test]
+fn impl_rejects_fsl_row_beyond_chunk_limit() {
+    let dim = 4200i32; // 4200*8 = 33600 > 32760
+    let child = std::sync::Arc::new(arrow::datatypes::Field::new(
+        "item",
+        arrow::datatypes::DataType::Float64,
+        false,
+    ));
+    let list = FixedSizeListArray::new(
+        child.clone(),
+        dim,
+        std::sync::Arc::new(Float64Array::from(vec![0.0; dim as usize])),
+        None,
+    );
+    let schema = arrow::datatypes::Schema::new(vec![arrow::datatypes::Field::new(
+        "vector",
+        arrow::datatypes::DataType::FixedSizeList(child, dim),
+        false,
+    )]);
+    let batch = RecordBatch::try_new(
+        std::sync::Arc::new(schema),
+        vec![std::sync::Arc::new(list) as _],
+    )
+    .unwrap();
+    let dir = tmp_dir_sync("lancefmt_impl_fsl_too_wide");
+    let err = write_dataset(&batch, &dir).unwrap_err();
+    assert!(
+        matches!(err, crate::StorageError::UnsupportedFormat(_)),
+        "expected UnsupportedFormat, got {err:?}"
+    );
+}
+
+/// #95-3: concurrent write_dataset calls to the same dataset dir are
+/// serialized by the per-dataset write mailbox — manifest versions strictly
+/// increase (no lost overwrite) and the dataset stays readable.
+#[test]
+fn impl_concurrent_dataset_writes_keep_versions_monotonic() {
+    use std::sync::Arc as StdArc;
+    let dir = tmp_dir_sync("lancefmt_impl_concurrent_writes");
+
+    let make_batch = |v: f64| {
+        let schema = arrow::datatypes::Schema::new(vec![arrow::datatypes::Field::new(
+            "value",
+            arrow::datatypes::DataType::Float64,
+            false,
+        )]);
+        RecordBatch::try_new(
+            std::sync::Arc::new(schema),
+            vec![std::sync::Arc::new(Float64Array::from(vec![v; 4])) as _],
+        )
+        .unwrap()
+    };
+
+    let dir = StdArc::new(dir);
+    let mut handles = Vec::new();
+    for t in 0..8u32 {
+        let dir = dir.clone();
+        handles.push(std::thread::spawn(move || {
+            for k in 0..5u32 {
+                let batch = make_batch((t * 10 + k) as f64);
+                write_dataset(&batch, dir.as_path())
+                    .unwrap_or_else(|e| panic!("write {t}.{k} failed: {e}"));
+            }
+        }));
+    }
+    for h in handles {
+        h.join().expect("writer thread");
+    }
+
+    // exactly 8*5 manifest versions, strictly 1..=40
+    let versions_dir = dir.join("_versions");
+    let mut versions: Vec<u64> = std::fs::read_dir(&versions_dir)
+        .unwrap()
+        .filter_map(|e| {
+            let name = e.unwrap().file_name().to_string_lossy().to_string();
+            name.strip_suffix(".manifest")
+                .and_then(|stem| stem.parse().ok())
+        })
+        .collect();
+    versions.sort_unstable();
+    let expected: Vec<u64> = (1..=40).collect();
+    assert_eq!(versions, expected, "manifest versions must be 1..=40");
+
+    // the dataset is readable and corresponds to the highest version
+    let loaded = scan_all(&dir).expect("scan after concurrent writes");
+    assert_eq!(loaded.num_rows(), 4);
+
+    // no tmp staging residue left behind (#95-3)
+    for sub in ["data", "_versions", "_transactions"] {
+        let residue: Vec<_> = std::fs::read_dir(dir.join(sub))
+            .unwrap()
+            .filter_map(|e| {
+                let name = e.unwrap().file_name().to_string_lossy().to_string();
+                name.contains(".tmp").then_some(name)
+            })
+            .collect();
+        assert!(residue.is_empty(), "tmp residue in {sub}: {residue:?}");
+    }
+}

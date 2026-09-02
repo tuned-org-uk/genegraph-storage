@@ -4,20 +4,28 @@
 //! - All I/O is async, no internal `block_on` or runtime creation.
 //! - Callers (CLI, tests, services) are responsible for providing a Tokio runtime.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use arrow::array::{Array as ArrowArray, Float64Array, UInt32Array};
-use arrow::datatypes::{DataType, Float64Type, Int64Type, UInt32Type};
+use arrow::array::{
+    Array as ArrowArray, ArrayRef, Float32Array, Float64Array, UInt32Array, UInt64Array,
+};
+use arrow::datatypes::{DataType, Field, Float64Type, Int64Type, Schema, UInt32Type};
 use arrow::record_batch::RecordBatch;
 use log::{debug, info};
 use smartcore::linalg::basic::arrays::Array;
 use smartcore::linalg::basic::matrix::DenseMatrix;
 use sprs::CsMat;
 
+use crate::graph::{GraphEdge, GraphWriteOptions, NodeIdWidth, StoredGraph};
 use crate::metadata::FileInfo;
 use crate::metadata::GeneMetadata;
 use crate::traits::backend::StorageBackend;
-use crate::traits::lance::LanceStorage;
+use crate::traits::lance::{
+    LanceStorage, reject_reserved_user_properties, validate_vector_space_schema,
+    with_collection_metadata,
+};
 use crate::{StorageError, StorageResult};
 
 /// Checked `usize -> u32` conversion.
@@ -210,18 +218,24 @@ impl StorageBackend for LanceStorageGraph {
             // Write to Lance
             let uri = Self::path_to_uri(&path)?;
             self.write_lance_batch_async(uri, batch).await?;
-            let mut md = self.load_metadata().await?;
-            md = md.add_file(
-                key,
-                FileInfo::new(
-                    format!("{}_{}.lance", self.get_name(), key),
-                    "dense",
-                    matrix.shape(),
-                    None,
-                    None,
-                )?,
-            );
-            self.save_metadata(&md).await?;
+            // Commit the registry entry through the instance's commit actor:
+            // concurrent save_* calls serialize their read-modify-write
+            // cycles instead of losing updates (duva actor model).
+            crate::commit::with_commit_actor(&self.metadata_path(), || async {
+                let mut md = self.load_metadata().await?;
+                md = md.add_file(
+                    key,
+                    FileInfo::new(
+                        format!("{}_{}.lance", self.get_name(), key),
+                        "dense",
+                        matrix.shape(),
+                        None,
+                        None,
+                    )?,
+                );
+                self.save_metadata(&md).await
+            })
+            .await?;
             info!("Dense {} matrix saved successfully", key);
         }
         Ok(())
@@ -465,18 +479,21 @@ impl StorageBackend for LanceStorageGraph {
 
         let filetype = FileInfo::which_filetype(key)?;
         {
-            let mut metadata = self.load_metadata().await?;
-            metadata = metadata.add_file(
-                key,
-                FileInfo::new(
-                    format!("{}_{}.lance", self.get_name(), key),
-                    filetype.as_str(),
-                    (matrix.rows(), matrix.cols()),
-                    Some(matrix.nnz()),
-                    None,
-                )?,
-            );
-            self.save_metadata(&metadata).await?;
+            crate::commit::with_commit_actor(&self.metadata_path(), || async {
+                let mut metadata = self.load_metadata().await?;
+                metadata = metadata.add_file(
+                    key,
+                    FileInfo::new(
+                        format!("{}_{}.lance", self.get_name(), key),
+                        filetype.as_str(),
+                        (matrix.rows(), matrix.cols()),
+                        Some(matrix.nnz()),
+                        None,
+                    )?,
+                );
+                self.save_metadata(&metadata).await
+            })
+            .await?;
 
             let batch = self.to_sparse_record_batch(matrix)?;
             let uri = Self::path_to_uri(&path)?;
@@ -781,18 +798,21 @@ impl StorageBackend for LanceStorageGraph {
 
         let batch = self.to_dense_record_batch(subcentroids)?;
         {
-            let mut metadata = self.load_metadata().await?;
-            metadata = metadata.add_file(
-                key,
-                FileInfo::new(
-                    format!("{}_{}.lance", self.get_name(), key),
-                    "vector",
-                    subcentroids.shape(),
-                    None,
-                    None,
-                )?,
-            );
-            self.save_metadata(&metadata).await?;
+            crate::commit::with_commit_actor(&self.metadata_path(), || async {
+                let mut metadata = self.load_metadata().await?;
+                metadata = metadata.add_file(
+                    key,
+                    FileInfo::new(
+                        format!("{}_{}.lance", self.get_name(), key),
+                        "vector",
+                        subcentroids.shape(),
+                        None,
+                        None,
+                    )?,
+                );
+                self.save_metadata(&metadata).await
+            })
+            .await?;
 
             let uri = Self::path_to_uri(&path)?;
             self.write_lance_batch_async(uri, batch).await?;
@@ -901,5 +921,313 @@ impl StorageBackend for LanceStorageGraph {
             .collect();
         info!("Loaded {} cluster assignments", assignments.len());
         Ok(assignments)
+    }
+
+    // =========
+    // NAMED COLLECTIONS (RFC #81)
+    // =========
+
+    async fn save_vectors_with(
+        &self,
+        name: &str,
+        batch: &RecordBatch,
+        properties: &BTreeMap<String, String>,
+        md_path: &Path,
+    ) -> StorageResult<()> {
+        reject_reserved_user_properties(properties)?;
+        self.validate_initialized(md_path)?;
+        if batch.num_rows() == 0 {
+            return Err(StorageError::Invalid(
+                "empty vector-space collections are not supported".into(),
+            ));
+        }
+        let (dim, _item_type) = validate_vector_space_schema(batch.schema().as_ref())?;
+        let batch = with_collection_metadata(batch, "vector-space", &[], properties)?;
+
+        let path = self.file_path(name);
+        info!(
+            "Saving vector-space collection '{}' ({} rows, vector dim {}) at {:?}",
+            name,
+            batch.num_rows(),
+            dim,
+            path
+        );
+        let uri = Self::path_to_uri(&path)?;
+        self.write_lance_batch_async(uri, batch.clone()).await?;
+
+        crate::commit::with_commit_actor(&self.metadata_path(), || async {
+            let mut md = self.load_metadata().await?;
+            let mut info = FileInfo::new(
+                format!("{}_{}.lance", self.get_name(), name),
+                "vectors",
+                (batch.num_rows(), dim as usize),
+                None,
+                None,
+            )?;
+            info.properties = properties.clone();
+            md = md.add_file(name, info);
+            self.save_metadata(&md).await
+        })
+        .await?;
+        info!("Vector-space collection '{}' saved successfully", name);
+        Ok(())
+    }
+
+    async fn load_vectors(&self, name: &str) -> StorageResult<RecordBatch> {
+        let path = self.file_path(name);
+        info!("Loading vector-space collection '{}' from {:?}", name, path);
+        let uri = Self::path_to_uri(&path)?;
+        let batch = self.read_lance_all_batches_async(uri).await?;
+        validate_vector_space_schema(batch.schema().as_ref())?;
+        info!(
+            "Loaded vector-space collection '{}': {} rows",
+            name,
+            batch.num_rows()
+        );
+        Ok(batch)
+    }
+
+    async fn save_graph_with(
+        &self,
+        name: &str,
+        edges: &[GraphEdge],
+        options: &GraphWriteOptions,
+        md_path: &Path,
+    ) -> StorageResult<()> {
+        reject_reserved_user_properties(&options.properties)?;
+        self.validate_initialized(md_path)?;
+        if edges.is_empty() {
+            return Err(StorageError::Invalid(
+                "empty graph collections are not supported".into(),
+            ));
+        }
+        // A collection is fully weighted or topology-only; mixed edges are
+        // rejected instead of being coerced.
+        let weighted = edges[0].weight.is_some();
+        if edges.iter().any(|e| e.weight.is_some() != weighted) {
+            return Err(StorageError::Invalid(
+                "graph collection must be either fully weighted or topology-only; \
+                 mixed edges are rejected"
+                    .into(),
+            ));
+        }
+        // The schema declares the storage-type limit; ids above it surface
+        // Overflow instead of being silently truncated (consistent with #51).
+        let max_id = edges.iter().map(|e| e.src.max(e.dst)).max().unwrap_or(0);
+        let width = options.node_id_width;
+        if width == NodeIdWidth::U32 && max_id > u32::MAX as u64 {
+            return Err(StorageError::Overflow(format!(
+                "node id {max_id} exceeds u32::MAX; save with NodeIdWidth::U64"
+            )));
+        }
+        let num_nodes = match options.num_nodes {
+            Some(n) if n < max_id + 1 => {
+                return Err(StorageError::Invalid(format!(
+                    "num_nodes {n} is smaller than the highest node id + 1 ({})",
+                    max_id + 1
+                )));
+            }
+            Some(n) => n,
+            None => max_id + 1,
+        };
+        let num_nodes_usize = usize::try_from(num_nodes)
+            .map_err(|_| StorageError::Overflow(format!("node count {num_nodes} exceeds usize")))?;
+
+        let (src, dst): (ArrayRef, ArrayRef) = match width {
+            NodeIdWidth::U32 => (
+                Arc::new(UInt32Array::from_iter_values(
+                    edges.iter().map(|e| e.src as u32),
+                )),
+                Arc::new(UInt32Array::from_iter_values(
+                    edges.iter().map(|e| e.dst as u32),
+                )),
+            ),
+            NodeIdWidth::U64 => (
+                Arc::new(UInt64Array::from_iter_values(edges.iter().map(|e| e.src))),
+                Arc::new(UInt64Array::from_iter_values(edges.iter().map(|e| e.dst))),
+            ),
+        };
+        let mut fields = vec![
+            Field::new("src", width.data_type(), false),
+            Field::new("dst", width.data_type(), false),
+        ];
+        let mut columns: Vec<ArrayRef> = vec![src, dst];
+        if weighted {
+            fields.push(Field::new("weight", DataType::Float32, false));
+            columns.push(Arc::new(Float32Array::from_iter_values(
+                edges.iter().map(|e| e.weight.unwrap()),
+            )));
+        }
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+            .map_err(|e| StorageError::Lance(e.to_string()))?;
+        // Dataset-level kind + graph layout facts (RFC #81-P1/P3).
+        let batch = with_collection_metadata(
+            &batch,
+            "graph",
+            &[
+                ("node_id_width", width.as_str().to_string()),
+                ("weighted", weighted.to_string()),
+                ("num_nodes", num_nodes.to_string()),
+            ],
+            &options.properties,
+        )?;
+
+        let path = self.file_path(name);
+        info!(
+            "Saving graph collection '{}' ({} edges, {} nodes, width {:?}, weighted {}) at {:?}",
+            name,
+            edges.len(),
+            num_nodes,
+            width,
+            weighted,
+            path
+        );
+        let uri = Self::path_to_uri(&path)?;
+        self.write_lance_batch_async(uri, batch).await?;
+
+        crate::commit::with_commit_actor(&self.metadata_path(), || async {
+            let mut md = self.load_metadata().await?;
+            let mut info = FileInfo::new(
+                format!("{}_{}.lance", self.get_name(), name),
+                "graph",
+                (num_nodes_usize, num_nodes_usize),
+                Some(edges.len()),
+                None,
+            )?;
+            info.properties = options.properties.clone();
+            info.properties
+                .insert("node_id_width".to_string(), width.as_str().to_string());
+            info.properties
+                .insert("weighted".to_string(), weighted.to_string());
+            info.properties
+                .insert("num_nodes".to_string(), num_nodes.to_string());
+            md = md.add_file(name, info);
+            self.save_metadata(&md).await
+        })
+        .await?;
+        info!("Graph collection '{}' saved successfully", name);
+        Ok(())
+    }
+
+    async fn load_graph(&self, name: &str) -> StorageResult<StoredGraph> {
+        let path = self.file_path(name);
+        info!("Loading graph collection '{}' from {:?}", name, path);
+        let uri = Self::path_to_uri(&path)?;
+        let batch = self.read_lance_all_batches_async(uri).await?;
+
+        let schema = batch.schema();
+        let n_cols = schema.fields().len();
+        if !(2..=3).contains(&n_cols) {
+            return Err(StorageError::Invalid(format!(
+                "graph edge-list schema expects src/dst (and optionally weight) columns, \
+                 found {n_cols}"
+            )));
+        }
+        let width = match (schema.field(0).data_type(), schema.field(1).data_type()) {
+            (DataType::UInt32, DataType::UInt32) => NodeIdWidth::U32,
+            (DataType::UInt64, DataType::UInt64) => NodeIdWidth::U64,
+            (s, d) => {
+                return Err(StorageError::Invalid(format!(
+                    "graph src/dst columns must share width UInt32|UInt64, found {s:?}/{d:?}"
+                )));
+            }
+        };
+        let weighted = n_cols == 3;
+        if weighted && schema.field(2).data_type() != &DataType::Float32 {
+            return Err(StorageError::Invalid(format!(
+                "graph weight column must be Float32, found {:?}",
+                schema.field(2).data_type()
+            )));
+        }
+
+        let ids = |col: usize, what: &'static str| -> StorageResult<Vec<u64>> {
+            let arr = batch.column(col);
+            if arr.null_count() != 0 {
+                return Err(StorageError::Invalid(format!(
+                    "graph '{what}' column contains nulls"
+                )));
+            }
+            match width {
+                NodeIdWidth::U32 => {
+                    let a = arr.as_any().downcast_ref::<UInt32Array>().ok_or_else(|| {
+                        StorageError::Invalid(format!("graph '{what}' column type mismatch"))
+                    })?;
+                    Ok((0..a.len()).map(|i| a.value(i) as u64).collect())
+                }
+                NodeIdWidth::U64 => {
+                    let a = arr.as_any().downcast_ref::<UInt64Array>().ok_or_else(|| {
+                        StorageError::Invalid(format!("graph '{what}' column type mismatch"))
+                    })?;
+                    Ok((0..a.len()).map(|i| a.value(i)).collect())
+                }
+            }
+        };
+        let src = ids(0, "src")?;
+        let dst = ids(1, "dst")?;
+        let weights: Option<Vec<f32>> = if weighted {
+            let w = batch.column(2);
+            if w.null_count() != 0 {
+                return Err(StorageError::Invalid(
+                    "graph 'weight' column contains nulls".into(),
+                ));
+            }
+            let a = w.as_any().downcast_ref::<Float32Array>().ok_or_else(|| {
+                StorageError::Invalid("graph 'weight' column type mismatch".into())
+            })?;
+            Some((0..a.len()).map(|i| a.value(i)).collect())
+        } else {
+            None
+        };
+
+        // Node count: dataset-level metadata if present (isolated vertices
+        // included), otherwise the highest id + 1.
+        let max_id = src
+            .iter()
+            .zip(dst.iter())
+            .map(|(s, d)| (*s).max(*d))
+            .max()
+            .unwrap_or(0);
+        let num_nodes = schema
+            .metadata()
+            .get("num_nodes")
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(max_id + 1);
+        let edges: Vec<GraphEdge> = match &weights {
+            Some(weights) => src
+                .iter()
+                .zip(dst.iter())
+                .zip(weights.iter())
+                .map(|((s, d), w)| GraphEdge::weighted(*s, *d, *w))
+                .collect(),
+            None => src
+                .iter()
+                .zip(dst.iter())
+                .map(|(s, d)| GraphEdge::unweighted(*s, *d))
+                .collect(),
+        };
+        if let Some(e) = edges
+            .iter()
+            .find(|e| e.src >= num_nodes || e.dst >= num_nodes)
+        {
+            return Err(StorageError::Invalid(format!(
+                "edge ({}, {}) out of bounds for {}-node graph",
+                e.src, e.dst, num_nodes
+            )));
+        }
+
+        info!(
+            "Loaded graph collection '{}': {} edges, {} nodes, width {:?}, weighted {}",
+            name,
+            edges.len(),
+            num_nodes,
+            width,
+            weighted
+        );
+        Ok(StoredGraph {
+            edges,
+            node_id_width: width,
+            num_nodes,
+            weighted,
+        })
     }
 }

@@ -1,6 +1,8 @@
 #![allow(async_fn_in_trait)]
 pub mod catalog;
+pub mod commit;
 pub mod generations;
+pub mod graph;
 pub mod lance_storage_graph;
 pub mod lancefmt;
 pub mod metadata;

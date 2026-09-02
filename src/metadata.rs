@@ -2,13 +2,63 @@
 
 use log::{debug, info};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 use crate::StorageError;
 use crate::StorageResult;
 use crate::traits::backend::StorageBackend;
 use crate::traits::metadata::Metadata;
+
+/// First-class collection kind (RFC #81-P1).
+///
+/// Every named collection in the metadata registry is either a vector space
+/// (dense vector collections and scalar artifacts), a graph (edge/adjacency
+/// artifacts), or a plain table (anything else).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CollectionKind {
+    /// Dense vector collections (embeddings, maps, norms, lambdas, ...).
+    VectorSpace,
+    /// Graph data (edge lists, adjacency, laplacian).
+    Graph,
+    /// Anything else stored as a table.
+    Table,
+}
+
+impl CollectionKind {
+    /// Registry / descriptor string form (Generic Table API property value).
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            CollectionKind::VectorSpace => "vector-space",
+            CollectionKind::Graph => "graph",
+            CollectionKind::Table => "table",
+        }
+    }
+
+    /// Parses the string form ([`Self::as_str`]).
+    pub fn parse(s: &str) -> StorageResult<Self> {
+        match s {
+            "vector-space" => Ok(CollectionKind::VectorSpace),
+            "graph" => Ok(CollectionKind::Graph),
+            "table" => Ok(CollectionKind::Table),
+            other => Err(StorageError::Invalid(format!(
+                "unknown collection kind '{other}' (expected vector-space, graph or table)"
+            ))),
+        }
+    }
+
+    /// Derives the kind from a legacy artifact filetype; the compat shim
+    /// that turns the fixed artifact keys (`rawinput`, `adjacency`, ...)
+    /// into pre-seeded collections (RFC #81-P1).
+    pub fn for_filetype(filetype: &str) -> Option<Self> {
+        match filetype {
+            "dense" | "vectors" | "vector" => Some(CollectionKind::VectorSpace),
+            "sparse" | "graph" => Some(CollectionKind::Graph),
+            _ => None,
+        }
+    }
+}
 
 /// Represent a single file spec in the persistence directory
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -23,6 +73,14 @@ pub struct FileInfo {
     pub cols: usize,
     pub nnz: Option<usize>,
     pub size_bytes: Option<u64>,
+    /// First-class collection kind (RFC #81-P1); `None` for entries written
+    /// before 0.28 (kind is then derived from `filetype`).
+    #[serde(default)]
+    pub kind: Option<CollectionKind>,
+    /// User properties attached to the collection (RFC #81-P1), e.g. the
+    /// `graph` linkage of a vector space (RFC #81-P4).
+    #[serde(default)]
+    pub properties: BTreeMap<String, String>,
 }
 
 impl FileInfo {
@@ -49,15 +107,18 @@ impl FileInfo {
             cols: data_shape.1,
             nnz,
             size_bytes,
+            kind: CollectionKind::for_filetype(filetype),
+            properties: BTreeMap::new(),
         })
     }
 
     /// Assign the right format to the file type
     pub fn which_format(filetype: &str) -> StorageResult<String> {
         match filetype {
-            "dense" => Ok(String::from("lance fixed-row")),
+            "dense" | "vectors" => Ok(String::from("lance fixed-row")),
             "sparse" => Ok(String::from("lance row-major")),
             "vector" => Ok(String::from("lance row-major")),
+            "graph" => Ok(String::from("lance edge-list")),
             other => Err(StorageError::UnsupportedFormat(other.to_string())),
         }
     }
@@ -68,6 +129,7 @@ impl FileInfo {
             "rawinput" | "sub_centroids" | "dense" => Ok(String::from("dense")),
             "adjacency" | "laplacian" | "signals" | "sparse" => Ok(String::from("sparse")),
             "lambdas" | "item_norms" | "norms" | "vector" => Ok(String::from("vector")),
+            "graph" | "vectors" => Ok(filetype.into()),
             other => Err(StorageError::UnsupportedFiletype(other.to_string())),
         }
     }

@@ -1,5 +1,6 @@
 mod lancefmt_common;
 mod test_catalog;
+mod test_collections;
 mod test_data;
 mod test_generations;
 mod test_lance_layer;
@@ -29,17 +30,8 @@ pub(crate) async fn tmp_dir(test_name: &str) -> PathBuf {
     d.canonicalize().unwrap_or(d)
 }
 
-// Logging harness
-use std::sync::Once;
-
-static INIT: Once = Once::new();
-
+// Logging harness: delegate to the crate-level initializer instead of
+// keeping a duplicate INIT static (#95).
 pub fn init() {
-    INIT.call_once(|| {
-        // Read RUST_LOG env variable, default to "info" if not set
-        let env = env_logger::Env::default().default_filter_or("debug");
-
-        // don't panic if called multiple times across binaries
-        let _ = env_logger::Builder::from_env(env).try_init();
-    });
+    crate::init();
 }

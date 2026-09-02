@@ -7,9 +7,9 @@
 use std::path::Path;
 
 use arrow::array::{
-    Array, FixedSizeListArray, Float64Array, Int64Array, PrimitiveArray, UInt32Array,
+    Array, FixedSizeListArray, Float32Array, Float64Array, Int64Array, PrimitiveArray, UInt8Array,
+    UInt32Array, UInt64Array,
 };
-use arrow::datatypes::ArrowPrimitiveType;
 use arrow::datatypes::{DataType, Schema as ArrowSchema};
 use arrow::record_batch::RecordBatch;
 use prost::Message;
@@ -100,50 +100,24 @@ fn build_chunk(buffer: &[u8], ln: u16) -> StorageResult<Chunk> {
     Ok(Chunk { metadata, bytes })
 }
 
-fn chunk_bytes_le(
-    values: &PrimitiveArray<arrow::datatypes::Float64Type>,
-    values_per_chunk: usize,
-) -> StorageResult<Vec<Chunk>> {
-    chunk_bytes_le_impl(values, values_per_chunk, 8, |out, v| {
-        out.extend_from_slice(&v.to_le_bytes())
-    })
-}
-
-fn chunk_bytes_le_u32(
-    values: &PrimitiveArray<arrow::datatypes::UInt32Type>,
-    values_per_chunk: usize,
-) -> StorageResult<Vec<Chunk>> {
-    chunk_bytes_le_impl(values, values_per_chunk, 4, |out, v| {
-        out.extend_from_slice(&v.to_le_bytes())
-    })
-}
-
-fn chunk_bytes_le_i64(
-    values: &PrimitiveArray<arrow::datatypes::Int64Type>,
-    values_per_chunk: usize,
-) -> StorageResult<Vec<Chunk>> {
-    chunk_bytes_le_impl(values, values_per_chunk, 8, |out, v| {
-        out.extend_from_slice(&v.to_le_bytes())
-    })
-}
-
-fn chunk_bytes_le_impl<T: ArrowPrimitiveType>(
-    values: &PrimitiveArray<T>,
-    values_per_chunk: usize,
-    bytes_per_value: usize,
-    write_one: impl Fn(&mut Vec<u8>, T::Native),
+/// Encodes `total_items` flat LE values into chunks of `items_per_chunk`
+/// values; `full_chunk_ln` is the log2 value recorded for a full chunk
+/// (log2 of values for scalar columns, log2 of rows for FixedSizeList
+/// columns).
+fn chunked_items(
+    total_items: usize,
+    items_per_chunk: usize,
+    full_chunk_ln: u16,
+    mut write_items: impl FnMut(&mut Vec<u8>, usize, usize),
 ) -> StorageResult<Vec<Chunk>> {
     let mut chunks = Vec::new();
     let mut start = 0usize;
-    let total = values.len();
-    while start < total {
-        let n = values_per_chunk.min(total - start);
-        let mut buffer = Vec::with_capacity(n * bytes_per_value);
-        for i in start..start + n {
-            write_one(&mut buffer, values.value(i));
-        }
-        let ln = if n == values_per_chunk {
-            log2_usize(n)?
+    while start < total_items {
+        let n = items_per_chunk.min(total_items - start);
+        let mut buffer = Vec::with_capacity(n * 8);
+        write_items(&mut buffer, start, n);
+        let ln = if n == items_per_chunk {
+            full_chunk_ln
         } else {
             0
         };
@@ -153,7 +127,79 @@ fn chunk_bytes_le_impl<T: ArrowPrimitiveType>(
     Ok(chunks)
 }
 
-fn encode_column(batch: &RecordBatch, col: usize) -> StorageResult<EncodedPage> {
+fn chunk_bytes_le(
+    values: &PrimitiveArray<arrow::datatypes::Float64Type>,
+    values_per_chunk: usize,
+) -> StorageResult<Vec<Chunk>> {
+    let ln = log2_usize(values_per_chunk)?;
+    chunked_items(values.len(), values_per_chunk, ln, |out, s, n| {
+        for i in s..s + n {
+            out.extend_from_slice(&values.value(i).to_le_bytes())
+        }
+    })
+}
+
+fn chunk_bytes_le_f32(
+    values: &PrimitiveArray<arrow::datatypes::Float32Type>,
+    values_per_chunk: usize,
+) -> StorageResult<Vec<Chunk>> {
+    let ln = log2_usize(values_per_chunk)?;
+    chunked_items(values.len(), values_per_chunk, ln, |out, s, n| {
+        for i in s..s + n {
+            out.extend_from_slice(&values.value(i).to_le_bytes())
+        }
+    })
+}
+
+fn chunk_bytes_le_u32(
+    values: &PrimitiveArray<arrow::datatypes::UInt32Type>,
+    values_per_chunk: usize,
+) -> StorageResult<Vec<Chunk>> {
+    let ln = log2_usize(values_per_chunk)?;
+    chunked_items(values.len(), values_per_chunk, ln, |out, s, n| {
+        for i in s..s + n {
+            out.extend_from_slice(&values.value(i).to_le_bytes())
+        }
+    })
+}
+
+fn chunk_bytes_le_u64(
+    values: &PrimitiveArray<arrow::datatypes::UInt64Type>,
+    values_per_chunk: usize,
+) -> StorageResult<Vec<Chunk>> {
+    let ln = log2_usize(values_per_chunk)?;
+    chunked_items(values.len(), values_per_chunk, ln, |out, s, n| {
+        for i in s..s + n {
+            out.extend_from_slice(&values.value(i).to_le_bytes())
+        }
+    })
+}
+
+fn chunk_bytes_le_u8(
+    values: &PrimitiveArray<arrow::datatypes::UInt8Type>,
+    values_per_chunk: usize,
+) -> StorageResult<Vec<Chunk>> {
+    let ln = log2_usize(values_per_chunk)?;
+    chunked_items(values.len(), values_per_chunk, ln, |out, s, n| {
+        for i in s..s + n {
+            out.extend_from_slice(&values.value(i).to_le_bytes())
+        }
+    })
+}
+
+fn chunk_bytes_le_i64(
+    values: &PrimitiveArray<arrow::datatypes::Int64Type>,
+    values_per_chunk: usize,
+) -> StorageResult<Vec<Chunk>> {
+    let ln = log2_usize(values_per_chunk)?;
+    chunked_items(values.len(), values_per_chunk, ln, |out, s, n| {
+        for i in s..s + n {
+            out.extend_from_slice(&values.value(i).to_le_bytes())
+        }
+    })
+}
+
+fn encode_column(batch: &RecordBatch, col: usize) -> StorageResult<Vec<EncodedPage>> {
     let column = batch.column(col);
     let rows = column.len() as u64;
     let (chunks, value_compression, num_items) = match column.data_type() {
@@ -167,6 +213,36 @@ fn encode_column(batch: &RecordBatch, col: usize) -> StorageResult<EncodedPage> 
                 chunk_bytes_le(arr, 512)?,
                 Compression::Flat(Flat {
                     bits_per_value: 64,
+                    data: None,
+                }),
+                rows,
+            )
+        }
+        DataType::Float32 => {
+            let arr = column
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| StorageError::Invalid("float32 downcast failed".into()))?;
+            // 1024 x 4B = 4KiB per chunk
+            (
+                chunk_bytes_le_f32(arr, 1024)?,
+                Compression::Flat(Flat {
+                    bits_per_value: 32,
+                    data: None,
+                }),
+                rows,
+            )
+        }
+        DataType::UInt8 => {
+            let arr = column
+                .as_any()
+                .downcast_ref::<UInt8Array>()
+                .ok_or_else(|| StorageError::Invalid("uint8 downcast failed".into()))?;
+            // 16384 x 1B = 16KiB per chunk
+            (
+                chunk_bytes_le_u8(arr, 16384)?,
+                Compression::Flat(Flat {
+                    bits_per_value: 8,
                     data: None,
                 }),
                 rows,
@@ -187,6 +263,21 @@ fn encode_column(batch: &RecordBatch, col: usize) -> StorageResult<EncodedPage> 
                 rows,
             )
         }
+        DataType::UInt64 => {
+            let arr = column
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| StorageError::Invalid("uint64 downcast failed".into()))?;
+            // 1024 x 8B = 8KiB per chunk
+            (
+                chunk_bytes_le_u64(arr, 1024)?,
+                Compression::Flat(Flat {
+                    bits_per_value: 64,
+                    data: None,
+                }),
+                rows,
+            )
+        }
         DataType::Int64 => {
             let arr = column
                 .as_any()
@@ -202,7 +293,7 @@ fn encode_column(batch: &RecordBatch, col: usize) -> StorageResult<EncodedPage> 
                 rows,
             )
         }
-        DataType::FixedSizeList(_child, dim) => {
+        DataType::FixedSizeList(child, dim) => {
             let dim: i32 = *dim;
             let list = column
                 .as_any()
@@ -213,40 +304,129 @@ fn encode_column(batch: &RecordBatch, col: usize) -> StorageResult<EncodedPage> 
                     "lancefmt writer does not support nulls in FixedSizeList columns".into(),
                 ));
             }
-            let dim = dim as usize;
-            let values = list
-                .values()
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .ok_or_else(|| StorageError::Invalid("fsl child downcast failed".into()))?;
-            let bytes_per_row = dim * std::mem::size_of::<f64>();
-            let rows_per_chunk = (CHUNK_DATA_BUDGET / bytes_per_row).next_power_of_two();
-            let mut chunks = Vec::new();
-            let mut start = 0usize;
-            while start < values.len() {
-                let n_items = (rows_per_chunk * dim).min(values.len() - start);
-                let mut buffer = Vec::with_capacity(n_items * 8);
-                for i in start..start + n_items {
-                    buffer.extend_from_slice(&values.value(i).to_le_bytes());
+            let (bits, bytes_per_item) = match child.data_type() {
+                DataType::Float64 => (64u64, 8usize),
+                DataType::Float32 => (32u64, 4usize),
+                other => {
+                    return Err(StorageError::UnsupportedFormat(format!(
+                        "lancefmt writer: unsupported fixed_size_list item type {other:?}"
+                    )));
                 }
-                let ln = if n_items == rows_per_chunk * dim {
-                    log2_usize(rows_per_chunk)?
-                } else {
-                    0
-                };
-                chunks.push(build_chunk(&buffer, ln)?);
-                start += n_items;
+            };
+            let dim = dim as usize;
+            let bytes_per_row = dim * bytes_per_item;
+            // Rows per full chunk: a power of two so the chunk metadata can
+            // record log2(rows). The u16 chunk metadata word caps a chunk at
+            // 32768 bytes ((bytes/8 - 1) << 4 must fit in 12 bits), so a
+            // single row of `bytes_per_row` bytes must fit in that budget.
+            // When the 16KiB budget cannot hold even two rows (wide
+            // vectors), `rows_per_chunk` collapses to 1 and log2(1) = 0 is
+            // indistinguishable from the final-chunk marker; in that case
+            // the column is written as one page per row, each page a single
+            // final chunk (the shape the official writer emits for
+            // single-chunk pages).
+            if bytes_per_row > 32768 - 8 {
+                return Err(StorageError::UnsupportedFormat(format!(
+                    "lancefmt writer: fixed_size_list row of {bytes_per_row} bytes \
+                     exceeds the 32768-byte chunk metadata limit"
+                )));
             }
-            let compression = Compression::FixedSizeList(Box::new(FslCompressive {
-                items_per_value: dim as u64,
-                has_validity: false,
-                values: Some(Box::new(CompressiveEncoding {
-                    compression: Some(Compression::Flat(Flat {
-                        bits_per_value: 64,
-                        data: None,
+            let rows_per_chunk = (CHUNK_DATA_BUDGET / bytes_per_row).next_power_of_two();
+            let fsl_compression = || {
+                Compression::FixedSizeList(Box::new(FslCompressive {
+                    items_per_value: dim as u64,
+                    has_validity: false,
+                    values: Some(Box::new(CompressiveEncoding {
+                        compression: Some(Compression::Flat(Flat {
+                            bits_per_value: bits,
+                            data: None,
+                        })),
                     })),
-                })),
-            }));
+                }))
+            };
+            if rows_per_chunk <= 1 {
+                let items = list.values();
+                let mut pages = Vec::with_capacity(list.len());
+                for row in 0..list.len() {
+                    let mut buffer = Vec::with_capacity(bytes_per_row);
+                    let start = row * dim;
+                    match child.data_type() {
+                        DataType::Float64 => {
+                            let values =
+                                items
+                                    .as_any()
+                                    .downcast_ref::<Float64Array>()
+                                    .ok_or_else(|| {
+                                        StorageError::Invalid("fsl child downcast failed".into())
+                                    })?;
+                            for i in start..start + dim {
+                                buffer.extend_from_slice(&values.value(i).to_le_bytes());
+                            }
+                        }
+                        DataType::Float32 => {
+                            let values =
+                                items
+                                    .as_any()
+                                    .downcast_ref::<Float32Array>()
+                                    .ok_or_else(|| {
+                                        StorageError::Invalid("fsl child downcast failed".into())
+                                    })?;
+                            for i in start..start + dim {
+                                buffer.extend_from_slice(&values.value(i).to_le_bytes());
+                            }
+                        }
+                        other => {
+                            return Err(StorageError::UnsupportedFormat(format!(
+                                "lancefmt writer: unsupported fixed_size_list item type {other:?}"
+                            )));
+                        }
+                    }
+                    let chunk = build_chunk(&buffer, 0)?;
+                    pages.push(EncodedPage {
+                        metadata_buffer: chunk.metadata.to_le_bytes().to_vec(),
+                        data_buffer: chunk.bytes,
+                        rows: 1,
+                        num_items: 1,
+                        value_compression: fsl_compression(),
+                    });
+                }
+                return Ok(pages);
+            }
+            let items_per_chunk = rows_per_chunk * dim;
+            let full_chunk_ln = log2_usize(rows_per_chunk)?;
+            let total_items = list.values().len();
+            let chunks = match child.data_type() {
+                DataType::Float64 => {
+                    let values = list
+                        .values()
+                        .as_any()
+                        .downcast_ref::<Float64Array>()
+                        .ok_or_else(|| StorageError::Invalid("fsl child downcast failed".into()))?;
+                    chunked_items(total_items, items_per_chunk, full_chunk_ln, |buf, s, n| {
+                        for i in s..s + n {
+                            buf.extend_from_slice(&values.value(i).to_le_bytes());
+                        }
+                    })?
+                }
+                DataType::Float32 => {
+                    let values = list
+                        .values()
+                        .as_any()
+                        .downcast_ref::<Float32Array>()
+                        .ok_or_else(|| StorageError::Invalid("fsl child downcast failed".into()))?;
+                    chunked_items(total_items, items_per_chunk, full_chunk_ln, |buf, s, n| {
+                        for i in s..s + n {
+                            buf.extend_from_slice(&values.value(i).to_le_bytes());
+                        }
+                    })?
+                }
+                other => {
+                    return Err(StorageError::UnsupportedFormat(format!(
+                        "lancefmt writer: unsupported fixed_size_list item type {other:?}"
+                    )));
+                }
+            };
+            let compression = fsl_compression();
             (chunks, compression, rows)
         }
         other => {
@@ -263,13 +443,13 @@ fn encode_column(batch: &RecordBatch, col: usize) -> StorageResult<EncodedPage> 
         data_buffer.extend_from_slice(&chunk.bytes);
     }
 
-    Ok(EncodedPage {
+    Ok(vec![EncodedPage {
         metadata_buffer,
         data_buffer,
         rows,
         num_items,
         value_compression,
-    })
+    }])
 }
 
 fn page_layout(page: &EncodedPage) -> lfv2::Encoding {
@@ -292,24 +472,88 @@ fn page_layout(page: &EncodedPage) -> lfv2::Encoding {
     direct_encoding("/lance.encodings21.PageLayout", layout.encode_to_vec())
 }
 
+/// Durable file write (#95-3): write to a unique tmp file next to `path`,
+/// fsync, then rename over `path`. The rename is the atomic publish point;
+/// the fsync makes the payload durable before the directory entry appears.
+fn write_durable(path: &Path, bytes: &[u8]) -> StorageResult<()> {
+    use std::io::Write;
+
+    let mut name = path
+        .file_name()
+        .ok_or_else(|| StorageError::Invalid(format!("bad artifact path {path:?}")))?
+        .to_os_string();
+    name.push(format!(".{}.tmp", uuid::Uuid::new_v4().simple()));
+    let tmp = path.with_file_name(name);
+
+    {
+        let mut f = std::fs::File::create(&tmp)
+            .map_err(|e| StorageError::Io(format!("create tmp for {path:?}: {e}")))?;
+        f.write_all(bytes)
+            .map_err(|e| StorageError::Io(format!("write tmp for {path:?}: {e}")))?;
+        f.sync_all()
+            .map_err(|e| StorageError::Io(format!("fsync tmp for {path:?}: {e}")))?;
+    }
+    std::fs::rename(&tmp, path).map_err(|e| StorageError::Io(format!("publish {path:?}: {e}")))?;
+    Ok(())
+}
+
+/// fsyncs a directory so a completed rename is itself durable
+/// (directory-entry durability, #95-3). No-op off unix.
+fn fsync_dir(dir: &Path) -> StorageResult<()> {
+    #[cfg(unix)]
+    {
+        let f = std::fs::File::open(dir)
+            .map_err(|e| StorageError::Io(format!("open dir {dir:?} for fsync: {e}")))?;
+        f.sync_all()
+            .map_err(|e| StorageError::Io(format!("fsync dir {dir:?}: {e}")))?;
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
 /// Writes `batch` as a single-fragment Lance v2.1 dataset rooted at `dir`.
+///
+/// Durability & concurrency (#95-3): the whole write — manifest-version
+/// allocation through commit-point publish — runs under a per-dataset write
+/// mailbox (a blocking `std::sync::Mutex` held across several fsyncs), and
+/// every artifact (data file, txn, manifest, version hint) is written
+/// tmp + fsync + rename with a directory fsync, in the order
+/// data → txn → manifest (commit) → hint. Readers observe either the
+/// previous or the complete new dataset version.
+///
+/// Blocking: because of that lock, callers on Tokio must reach this through
+/// `spawn_blocking` (as `LanceStorage::write_lance_batch_async` does), never
+/// directly on an async executor thread.
 pub fn write_dataset(batch: &RecordBatch, dir: &Path) -> StorageResult<()> {
     if batch.num_rows() == 0 {
         return Err(StorageError::Invalid(
             "lancefmt writer: empty batches are not supported".into(),
         ));
     }
-    let arrow_schema = batch.schema().as_ref().clone();
-    let (fields, schema_meta) = to_lance_schema(&arrow_schema)?;
 
     std::fs::create_dir_all(dir)
-        .map_err(|e| StorageError::Io(format!("create dataset dir {:?}: {e}", dir)))?;
+        .map_err(|e| StorageError::Io(format!("create dataset dir {dir:?}: {e}")))?;
     let data_dir = dir.join("data");
     let versions_dir = dir.join("_versions");
     let txn_dir = dir.join("_transactions");
     for d in [&data_dir, &versions_dir, &txn_dir] {
-        std::fs::create_dir_all(d).map_err(|e| StorageError::Io(format!("create {:?}: {e}", d)))?;
+        std::fs::create_dir_all(d).map_err(|e| StorageError::Io(format!("create {d:?}: {e}")))?;
     }
+
+    crate::commit::with_dataset_write_lock(dir, || {
+        write_dataset_locked(batch, &data_dir, &versions_dir, &txn_dir)
+    })
+}
+
+fn write_dataset_locked(
+    batch: &RecordBatch,
+    data_dir: &Path,
+    versions_dir: &Path,
+    txn_dir: &Path,
+) -> StorageResult<()> {
+    let arrow_schema = batch.schema().as_ref().clone();
+    let (fields, schema_meta) = to_lance_schema(&arrow_schema)?;
 
     let uuid = uuid::Uuid::new_v4();
     let data_file_name = format!("{:024b}{}.lance", 0, uuid.simple());
@@ -319,17 +563,28 @@ pub fn write_dataset(batch: &RecordBatch, dir: &Path) -> StorageResult<()> {
     let mut column_metadatas: Vec<(u64, Vec<u8>)> = Vec::new();
 
     for col in 0..batch.num_columns() {
-        let page = encode_column(batch, col)?;
-        let page_encoding = page_layout(&page);
+        let pages = encode_column(batch, col)?;
+        let mut page_entries: Vec<column_metadata::Page> = Vec::with_capacity(pages.len());
+        for page in &pages {
+            let page_encoding = page_layout(page);
 
-        let mut buffers: Vec<&[u8]> = vec![&page.metadata_buffer, &page.data_buffer];
-        let mut page_buffer_offsets = Vec::with_capacity(buffers.len());
-        let mut page_buffer_sizes = Vec::with_capacity(buffers.len());
-        for b in buffers.drain(..) {
-            pad_to(&mut file_bytes, BUFFER_ALIGNMENT);
-            page_buffer_offsets.push(file_bytes.len() as u64);
-            page_buffer_sizes.push(b.len() as u64);
-            file_bytes.extend_from_slice(b);
+            let mut buffers: Vec<&[u8]> = vec![&page.metadata_buffer, &page.data_buffer];
+            let mut page_buffer_offsets = Vec::with_capacity(buffers.len());
+            let mut page_buffer_sizes = Vec::with_capacity(buffers.len());
+            for b in buffers.drain(..) {
+                pad_to(&mut file_bytes, BUFFER_ALIGNMENT);
+                page_buffer_offsets.push(file_bytes.len() as u64);
+                page_buffer_sizes.push(b.len() as u64);
+                file_bytes.extend_from_slice(b);
+            }
+
+            page_entries.push(column_metadata::Page {
+                buffer_offsets: page_buffer_offsets,
+                buffer_sizes: page_buffer_sizes,
+                length: page.rows,
+                encoding: Some(page_encoding),
+                priority: 0,
+            });
         }
 
         let column_metadata = ColumnMetadata {
@@ -340,13 +595,7 @@ pub fn write_dataset(batch: &RecordBatch, dir: &Path) -> StorageResult<()> {
                 }
                 .encode_to_vec(),
             )),
-            pages: vec![column_metadata::Page {
-                buffer_offsets: page_buffer_offsets,
-                buffer_sizes: page_buffer_sizes,
-                length: page.rows,
-                encoding: Some(page_encoding),
-                priority: 0,
-            }],
+            pages: page_entries,
             buffer_offsets: vec![],
             buffer_sizes: vec![],
         };
@@ -401,17 +650,21 @@ pub fn write_dataset(batch: &RecordBatch, dir: &Path) -> StorageResult<()> {
     file_bytes.extend_from_slice(b"LANC");
 
     let data_path = data_dir.join(&data_file_name);
-    std::fs::write(&data_path, &file_bytes)
-        .map_err(|e| StorageError::Io(format!("write {data_path:?}: {e}")))?;
+    write_durable(&data_path, &file_bytes)?;
+    fsync_dir(data_dir)?;
 
     // ---- manifest + transaction -----------------------------------------
     // Overwrite semantics (M4): an existing dataset receives a new manifest
     // version whose fragment set fully replaces the previous one; readers
     // (ours and official) open the highest version.
-    let prev_version = latest_manifest_version(&versions_dir)?;
+    let prev_version = latest_manifest_version(versions_dir)?;
     let next_version = prev_version + 1;
     // Fragment ids are unique per dataset; version numbering gives us a
     // deterministic fresh id per overwrite (fresh dataset -> 0).
+    // NOTE (#95): this id == version-by-construction holds only while
+    // Overwrite is the sole operation. When Append lands (RFC #81), fragment
+    // ids must be allocated from `max_fragment_id` instead, since appended
+    // fragments coexist with previous versions' fragments.
     let fragment_id = prev_version;
 
     let data_file = DataFile {
@@ -481,11 +734,11 @@ pub fn write_dataset(batch: &RecordBatch, dir: &Path) -> StorageResult<()> {
         })),
     };
     let txn_bytes = transaction.encode_to_vec();
-    std::fs::write(
-        txn_dir.join(format!("{prev_version}-{uuid}.txn")),
+    write_durable(
+        &txn_dir.join(format!("{prev_version}-{uuid}.txn")),
         &txn_bytes,
-    )
-    .map_err(|e| StorageError::Io(format!("write txn: {e}")))?;
+    )?;
+    fsync_dir(txn_dir)?;
 
     let manifest_bytes = manifest.encode_to_vec();
     let mut out: Vec<u8> = Vec::new();
@@ -499,13 +752,17 @@ pub fn write_dataset(batch: &RecordBatch, dir: &Path) -> StorageResult<()> {
     out.extend_from_slice(&FILE_MAJOR.to_le_bytes());
     out.extend_from_slice(b"LANC");
 
-    std::fs::write(versions_dir.join(format!("{next_version}.manifest")), &out)
-        .map_err(|e| StorageError::Io(format!("write manifest: {e}")))?;
-    std::fs::write(
-        versions_dir.join("latest_version_hint.json"),
-        format!("{{\"version\":{next_version}}}"),
-    )
-    .map_err(|e| StorageError::Io(format!("write hint: {e}")))?;
+    // The manifest rename is the dataset's commit point; the directory
+    // fsync right after makes the published version durable.
+    write_durable(&versions_dir.join(format!("{next_version}.manifest")), &out)?;
+    fsync_dir(versions_dir)?;
+    // The hint is a discovery accelerator, not the commit pointer; it is
+    // still published atomically so a concurrent open never reads a
+    // truncated hint (#95).
+    write_durable(
+        &versions_dir.join("latest_version_hint.json"),
+        format!("{{\"version\":{next_version}}}").as_bytes(),
+    )?;
 
     Ok(())
 }
