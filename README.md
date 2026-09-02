@@ -82,6 +82,38 @@ Append-style writers get immutable, atomically-committed generations:
 let gen = storage.scoped_generation(1); // artifacts at {logical}__g1_{key}.lance
 ```
 
+### Concurrent writers and metadata safety
+
+Every `save_*` call runs its metadata registry update through a per-path
+commit actor, so concurrent tasks inside one process never lose updates.
+Downstream code that performs its **own** metadata read-modify-write cycles
+must use the same serialization. Two levels are public:
+
+- **In-process** — `commit::with_commit_actor(metadata_path, cycle)`
+  serializes your cycle against the registry paths of the same metadata
+  file.
+- **Cross-process** — the commit actor is per-process only. Independent
+  processes (e.g. separate CLI invocations) take an advisory lock file
+  around the whole cycle with `commit::with_file_lock`, resolved through
+  the blessed convention `commit::lock_file_for_metadata(metadata_path)`
+  (`{metadata-stem}.lock` next to the metadata file):
+
+```rust
+use genegraph_storage::commit::{lock_file_for_metadata, with_commit_actor, with_file_lock};
+
+let metadata_path = std::path::Path::new("base/ds__g1_metadata.json");
+let lock_path = lock_file_for_metadata(&metadata_path);
+with_file_lock(&lock_path, || {
+    // serialized across processes; run your load → mutate → publish here
+    Ok(())
+})
+.await
+.unwrap();
+```
+
+Every writer of a given metadata file must take the same lock file before
+mutating it — arbitration is only as strong as the convention.
+
 ## Lance format
 
 The default build runs the in-house Lance v2.1 implementation (`lancefmt`) for all `StorageBackend` I/O: manifest with inline Overwrite transactions, txn files, version hints, MiniBlock pages with Flat / InlineBitpacking / FixedSizeList value compression. Encodings outside the supported subset are rejected with `StorageError::UnsupportedFormat` (never guessed). Interop conformance is fixture-based: golden fixtures written by the official lance crate are read back by the in-house reader's suite.

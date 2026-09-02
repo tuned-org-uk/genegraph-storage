@@ -244,6 +244,52 @@ async fn test_lance_sparse_roundtrip() {
     assert_eq!(adjacency, loaded);
 }
 
+/// #102 (fail early and typed): a fully disconnected graph (adjacency
+/// nnz=0) is a legitimate data state that the sparse artifact path cannot
+/// persist. It must be rejected at save time — before the metadata
+/// read-modify-write cycle and before any artifact write — so no partial
+/// directory is left behind and the consumer gets an actionable error.
+#[tokio::test(flavor = "multi_thread")]
+async fn save_sparse_rejects_disconnected_nnz_zero_matrix_before_writes() {
+    crate::tests::init();
+    let name = "sparse_nnz0_rejected";
+    let (_, storage, data, _, _) = init_test_builder(name).await;
+    let (nitems, nfeatures) = data.shape();
+
+    let md = GeneMetadata::seed_metadata(name, nitems, nfeatures, &storage)
+        .await
+        .unwrap();
+    let md_path: PathBuf = storage.save_metadata(&md).await.unwrap();
+
+    // 8x8 fully disconnected adjacency: nnz=0 with declared shape, exactly
+    // the lambda-graph state a too-small eps produces.
+    let adjacency = CsMat::zero((8, 8));
+    let err = storage
+        .save_sparse("adjacency", &adjacency, &md_path)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, StorageError::Invalid(ref m) if m.contains("nnz=0") && m.contains("disconnected")),
+        "expected typed disconnected-graph validation error, got {err:?}"
+    );
+
+    // fail-early contract: the registry commit must not have happened —
+    // the metadata still has no adjacency entry.
+    let md_after = storage.load_metadata().await.unwrap();
+    assert!(
+        !md_after.files.contains_key("adjacency"),
+        "a rejected nnz=0 save must not register metadata (partial directory)"
+    );
+    // ... and no artifact file may be left behind.
+    let artifact = storage
+        .base_path()
+        .join(format!("{name}_adjacency.lance"));
+    assert!(
+        !artifact.exists(),
+        "a rejected nnz=0 save must not leave an artifact at {artifact:?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_lambdas_roundtrip() {
     crate::tests::init();

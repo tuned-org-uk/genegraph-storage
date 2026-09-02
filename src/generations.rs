@@ -253,21 +253,42 @@ pub fn pin_generation(info: &GenerationInfo) -> StorageResult<GenerationGuard> {
 }
 
 /// Atomic JSON publish: write to a unique `{path}.tmp`, fsync, rename over
-/// `path`.
+/// `path`, then fsync the parent directory (#101).
 ///
 /// The rename is the single commit point (POSIX-atomic within a directory):
 /// concurrent readers observe either the previous file or the complete new
-/// one, never a truncated write. This is the ONLY sanctioned way to publish
-/// a metadata file. The tmp name is uuid-unique (#95) so concurrent
-/// publishers of the same path cannot corrupt each other's staging file;
-/// the last rename wins, which makes last-writer-wins explicit instead of
-/// interleaved.
+/// one, never a truncated write. The post-rename directory fsync makes the
+/// rename itself durable — without it, a crash can revert the metadata
+/// commit pointer (the single atomic commit of a generation, #93) to the
+/// previous generation, or lose it entirely on a first commit.
+///
+/// This is the ONLY sanctioned way to publish a metadata file. The tmp name
+/// is uuid-unique (#95) so concurrent publishers of the same path cannot
+/// corrupt each other's staging file; the last rename wins, which makes
+/// last-writer-wins explicit instead of interleaved.
 pub fn write_json_atomic(path: &Path, contents: &str) -> StorageResult<()> {
     use std::io::Write;
 
     let tmp = path.with_extension(format!("json.tmp.{}", uuid::Uuid::new_v4().simple()));
-    if let Some(parent) = path.parent() {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    // `parent()` yields "" for bare filenames; resolve it to the working
+    // directory so the fsync discipline below has a real handle to sync.
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    if !parent.exists() {
         std::fs::create_dir_all(parent).map_err(|e| StorageError::Io(e.to_string()))?;
+        // The fresh directory itself must be durable before anything is
+        // published inside it: fsync it and its parent so both directory
+        // entries survive a crash (#101).
+        if let Some(grandparent) = parent.parent()
+            && !grandparent.as_os_str().is_empty()
+        {
+            fsync_dir(grandparent)?;
+        }
+        fsync_dir(parent)?;
     }
     {
         let mut f = std::fs::File::create(&tmp).map_err(|e| StorageError::Io(e.to_string()))?;
@@ -276,6 +297,21 @@ pub fn write_json_atomic(path: &Path, contents: &str) -> StorageResult<()> {
         f.sync_all().map_err(|e| StorageError::Io(e.to_string()))?;
     }
     std::fs::rename(&tmp, path).map_err(|e| StorageError::Io(e.to_string()))?;
+    fsync_dir(parent)
+}
+
+/// fsyncs a directory so a completed rename is itself durable
+/// (directory-entry durability, #101 / lancefmt #95-3). No-op off unix.
+pub(crate) fn fsync_dir(dir: &Path) -> StorageResult<()> {
+    #[cfg(unix)]
+    {
+        let f = std::fs::File::open(dir)
+            .map_err(|e| StorageError::Io(format!("open dir {dir:?} for fsync: {e}")))?;
+        f.sync_all()
+            .map_err(|e| StorageError::Io(format!("fsync dir {dir:?}: {e}")))?;
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
     Ok(())
 }
 

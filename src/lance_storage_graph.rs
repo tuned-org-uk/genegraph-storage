@@ -467,6 +467,19 @@ impl StorageBackend for LanceStorageGraph {
         md_path: &Path,
     ) -> StorageResult<()> {
         self.validate_initialized(md_path)?;
+        // #102, fail early and typed: an nnz=0 sparse matrix (a fully
+        // disconnected adjacency — a legitimate data state, e.g. from a
+        // too-small eps) cannot be persisted as a sparse artifact. Reject
+        // here, before the metadata commit cycle and before any artifact
+        // write, so no partial directory is left behind.
+        if matrix.nnz() == 0 {
+            return Err(StorageError::Invalid(format!(
+                "sparse '{key}' is fully disconnected: adjacency nnz=0 ({}x{}) — \
+                 raise --eps/--k or gate the input before persisting",
+                matrix.rows(),
+                matrix.cols()
+            )));
+        }
         let path = self.file_path(key);
         info!(
             "Saving sparse {} matrix: {} x {}, nnz={} at {:?}",

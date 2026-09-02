@@ -63,6 +63,62 @@ async fn test_write_json_atomic_overwrites_completely() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// #101: the directory-fsync helper lives in one shared place so both the
+/// metadata commit pointer (`write_json_atomic`) and the lancefmt writer
+/// publish sequence use the same discipline. It must succeed on a real
+/// directory (its result is what makes a completed rename durable).
+#[test]
+fn fsync_dir_succeeds_on_real_directory() {
+    let dir = std::env::temp_dir().join(format!(
+        "gen_fsync_dir_probe_{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    crate::generations::fsync_dir(&dir).expect("fsync on a real directory must succeed");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// #101: the commit pointer must survive a crash that happens right after
+/// the rename — the parent directory is fsynced after the rename so the
+/// directory entry itself is durable. Writes into a fresh (nested) parent
+/// directory exercise the create_dir_all + fsync path end to end.
+#[tokio::test(flavor = "multi_thread")]
+async fn write_json_atomic_publishes_into_fresh_parent_dir() {
+    let dir = tmp_dir("write_json_atomic_fresh_parent").await;
+    let path = dir.join("nested").join("deeper").join("ds__g1_metadata.json");
+
+    write_json_atomic(&path, r#"{"v": 1}"#).expect("publish into fresh parent dirs must succeed");
+    assert_eq!(fs::read_to_string(&path).unwrap(), r#"{"v": 1}"#);
+
+    // a second publish (rename over an existing entry) also stays intact
+    write_json_atomic(&path, r#"{"v": 2}"#).expect("republish must succeed");
+    assert_eq!(fs::read_to_string(&path).unwrap(), r#"{"v": 2}"#);
+
+    let residue: Vec<_> = fs::read_dir(path.parent().unwrap())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|x| x == "tmp"))
+        .collect();
+    assert!(residue.is_empty(), "tmp files must not leak: {residue:?}");
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// #101 edge: a bare filename has `parent() == Some("")` (no directory
+/// component). The parent-fsync discipline must not turn that previously
+/// working shape into an error — the empty path resolves to the process
+/// working directory.
+#[test]
+fn write_json_atomic_accepts_bare_filename_without_parent() {
+    let name = format!("bare_{}_metadata.json", uuid::Uuid::new_v4().simple());
+    let cwd = std::env::current_dir().unwrap();
+    write_json_atomic(Path::new(&name), r#"{"bare": true}"#)
+        .expect("bare-filename publish must keep working");
+    let contents = fs::read_to_string(cwd.join(&name)).unwrap();
+    assert_eq!(contents, r#"{"bare": true}"#);
+    let _ = fs::remove_file(cwd.join(&name));
+}
+
 /// Only generations with a metadata file are committed/listed; artifact
 /// generations without one (orphans from a pre-commit crash) are visible
 /// to the sweep API but never to resolution.

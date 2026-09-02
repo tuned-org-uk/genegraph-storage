@@ -728,6 +728,7 @@ dependencies = [
  "env_logger",
  "futures",
  "lance-bitpacking",
+ "libc",
  "log",
  "ordered-float 5.5.0",
  "parquet",
