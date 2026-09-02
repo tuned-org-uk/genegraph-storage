@@ -20,6 +20,7 @@ pub(crate) fn logical_type_name(dt: &DataType) -> StorageResult<String> {
     match dt {
         DataType::Float64 => Ok("double".to_string()),
         DataType::UInt32 => Ok("uint32".to_string()),
+        DataType::Int64 => Ok("int64".to_string()),
         DataType::FixedSizeList(child, n) if matches!(child.data_type(), DataType::Float64) => {
             Ok(format!("fixed_size_list:double:{n}"))
         }
@@ -33,6 +34,7 @@ fn parse_logical_type(name: &str) -> StorageResult<DataType> {
     match name {
         "double" => Ok(DataType::Float64),
         "uint32" => Ok(DataType::UInt32),
+        "int64" => Ok(DataType::Int64),
         _ => {
             if let Some(rest) = name.strip_prefix("fixed_size_list:double:") {
                 let dim: i32 = rest.parse().map_err(|_| {

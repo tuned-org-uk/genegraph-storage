@@ -79,6 +79,24 @@ async fn conformance_uint32_nonnull() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn conformance_int64_nonnull() {
+    let batch = read_all("int64_nonnull").await;
+    let expected = fx::i64_batch();
+    assert_eq!(batch.schema(), expected.schema());
+
+    let arr = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .expect("i64 column");
+    let expected_values = fx::i64_values();
+    assert_eq!(arr.len(), expected_values.len());
+    for (i, e) in expected_values.iter().enumerate() {
+        assert_eq!(arr.value(i), *e, "value mismatch at row {i}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn conformance_fsl_f64_nonnull() {
     let batch = read_all("fsl_f64_nonnull").await;
 

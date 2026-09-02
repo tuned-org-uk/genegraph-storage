@@ -4,20 +4,39 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, PrimitiveArray};
 use arrow::datatypes::{ArrowPrimitiveType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use arrow::record_batch::RecordBatchIterator;
 use log::{debug, info};
-
-use futures::StreamExt;
-use lance::Dataset;
-use lance::dataset::{WriteMode, WriteParams};
 
 use crate::metadata::FileInfo;
 use crate::traits::backend::StorageBackend;
 use crate::traits::metadata::Metadata;
 use crate::{StorageError, StorageResult};
 
+#[cfg(feature = "official-lance")]
+use arrow::record_batch::RecordBatchIterator;
+#[cfg(feature = "official-lance")]
+use futures::StreamExt;
+#[cfg(feature = "official-lance")]
+use lance::Dataset;
+#[cfg(feature = "official-lance")]
+use lance::dataset::{WriteMode, WriteParams};
+
+/// Resolves a `file://` URI (as produced by `path_to_uri`) to a local path.
+#[cfg(not(feature = "official-lance"))]
+fn uri_to_path(uri: &str) -> StorageResult<std::path::PathBuf> {
+    let url = url::Url::parse(uri)
+        .map_err(|e| StorageError::Invalid(format!("bad dataset URI `{uri}`: {e}")))?;
+    url.to_file_path().map_err(|_| {
+        StorageError::Invalid(format!("dataset URI is not a local file path: `{uri}`"))
+    })
+}
+
 pub trait LanceStorage {
     /// Async helper: write a RecordBatch to a Lance dataset.
+    ///
+    /// With default features this runs the in-house v2.1 implementation
+    /// (`lancefmt`) on the blocking pool; the `official-lance` feature opts
+    /// back into the official crate (see #75 M5).
+    #[cfg(feature = "official-lance")]
     async fn write_lance_batch_async(&self, uri: String, batch: RecordBatch) -> StorageResult<()> {
         info!("Writing Lance dataset to {}", uri);
 
@@ -38,7 +57,17 @@ pub trait LanceStorage {
         Ok(())
     }
 
+    #[cfg(not(feature = "official-lance"))]
+    async fn write_lance_batch_async(&self, uri: String, batch: RecordBatch) -> StorageResult<()> {
+        info!("Writing Lance dataset (in-house v2.1) to {}", uri);
+        let path = uri_to_path(&uri)?;
+        tokio::task::spawn_blocking(move || crate::lancefmt::write_dataset(&batch, &path))
+            .await
+            .map_err(|e| StorageError::Io(format!("lancefmt writer task failed: {e}")))?
+    }
+
     /// Async helper: read and concatenate all RecordBatches from a Lance dataset.
+    #[cfg(feature = "official-lance")]
     async fn read_lance_all_batches_async(&self, uri: String) -> StorageResult<RecordBatch> {
         info!("Reading Lance dataset from {}", uri);
 
@@ -65,6 +94,21 @@ pub trait LanceStorage {
         let combined = arrow::compute::concat_batches(&schema, &batches)
             .map_err(|e| StorageError::Lance(format!("Failed to concatenate batches: {}", e)))?;
 
+        debug!(
+            "Combined Lance batch for {:?} has {} rows",
+            uri,
+            combined.num_rows()
+        );
+        Ok(combined)
+    }
+
+    #[cfg(not(feature = "official-lance"))]
+    async fn read_lance_all_batches_async(&self, uri: String) -> StorageResult<RecordBatch> {
+        info!("Reading Lance dataset (in-house v2.1) from {}", uri);
+        let path = uri_to_path(&uri)?;
+        let combined = tokio::task::spawn_blocking(move || crate::lancefmt::scan_all(&path))
+            .await
+            .map_err(|e| StorageError::Io(format!("lancefmt reader task failed: {e}")))??;
         debug!(
             "Combined Lance batch for {:?} has {} rows",
             uri,

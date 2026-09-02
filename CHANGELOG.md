@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.20.0 (2026-09-02)
+
+The in-house Lance milestone (#75 M4 + M5 + M-C1): the default build no
+longer depends on the official `lance` crate.
+
+**Breaking**
+
+- `lance` moved out of the default dependency tree (now an optional
+  dependency behind the new `official-lance` feature, plus a
+  dev-dependency for conformance tests). The default build runs the
+  in-house Lance v2.1 implementation (`lancefmt`) for all
+  `StorageBackend` I/O. Runtime dependency graph: **542 -> 208 packages;
+  datafusion family 30 -> 0**; the only remaining lance-family crate is
+  the `lance-bitpacking` leaf.
+- New runtime dependencies: `prost`, `prost-types`, `lance-bitpacking`
+  (all Apache-2.0).
+
+**Added**
+
+- M4: `lancefmt` overwrite semantics — writing to an existing dataset
+  creates a new manifest version (`N+1.manifest`, updated version hint)
+  whose fragment set replaces the previous one; readers (ours and
+  official) always land on the latest version.
+- `Int64` column support in `lancefmt` (schema, writer, reader incl.
+  InlineBitpacking decode) — needed by `save_cluster_assignments`.
+- M-C1: catalog contract (`src/catalog.rs`): `TableDescriptor` +
+  `Catalog` trait mirroring the Lance Namespace / Polaris Generic Table
+  API shape (`name`/`format`/`base-location`/`properties`), with
+  `LocalRegistry` implemented over the existing JSON metadata registry
+  (standards-hygiene per decision D1 in #75; no catalog server client).
+
+**Changed**
+
+- `LanceStorage::write_lance_batch_async` /
+  `read_lance_all_batches_async` run `lancefmt` on the blocking pool by
+  default; the `official-lance` feature restores the previous behavior
+  during the transition cycle.
+
+## 0.13.3 (2026-09-02)
+
 ## 0.13.3 (2026-09-02)
 
 **Added**

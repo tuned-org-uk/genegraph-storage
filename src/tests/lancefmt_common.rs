@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, FixedSizeListArray, Float64Array, UInt32Array};
+use arrow::array::{ArrayRef, FixedSizeListArray, Float64Array, Int64Array, UInt32Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
@@ -61,6 +61,25 @@ pub(crate) fn f64_multipage_record_batch() -> RecordBatch {
 
 pub(crate) fn f64_small_values() -> Vec<f64> {
     (0..F64_SMALL_ROWS).map(|i| i as f64 * 0.5).collect()
+}
+
+pub(crate) const I64_ROWS: usize = 1_000;
+
+pub(crate) fn i64_schema() -> Schema {
+    Schema::new(vec![Field::new("cluster", DataType::Int64, false)])
+}
+
+pub(crate) fn i64_batch() -> RecordBatch {
+    batch_of(
+        i64_schema(),
+        vec![Arc::new(Int64Array::from(i64_values())) as ArrayRef],
+    )
+}
+
+pub(crate) fn i64_values() -> Vec<i64> {
+    (0..I64_ROWS)
+        .map(|i| if i % 4 == 3 { -1 } else { (i * 7) as i64 })
+        .collect()
 }
 
 pub(crate) fn u32_schema() -> Schema {
