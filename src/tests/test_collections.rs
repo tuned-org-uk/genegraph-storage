@@ -638,8 +638,8 @@ async fn write_paths_reject_registry_reserved_properties() {
 
     // nothing was written for the rejected collections
     let md = storage.load_metadata().await.unwrap();
-    assert!(md.files.get("bad_vecs").is_none());
-    assert!(md.files.get("bad_graph").is_none());
+    assert!(!md.files.contains_key("bad_vecs"));
+    assert!(!md.files.contains_key("bad_graph"));
 }
 
 /// Review PR #96 finding 4: a `kind` property that contradicts the typed

@@ -14,7 +14,9 @@
 //!   the complete new one, never a partial write.
 //! - `__g{digits}` at the end of an instance name is reserved.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex as StdMutex, OnceLock};
 
 use crate::{StorageError, StorageResult};
 
@@ -109,14 +111,19 @@ pub async fn list_artifact_generations(base: &Path, logical: &str) -> StorageRes
 /// `{logical}__g{gen}_`, so sibling datasets (`ds` vs `ds2`) are untouched.
 /// Safe to call on orphaned generations (no metadata) and on missing ones.
 ///
-/// Reader isolation (#95): there is no reference counting of in-flight
-/// readers. A sweep that removes a generation a reader is currently scanning
-/// will surface as an `Io` error mid-read; callers must serialize sweeps
-/// against reads (e.g. via the commit actor) or treat absence as
-/// "generation retired". Readers that need stable views should open by
-/// generation number and re-resolve on failure.
+/// Reader isolation (#97): if any [`GenerationGuard`] pin is alive for this
+/// generation, the sweep is refused with
+/// [`StorageError::InvalidState`] — it never removes artifacts under an
+/// in-flight reader. Callers retry once their readers have released.
 pub async fn delete_generation(base: &Path, logical: &str, generation: u64) -> StorageResult<()> {
     let prefix = format!("{logical}{GENERATION_SEP}{generation}_");
+    let metadata_path = base.join(format!("{prefix}metadata.json"));
+    if generation_pin_count(&metadata_path) > 0 {
+        return Err(StorageError::InvalidState(format!(
+            "generation {generation} of '{logical}' is pinned by an in-flight reader; \
+             sweep refused until all readers release"
+        )));
+    }
     let mut rd = tokio::fs::read_dir(base)
         .await
         .map_err(|e| StorageError::Io(e.to_string()))?;
@@ -140,6 +147,80 @@ pub async fn delete_generation(base: &Path, logical: &str, generation: u64) -> S
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Reader pins (#97)
+// ---------------------------------------------------------------------------
+
+/// Process-wide pin registry: metadata-path → live pin count. Counts hit
+/// zero only transiently (the dropping guard removes the entry), so the
+/// map stays bounded by the number of pinned generations.
+fn pin_registry() -> &'static StdMutex<HashMap<String, usize>> {
+    static PINS: OnceLock<StdMutex<HashMap<String, usize>>> = OnceLock::new();
+    PINS.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+/// RAII pin on a committed generation (#97).
+///
+/// Acquired through [`pin_generation`]; while alive, it keeps one reference
+/// on the generation so a concurrent [`delete_generation`] refuses to touch
+/// it. Dropping the guard releases the reference; the last drop for a
+/// generation unregisters it.
+#[derive(Debug)]
+pub struct GenerationGuard {
+    key: String,
+}
+
+impl Drop for GenerationGuard {
+    fn drop(&mut self) {
+        let mut pins = pin_registry()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(count) = pins.get_mut(&self.key) {
+            *count -= 1;
+            if *count == 0 {
+                pins.remove(&self.key);
+            }
+        }
+    }
+}
+
+/// Pins a committed generation for the duration of a read (#97).
+///
+/// Registration is process-wide and refcounted: several readers may pin the
+/// same generation concurrently and all succeed; a sweep is refused while
+/// any pin is alive. Fails with [`StorageError::Invalid`] if the
+/// generation's metadata file (the commit pointer) does not exist —
+/// orphaned generations cannot be pinned.
+///
+/// Pin and sweep must address the generation through the same `base` path:
+/// the registry is keyed by the metadata file path.
+pub fn pin_generation(info: &GenerationInfo) -> StorageResult<GenerationGuard> {
+    if !info.metadata_path.is_file() {
+        return Err(StorageError::Invalid(format!(
+            "generation {} is not committed (no metadata at {:?}); \
+             only committed generations can be pinned",
+            info.generation, info.metadata_path
+        )));
+    }
+    let key = info.metadata_path.to_string_lossy().to_string();
+    let mut pins = pin_registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *pins.entry(key.clone()).or_insert(0) += 1;
+    Ok(GenerationGuard { key })
+}
+
+/// Live pin count for a generation, keyed by its metadata file path.
+fn generation_pin_count(metadata_path: &Path) -> usize {
+    let key = metadata_path.to_string_lossy().to_string();
+    pin_registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&key)
+        .copied()
+        .unwrap_or(0)
 }
 
 /// Atomic JSON publish: write to a unique `{path}.tmp`, fsync, rename over
