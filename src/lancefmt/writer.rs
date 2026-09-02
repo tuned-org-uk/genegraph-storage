@@ -6,7 +6,9 @@
 
 use std::path::Path;
 
-use arrow::array::{Array, FixedSizeListArray, Float64Array, PrimitiveArray, UInt32Array};
+use arrow::array::{
+    Array, FixedSizeListArray, Float64Array, Int64Array, PrimitiveArray, UInt32Array,
+};
 use arrow::datatypes::ArrowPrimitiveType;
 use arrow::datatypes::{DataType, Schema as ArrowSchema};
 use arrow::record_batch::RecordBatch;
@@ -116,6 +118,15 @@ fn chunk_bytes_le_u32(
     })
 }
 
+fn chunk_bytes_le_i64(
+    values: &PrimitiveArray<arrow::datatypes::Int64Type>,
+    values_per_chunk: usize,
+) -> StorageResult<Vec<Chunk>> {
+    chunk_bytes_le_impl(values, values_per_chunk, 8, |out, v| {
+        out.extend_from_slice(&v.to_le_bytes())
+    })
+}
+
 fn chunk_bytes_le_impl<T: ArrowPrimitiveType>(
     values: &PrimitiveArray<T>,
     values_per_chunk: usize,
@@ -171,6 +182,21 @@ fn encode_column(batch: &RecordBatch, col: usize) -> StorageResult<EncodedPage> 
                 chunk_bytes_le_u32(arr, 1024)?,
                 Compression::Flat(Flat {
                     bits_per_value: 32,
+                    data: None,
+                }),
+                rows,
+            )
+        }
+        DataType::Int64 => {
+            let arr = column
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| StorageError::Invalid("int64 downcast failed".into()))?;
+            // 1024 x 8B = 8KiB per chunk
+            (
+                chunk_bytes_le_i64(arr, 1024)?,
+                Compression::Flat(Flat {
+                    bits_per_value: 64,
                     data: None,
                 }),
                 rows,
@@ -379,6 +405,15 @@ pub fn write_dataset(batch: &RecordBatch, dir: &Path) -> StorageResult<()> {
         .map_err(|e| StorageError::Io(format!("write {data_path:?}: {e}")))?;
 
     // ---- manifest + transaction -----------------------------------------
+    // Overwrite semantics (M4): an existing dataset receives a new manifest
+    // version whose fragment set fully replaces the previous one; readers
+    // (ours and official) open the highest version.
+    let prev_version = latest_manifest_version(&versions_dir)?;
+    let next_version = prev_version + 1;
+    // Fragment ids are unique per dataset; version numbering gives us a
+    // deterministic fresh id per overwrite (fresh dataset -> 0).
+    let fragment_id = prev_version;
+
     let data_file = DataFile {
         path: data_file_name.clone(),
         fields: fields.iter().map(|f| f.id).collect(),
@@ -389,7 +424,7 @@ pub fn write_dataset(batch: &RecordBatch, dir: &Path) -> StorageResult<()> {
         base_id: None,
     };
     let fragment = DataFragment {
-        id: 0,
+        id: fragment_id,
         files: vec![data_file],
         overlays: vec![],
         deletion_file: None,
@@ -402,7 +437,7 @@ pub fn write_dataset(batch: &RecordBatch, dir: &Path) -> StorageResult<()> {
         fields,
         schema_metadata: schema_meta.clone(),
         fragments: vec![fragment],
-        version: 1,
+        version: next_version,
         version_aux_data: 0,
         writer_version: Some(WriterVersion {
             library: "genegraph-storage".to_string(),
@@ -418,8 +453,8 @@ pub fn write_dataset(batch: &RecordBatch, dir: &Path) -> StorageResult<()> {
         tag: String::new(),
         reader_feature_flags: 0,
         writer_feature_flags: 0,
-        max_fragment_id: Some(0),
-        transaction_file: format!("0-{uuid}.txn"),
+        max_fragment_id: Some(fragment_id as u32),
+        transaction_file: format!("{prev_version}-{uuid}.txn"),
         next_row_id: 0,
         data_format: Some(DataStorageFormat {
             file_format: "lance".to_string(),
@@ -433,7 +468,7 @@ pub fn write_dataset(batch: &RecordBatch, dir: &Path) -> StorageResult<()> {
     };
 
     let transaction = Transaction {
-        read_version: 0,
+        read_version: prev_version,
         uuid: uuid.to_string(),
         tag: String::new(),
         transaction_properties: Default::default(),
@@ -446,8 +481,11 @@ pub fn write_dataset(batch: &RecordBatch, dir: &Path) -> StorageResult<()> {
         })),
     };
     let txn_bytes = transaction.encode_to_vec();
-    std::fs::write(txn_dir.join(format!("0-{uuid}.txn")), &txn_bytes)
-        .map_err(|e| StorageError::Io(format!("write txn: {e}")))?;
+    std::fs::write(
+        txn_dir.join(format!("{prev_version}-{uuid}.txn")),
+        &txn_bytes,
+    )
+    .map_err(|e| StorageError::Io(format!("write txn: {e}")))?;
 
     let manifest_bytes = manifest.encode_to_vec();
     let mut out: Vec<u8> = Vec::new();
@@ -461,15 +499,35 @@ pub fn write_dataset(batch: &RecordBatch, dir: &Path) -> StorageResult<()> {
     out.extend_from_slice(&FILE_MAJOR.to_le_bytes());
     out.extend_from_slice(b"LANC");
 
-    std::fs::write(versions_dir.join("1.manifest"), &out)
+    std::fs::write(versions_dir.join(format!("{next_version}.manifest")), &out)
         .map_err(|e| StorageError::Io(format!("write manifest: {e}")))?;
     std::fs::write(
         versions_dir.join("latest_version_hint.json"),
-        "{\"version\":1}",
+        format!("{{\"version\":{next_version}}}"),
     )
     .map_err(|e| StorageError::Io(format!("write hint: {e}")))?;
 
     Ok(())
+}
+
+/// Highest `N.manifest` version currently present (0 for a fresh dataset).
+fn latest_manifest_version(versions_dir: &Path) -> StorageResult<u64> {
+    let entries = std::fs::read_dir(versions_dir)
+        .map_err(|e| StorageError::Io(format!("read {versions_dir:?}: {e}")))?;
+    let mut best = 0u64;
+    for entry in entries {
+        let entry = entry.map_err(|e| StorageError::Io(e.to_string()))?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy().to_string();
+        let Some(stem) = name_str.strip_suffix(".manifest") else {
+            continue;
+        };
+        let v: u64 = stem.parse().map_err(|_| {
+            StorageError::Invalid(format!("unparseable manifest name {name_str:?}"))
+        })?;
+        best = best.max(v);
+    }
+    Ok(best)
 }
 
 #[allow(dead_code)]

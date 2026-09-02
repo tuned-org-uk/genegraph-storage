@@ -1,4 +1,5 @@
 #![allow(async_fn_in_trait)]
+pub mod catalog;
 pub mod lance_storage_graph;
 pub mod lancefmt;
 pub mod metadata;

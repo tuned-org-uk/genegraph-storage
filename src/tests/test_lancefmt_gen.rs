@@ -34,6 +34,7 @@ async fn lancefmt_gen_fixtures() {
     .await;
 
     write_batches("uint32_nonnull", fx::u32_schema(), vec![fx::u32_batch()]).await;
+    write_batches("int64_nonnull", fx::i64_schema(), vec![fx::i64_batch()]).await;
     write_batches("fsl_f64_nonnull", fx::fsl_schema(), vec![fx::fsl_batch()]).await;
     write_batches(
         "sparse_triplet_meta",

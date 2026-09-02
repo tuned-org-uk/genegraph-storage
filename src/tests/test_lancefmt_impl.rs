@@ -264,3 +264,72 @@ fn impl_our_reader_reads_official_fixtures_multichunk() {
         "official->ours multichunk",
     );
 }
+
+#[test]
+fn impl_overwrite_bumps_manifest_version() {
+    // M4: overwriting an existing dataset must write a NEW manifest version
+    // (readers see the latest), not clobber version 1.
+    let dir = tmp_dir_sync("lancefmt_impl_overwrite");
+    write_dataset(&fx::f64_batch(), &dir).expect("first write");
+    write_dataset(&fx::f64_batch_from(vec![9.5, -2.0, 7.25]), &dir).expect("overwrite");
+
+    let versions: Vec<String> = std::fs::read_dir(dir.join("_versions"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .collect();
+    assert!(
+        versions.iter().any(|v| v == "1.manifest"),
+        "version 1 must be preserved, got {versions:?}"
+    );
+    assert!(
+        versions.iter().any(|v| v == "2.manifest"),
+        "overwrite must create version 2, got {versions:?}"
+    );
+    let hint = std::fs::read_to_string(dir.join("_versions/latest_version_hint.json")).unwrap();
+    assert_eq!(
+        hint, "{\"version\":2}",
+        "hint must point at the new version"
+    );
+
+    let loaded = scan_all(&dir).expect("scan after overwrite");
+    assert_batch_f64(&loaded, &[9.5, -2.0, 7.25], 0, "overwrite round-trip");
+
+    // the official reader must also land on the latest version
+    let official = read_with_official(&dir);
+    assert_batch_f64(
+        &official,
+        &[9.5, -2.0, 7.25],
+        0,
+        "official reads latest version",
+    );
+}
+
+#[test]
+fn impl_roundtrip_int64_nonnull() {
+    let batch = fx::i64_batch();
+    let dir = tmp_dir_sync("lancefmt_impl_i64");
+    write_dataset(&batch, &dir).expect("write");
+    let loaded = scan_all(&dir).expect("our scan");
+    assert_batch_i64(&loaded, &fx::i64_values(), 0, "ours->ours i64");
+}
+
+#[test]
+fn impl_official_reads_our_int64() {
+    let batch = fx::i64_batch();
+    let dir = tmp_dir_sync("lancefmt_impl_off_i64");
+    write_dataset(&batch, &dir).expect("write");
+    let loaded = read_with_official(&dir);
+    assert_batch_i64(&loaded, &fx::i64_values(), 0, "ours->official i64");
+}
+
+fn assert_batch_i64(batch: &RecordBatch, expected: &[i64], col: usize, what: &str) {
+    let arr = batch
+        .column(col)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap_or_else(|| panic!("{what}: expected i64 column"));
+    assert_eq!(arr.len(), expected.len(), "{what}: row count");
+    for (i, e) in expected.iter().enumerate() {
+        assert_eq!(arr.value(i), *e, "{what}: value mismatch at row {i}");
+    }
+}

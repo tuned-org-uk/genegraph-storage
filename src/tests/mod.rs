@@ -1,4 +1,5 @@
 mod lancefmt_common;
+mod test_catalog;
 mod test_data;
 mod test_lance_layer;
 mod test_lancefmt_conformance;

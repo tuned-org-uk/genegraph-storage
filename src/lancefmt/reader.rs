@@ -114,16 +114,36 @@ fn decode_direct_any(encoding: &Option<lfv2::Encoding>) -> StorageResult<Vec<u8>
 enum ChunkValues {
     F64(Vec<f64>),
     U32(Vec<u32>),
+    I64(Vec<i64>),
+}
+
+/// The scalar leaf type a column decodes into (FSL columns decode into their
+/// item type).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Leaf {
+    F64,
+    U32,
+    I64,
+}
+
+fn leaf_of(dt: &DataType) -> StorageResult<Leaf> {
+    match dt {
+        DataType::Float64 | DataType::FixedSizeList(_, _) => Ok(Leaf::F64),
+        DataType::UInt32 => Ok(Leaf::U32),
+        DataType::Int64 => Ok(Leaf::I64),
+        other => Err(unsupported(&format!("column type {other:?}"))),
+    }
 }
 
 fn decode_chunk(
     buffer: &[u8],
     compression: &Compression,
+    leaf: Leaf,
     values_in_chunk: u64,
 ) -> StorageResult<ChunkValues> {
     match compression {
-        Compression::Flat(flat) => match flat.bits_per_value {
-            64 => {
+        Compression::Flat(flat) => match (leaf, flat.bits_per_value) {
+            (Leaf::F64, 64) => {
                 let values = buffer
                     .as_chunks::<8>()
                     .0
@@ -132,7 +152,16 @@ fn decode_chunk(
                     .collect();
                 Ok(ChunkValues::F64(values))
             }
-            32 => {
+            (Leaf::I64, 64) => {
+                let values = buffer
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|b| i64::from_le_bytes(*b))
+                    .collect();
+                Ok(ChunkValues::I64(values))
+            }
+            (Leaf::U32, 32) => {
                 let values = buffer
                     .as_chunks::<4>()
                     .0
@@ -141,10 +170,12 @@ fn decode_chunk(
                     .collect();
                 Ok(ChunkValues::U32(values))
             }
-            other => Err(unsupported(&format!("Flat bits_per_value={other}"))),
+            (leaf, bits) => Err(unsupported(&format!(
+                "Flat bits_per_value={bits} for leaf {leaf:?}"
+            ))),
         },
-        Compression::InlineBitpacking(ib) => match ib.uncompressed_bits_per_value {
-            32 => {
+        Compression::InlineBitpacking(ib) => match (leaf, ib.uncompressed_bits_per_value) {
+            (Leaf::U32, 32) => {
                 if buffer.len() < 4 {
                     return Err(StorageError::Invalid("bitpacked chunk too small".into()));
                 }
@@ -182,8 +213,48 @@ fn decode_chunk(
                 }
                 Ok(ChunkValues::U32(out[..n].to_vec()))
             }
-            other => Err(unsupported(&format!(
-                "InlineBitpacking uncompressed_bits_per_value={other}"
+            (Leaf::I64, 64) => {
+                if buffer.len() < 4 {
+                    return Err(StorageError::Invalid("bitpacked chunk too small".into()));
+                }
+                let width = u32::from_le_bytes(buffer[0..4].try_into().unwrap()) as usize;
+                let packed = &buffer[4..];
+                if !packed.len().is_multiple_of(8) {
+                    return Err(StorageError::Invalid(
+                        "bitpacked chunk not word-aligned".into(),
+                    ));
+                }
+                let words: Vec<u64> = packed
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|b| u64::from_le_bytes(*b))
+                    .collect();
+                let block_words = (1024usize * width).div_ceil(64);
+                if words.len() < block_words {
+                    return Err(StorageError::Invalid(
+                        "bitpacked chunk shorter than one FL block".into(),
+                    ));
+                }
+                let mut out = vec![0u64; 1024];
+                // SAFETY: `out` has exactly the FL block size for u64 and
+                // `words` holds one full block of packed words.
+                unsafe {
+                    use lance_bitpacking::BitPacking;
+                    <u64 as BitPacking>::unchecked_unpack(width, &words[..block_words], &mut out);
+                }
+                let n = values_in_chunk as usize;
+                if n > 1024 {
+                    return Err(StorageError::Invalid(
+                        "bitpacked chunk claims more than 1024 values".into(),
+                    ));
+                }
+                Ok(ChunkValues::I64(
+                    out[..n].iter().map(|v| *v as i64).collect(),
+                ))
+            }
+            (leaf, bits) => Err(unsupported(&format!(
+                "InlineBitpacking uncompressed_bits_per_value={bits} for leaf {leaf:?}"
             ))),
         },
         other => Err(unsupported(&format!("value compression {other:?}"))),
@@ -232,8 +303,10 @@ fn decode_page(
 
     // Walk chunks: metadata is one u16 per chunk; the data buffer holds the
     // chunks back to back.
+    let leaf = leaf_of(expected_type)?;
     let mut f64_out: Vec<f64> = Vec::new();
     let mut u32_out: Vec<u32> = Vec::new();
+    let mut i64_out: Vec<i64> = Vec::new();
     let mut chunk_data_pos = 0usize;
     let mut vals_so_far: u64 = 0;
     let num_chunks = metadata.len() / 2;
@@ -287,7 +360,12 @@ fn decode_page(
                 if flat.bits_per_value != 64 {
                     return Err(unsupported("FixedSizeList with non-64-bit items"));
                 }
-                match decode_chunk(buffer, &Compression::Flat(*flat), values_in_chunk)? {
+                match decode_chunk(
+                    buffer,
+                    &Compression::Flat(*flat),
+                    Leaf::F64,
+                    values_in_chunk,
+                )? {
                     ChunkValues::F64(mut items) => {
                         let items_expected =
                             values_in_chunk as usize * fsl.items_per_value as usize;
@@ -299,9 +377,7 @@ fn decode_page(
                         }
                         f64_out.append(&mut items);
                     }
-                    ChunkValues::U32(_) => {
-                        return Err(StorageError::Invalid("fsl decoded as u32".into()));
-                    }
+                    _ => return Err(StorageError::Invalid("fsl decoded as non-f64".into())),
                 }
             }
             other => {
@@ -310,9 +386,10 @@ fn decode_page(
                 } else {
                     values_in_chunk
                 };
-                match decode_chunk(buffer, other, values_in_chunk)? {
+                match decode_chunk(buffer, other, leaf, values_in_chunk)? {
                     ChunkValues::F64(mut v) => f64_out.append(&mut v),
                     ChunkValues::U32(mut v) => u32_out.append(&mut v),
+                    ChunkValues::I64(mut v) => i64_out.append(&mut v),
                 }
             }
         }
@@ -326,7 +403,7 @@ fn decode_page(
         )));
     }
 
-    build_array(expected_type, f64_out, u32_out, page.length)
+    build_array(expected_type, f64_out, u32_out, i64_out, page.length)
 }
 
 fn validate_miniblock(miniblock: &MiniBlockLayout) -> StorageResult<()> {
@@ -353,6 +430,7 @@ fn build_array(
     expected_type: &DataType,
     f64_out: Vec<f64>,
     u32_out: Vec<u32>,
+    i64_out: Vec<i64>,
     expected_rows: u64,
 ) -> StorageResult<ArrayRef> {
     let arr: ArrayRef = match expected_type {
@@ -379,6 +457,18 @@ fn build_array(
                 });
             }
             Arc::new(UInt32Array::from(u32_out))
+        }
+        DataType::Int64 => {
+            if !f64_out.is_empty() || !u32_out.is_empty() {
+                return Err(StorageError::Invalid("non-i64 values in i64 column".into()));
+            }
+            if i64_out.len() as u64 != expected_rows {
+                return Err(StorageError::DimensionMismatch {
+                    expected: format!("{expected_rows} values"),
+                    found: format!("{} values", i64_out.len()),
+                });
+            }
+            Arc::new(arrow::array::Int64Array::from(i64_out))
         }
         DataType::FixedSizeList(_child, dim) => {
             if !u32_out.is_empty() {
