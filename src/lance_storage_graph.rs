@@ -581,22 +581,26 @@ impl StorageBackend for LanceStorageGraph {
     ///
     /// Async test helper that avoids any internal blocking runtimes.
     async fn save_dense_to_file(data: &DenseMatrix<f64>, path: &Path) -> StorageResult<()> {
-        use tokio::fs as tokio_fs;
-
         info!("Saving dense matrix to file (async): {:?}", path);
 
-        // Ensure parent dir exists for the test file.
-        if let Some(parent) = path.parent() {
-            tokio_fs::try_exists(parent).await.map_err(|e| {
-                StorageError::Io(format!("Failed to create dir {:?}: {}", parent, e))
+        // Create missing parent directories instead of failing late in the
+        // format-specific writers.
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .ok_or_else(|| {
+                StorageError::Invalid(format!("path has no parent directory: {:?}", path))
             })?;
-        }
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| StorageError::Io(format!("create dir {:?}: {}", parent, e)))?;
+        let parent_str = parent
+            .to_str()
+            .ok_or_else(|| StorageError::Invalid(format!("non-UTF8 parent path for {:?}", path)))?
+            .to_string();
 
-        // Create a temporary storage only to store the file.
-        let tmp_storage = Self::new(
-            String::from(path.parent().unwrap().to_str().unwrap()),
-            String::from("tmp_storage"),
-        );
+        // Temporary storage, only used to build the record batch / write lance.
+        let tmp_storage = Self::new(parent_str, String::from("tmp_storage"));
 
         let extension = path
             .extension()
@@ -633,7 +637,6 @@ impl StorageBackend for LanceStorageGraph {
                 use parquet::file::properties::WriterProperties;
                 use std::fs::File;
 
-                // For tests we still use sync parquet writer; directory was created with tokio_fs.
                 let batch = tmp_storage.to_dense_record_batch(data)?;
                 debug!(
                     "Created RecordBatch with {} rows for Parquet",
@@ -648,26 +651,36 @@ impl StorageBackend for LanceStorageGraph {
                     )));
                 }
 
-                let file = File::create(path).map_err(|e| {
-                    StorageError::Io(format!("Failed to create parquet file: {}", e))
-                })?;
-
-                let props = WriterProperties::builder()
-                    .set_compression(parquet::basic::Compression::SNAPPY)
-                    .build();
-
-                let mut writer =
-                    ArrowWriter::try_new(file, batch.schema(), Some(props)).map_err(|e| {
-                        StorageError::Parquet(format!("Failed to create parquet writer: {}", e))
+                // The parquet writer is synchronous: run it on the blocking
+                // pool so the async executor thread is not stalled (see #52
+                // for the matching read path).
+                let owned_path = path.to_path_buf();
+                tokio::task::spawn_blocking(move || -> StorageResult<()> {
+                    let file = File::create(&owned_path).map_err(|e| {
+                        StorageError::Io(format!("Failed to create parquet file: {}", e))
                     })?;
 
-                writer
-                    .write(&batch)
-                    .map_err(|e| StorageError::Parquet(format!("Failed to write batch: {}", e)))?;
+                    let props = WriterProperties::builder()
+                        .set_compression(parquet::basic::Compression::SNAPPY)
+                        .build();
 
-                writer
-                    .close()
-                    .map_err(|e| StorageError::Parquet(format!("Failed to close writer: {}", e)))?;
+                    let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props))
+                        .map_err(|e| {
+                            StorageError::Parquet(format!("Failed to create parquet writer: {}", e))
+                        })?;
+
+                    writer.write(&batch).map_err(|e| {
+                        StorageError::Parquet(format!("Failed to write batch: {}", e))
+                    })?;
+
+                    writer.close().map_err(|e| {
+                        StorageError::Parquet(format!("Failed to close writer: {}", e))
+                    })?;
+
+                    Ok(())
+                })
+                .await
+                .map_err(|e| StorageError::Io(format!("parquet writer task failed: {}", e)))??;
 
                 info!("Saved dense matrix to Parquet: {} x {}", n_rows, n_cols);
                 Ok(())
