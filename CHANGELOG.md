@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.26.0 (2026-09-02)
+
+Transactional generations: the durability layer for append-style writers
+(genegraph-storage #93, RFC #81 phase P5). Lessons taken from
+Migorithm/duva: immutable segments + a single atomic commit pointer.
+
+**Added**
+
+- `generations` module: `{logical}__g{N}` generation naming/parse helpers,
+  `list_generations` (committed only — a generation without a metadata
+  file was never committed), `list_artifact_generations` (committed +
+  orphaned, for sweeps), `delete_generation` (prefix-exact removal of a
+  generation's artifacts and metadata), `write_json_atomic` (tmp + fsync +
+  rename — the only sanctioned way to publish a metadata file).
+- `LanceStorageGraph::scoped_generation(n)`: a handle routing artifact IO
+  at `{logical}__g{n}_{key}.lance` with the per-generation metadata file
+  as commit pointer; logical identity recoverable via
+  `generations::logical_name`.
+
+**Changed**
+
+- `StorageBackend::save_metadata` (default impl) now publishes atomically
+  via `write_json_atomic` instead of an in-place write that could be
+  observed half-written after a crash.
+
 ## 0.25.0 (2026-09-02)
 
 Version line for the post-M5 development cycle (in-house Lance v2.1

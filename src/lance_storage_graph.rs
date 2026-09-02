@@ -130,6 +130,19 @@ impl LanceStorageGraph {
         let storage = Self::new(base_path.clone(), metadata.name_id.clone());
         Ok((storage, metadata))
     }
+
+    /// A handle over generation `gen` of this logical dataset: artifact
+    /// paths resolve as `{logical}__g{gen}_{key}.lance` and the metadata
+    /// path as `{logical}__g{gen}_metadata.json` — the per-generation
+    /// commit pointer (#93, RFC #81-P5). The logical identity stays
+    /// recoverable via [`crate::generations::logical_name`].
+    pub fn scoped_generation(&self, generation: u64) -> Self {
+        let logical = crate::generations::logical_name(&self.name);
+        Self::new(
+            self.base.clone(),
+            crate::generations::generation_name(logical, generation),
+        )
+    }
 }
 
 impl LanceStorage for LanceStorageGraph {}
