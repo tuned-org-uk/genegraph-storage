@@ -18,7 +18,6 @@ use crate::metadata::FileInfo;
 use crate::metadata::GeneMetadata;
 use crate::traits::backend::StorageBackend;
 use crate::traits::lance::LanceStorage;
-use crate::traits::metadata::Metadata;
 use crate::{StorageError, StorageResult};
 
 /// Checked `usize -> u32` conversion.

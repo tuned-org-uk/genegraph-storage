@@ -341,3 +341,45 @@ fn test_fileinfo_new_accepts_known_filetype() {
     assert_eq!(info.rows, 4);
     assert_eq!(info.cols, 2);
 }
+
+// ===== Ergonomic constructors: reachable without importing the Metadata trait =====
+
+/// Isolated scope: imports ONLY the types, not the `Metadata` trait. If the
+/// construction chain below compiles and runs, the inherent impls on
+/// `GeneMetadata` are doing their job.
+mod inherent_only {
+    use crate::lance_storage_graph::LanceStorageGraph;
+    use crate::metadata::GeneMetadata;
+    // StorageBackend is unrelated to the Metadata-trait ergonomics under
+    // test here; base_path() needs it.
+    use crate::traits::backend::StorageBackend;
+
+    #[test]
+    fn gene_metadata_new_without_trait_import() {
+        let md = GeneMetadata::new("no_trait_import");
+        assert_eq!(md.name_id, "no_trait_import");
+        assert_eq!(md.nrows, 0);
+        assert!(md.files.is_empty());
+    }
+
+    #[test]
+    fn construction_chain_without_trait_import() {
+        let base = std::env::temp_dir();
+        let storage = LanceStorageGraph::new(
+            base.join("no_trait").to_string_lossy().to_string(),
+            "no_trait_import".to_string(),
+        );
+        let md = GeneMetadata::new("no_trait_import")
+            .with_base(storage.base_path())
+            .with_dimensions(10, 5);
+        assert_eq!(md.nrows, 10);
+        assert_eq!(md.ncols, 5);
+        assert_eq!(md.base, storage.base_path().to_string_lossy().to_string());
+
+        let info = md
+            .new_fileinfo("rawinput", "dense", (10, 5), None, None)
+            .expect("dense filetype");
+        let md = md.add_file("rawinput", info);
+        assert!(md.files.contains_key("rawinput"));
+    }
+}

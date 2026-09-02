@@ -99,6 +99,42 @@ impl GeneMetadata {
     }
 }
 
+impl GeneMetadata {
+    /// Inherent constructor: mirrors [`Metadata::new`] so the common
+    /// construction chain works without importing the trait (0.25.0
+    /// ergonomics).
+    pub fn new(name_id: &str) -> Self {
+        <Self as Metadata>::new(name_id)
+    }
+
+    /// Inherent builder step: mirrors [`Metadata::with_base`].
+    pub fn with_base(self, base_path: PathBuf) -> Self {
+        <Self as Metadata>::with_base(self, base_path)
+    }
+
+    /// Inherent builder step: mirrors [`Metadata::with_dimensions`].
+    pub fn with_dimensions(self, rows: usize, cols: usize) -> Self {
+        <Self as Metadata>::with_dimensions(self, rows, cols)
+    }
+
+    /// Inherent builder step: mirrors [`Metadata::add_file`].
+    pub fn add_file(self, key: &str, info: FileInfo) -> Self {
+        <Self as Metadata>::add_file(self, key, info)
+    }
+
+    /// Inherent helper: mirrors [`Metadata::new_fileinfo`].
+    pub fn new_fileinfo(
+        &self,
+        key: &str,
+        filetype: &str,
+        data_shape: (usize, usize),
+        nnz: Option<usize>,
+        size_bytes: Option<u64>,
+    ) -> StorageResult<FileInfo> {
+        <Self as Metadata>::new_fileinfo(self, key, filetype, data_shape, nnz, size_bytes)
+    }
+}
+
 impl Metadata for GeneMetadata {
     /// Empty metadata object
     /// do not use in test, use seed_metadata_eigen instead

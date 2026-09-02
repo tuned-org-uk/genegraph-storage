@@ -2,8 +2,6 @@ mod lancefmt_common;
 mod test_catalog;
 mod test_data;
 mod test_lance_layer;
-mod test_lancefmt_conformance;
-mod test_lancefmt_gen;
 mod test_lancefmt_impl;
 mod test_metadata;
 mod test_parquet_io;

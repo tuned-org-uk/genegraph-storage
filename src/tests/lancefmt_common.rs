@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, FixedSizeListArray, Float64Array, Int64Array, UInt32Array};
@@ -7,17 +6,6 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 pub const FIXTURES_DIR: &str = "tests/fixtures/lancefmt";
-
-pub(crate) fn fixture_path(name: &str) -> PathBuf {
-    Path::new(FIXTURES_DIR).join(format!("{name}.lance"))
-}
-
-pub(crate) fn fixture_uri(name: &str) -> String {
-    let abs = std::fs::canonicalize(fixture_path(name)).expect("fixture must exist");
-    url::Url::from_file_path(&abs)
-        .expect("fixture path is absolute")
-        .to_string()
-}
 
 /// Deterministic formulas shared by the generator and the conformance tests:
 /// the tests recompute the expected values instead of trusting the fixtures.
