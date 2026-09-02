@@ -50,4 +50,5 @@ libc = "0.2"
 rand = "0.9.2"
 rand_distr = "0.5.1"
 approx = "0.5.1"
+serde_json = "^1.0.150"
 tokio = { version = "1", features = ["macros", "rt-multi-thread" ] }

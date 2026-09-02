@@ -94,25 +94,30 @@ must use the same serialization. Two levels are public:
   file.
 - **Cross-process** — the commit actor is per-process only. Independent
   processes (e.g. separate CLI invocations) take an advisory lock file
-  around the whole cycle with `commit::with_file_lock`, resolved through
-  the blessed convention `commit::lock_file_for_metadata(metadata_path)`
-  (`{metadata-stem}.lock` next to the metadata file):
+  around the whole cycle, resolved through the blessed convention
+  `commit::lock_file_for_metadata(metadata_path)` (`{metadata-stem}.lock`
+  next to the metadata file). The composed recipe — file lock held across
+  the awaited actor cycle — is
+  `commit::with_metadata_file_lock(metadata_path, cycle)`:
 
 ```rust
-use genegraph_storage::commit::{lock_file_for_metadata, with_commit_actor, with_file_lock};
+use genegraph_storage::commit::with_metadata_file_lock;
 
 let metadata_path = std::path::Path::new("base/ds__g1_metadata.json");
-let lock_path = lock_file_for_metadata(&metadata_path);
-with_file_lock(&lock_path, || {
-    // serialized across processes; run your load → mutate → publish here
+with_metadata_file_lock(metadata_path, || async {
+    // load → mutate → publish here: serialized across processes *and*
+    // against in-process save_* cycles
     Ok(())
 })
 .await
 .unwrap();
 ```
 
-Every writer of a given metadata file must take the same lock file before
-mutating it — arbitration is only as strong as the convention.
+For consumers whose whole cycle is synchronous,
+`commit::with_file_lock` takes the same lock file around a sync closure —
+it serializes across processes but does not compose with the in-process
+actor. Every writer of a given metadata file must take the same lock file
+before mutating it — arbitration is only as strong as the convention.
 
 ## Lance format
 

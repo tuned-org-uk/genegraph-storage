@@ -54,30 +54,40 @@
 //!    });
 //!    ```
 //!
-//! 2. **Cross-process** — [`with_file_lock`], an advisory `flock` held for
-//!    the documented hold scope (the whole closure: lock → read-modify-write
-//!    → publish → release). The blessed convention is one lock file next to
-//!    the metadata file, named by [`lock_file_for_metadata`]
-//!    (`{metadata-stem}.lock`). Multi-process consumers (independent CLI
-//!    invocations) wrap the whole cycle — closure body *and* the
-//!    [`with_commit_actor`] call — in [`with_file_lock`]:
+//! 2. **Cross-process** — an advisory `flock` on a lock file, held for the
+//!    documented hold scope (the whole read-modify-write cycle: lock →
+//!    load → mutate → publish → release). The blessed convention is one
+//!    lock file next to the metadata file, named by
+//!    [`lock_file_for_metadata`] (`{metadata-stem}.lock`). Two forms
+//!    exist:
 //!
-//!    ```no_run
-//!    use std::path::Path;
-//!    use genegraph_storage::commit::{lock_file_for_metadata, with_file_lock};
+//!    - [`with_metadata_file_lock`] — the **composed** recipe: the file
+//!      lock is held across the whole awaited commit-actor cycle, so
+//!      cross-process exclusion *and* in-process actor serialization are
+//!      both active for the duration of the cycle. This is what
+//!      multi-process consumers whose metadata file is also touched by
+//!      async `save_*` paths must use:
 //!
-//!    futures::executor::block_on(async {
-//!        let metadata_path = Path::new("base/ds__g1_metadata.json");
-//!        let lock_path = lock_file_for_metadata(metadata_path);
-//!        let cycle = with_file_lock(&lock_path, || {
-//!            // serialized across processes; hand in-process cycles to the
-//!            // commit actor inside (blocking context, no async here)
-//!            Ok(())
-//!        })
-//!        .await;
-//!        let _ = cycle;
-//!    });
-//!    ```
+//!      ```no_run
+//!      use std::path::Path;
+//!      use genegraph_storage::commit::with_metadata_file_lock;
+//!
+//!      futures::executor::block_on(async {
+//!          let metadata_path = Path::new("base/ds__g1_metadata.json");
+//!          let cycle = with_metadata_file_lock(metadata_path, || async {
+//!              // load → mutate → publish (via generations::write_json_atomic)
+//!              Ok(())
+//!          })
+//!          .await;
+//!          let _ = cycle;
+//!      });
+//!      ```
+//!
+//!    - [`with_file_lock`] — the raw lock for consumers whose whole cycle
+//!      is **synchronous**. Its closure runs on the blocking pool and
+//!      cannot await the commit actor; it therefore does *not* serialize
+//!      against in-process async `save_*` cycles. If that matters, use
+//!      [`with_metadata_file_lock`].
 //!
 //! The lock file is a rendezvous point for cooperating writers, not a
 //! commit artifact: it carries no data and is left in place after release.
@@ -169,10 +179,11 @@ where
 ///
 /// The closure is synchronous and runs on the blocking pool: the flock can
 /// block arbitrarily long on a competing holder, so it must never run on
-/// an async executor thread. In-process cycle serialization stays with
-/// [`with_commit_actor`]; the two compose (actor cycle *inside* the file
-/// lock). Off unix this fails with
-/// [`StorageError::UnsupportedFormat`] rather than silently skipping
+/// an async executor thread. Because the closure is sync, it **cannot**
+/// await [`with_commit_actor`] — a cycle run here is serialized across
+/// processes but not against in-process async `save_*` cycles; use
+/// [`with_metadata_file_lock`] when both are required. Off unix this fails
+/// with [`StorageError::UnsupportedFormat`] rather than silently skipping
 /// arbitration.
 pub async fn with_file_lock<T, F>(lock_path: &Path, f: F) -> StorageResult<T>
 where
@@ -262,6 +273,37 @@ impl FileLock {
             "cross-process file locking (with_file_lock) requires a POSIX platform".into(),
         ))
     }
+}
+
+/// The blessed recipe for a multi-process consumer's metadata
+/// read-modify-write cycle (#100, review composition fix): the advisory
+/// file lock ([`lock_file_for_metadata`]) is held across the **whole**
+/// awaited commit-actor cycle — cross-process exclusion and in-process
+/// actor serialization are both active for the duration of `cycle`.
+///
+/// The closure is async: a full load → mutate → publish cycle (including
+/// any `save_*`-style actor work) runs inside, while independent processes
+/// taking the same lock file serialize behind it. Lock acquisition runs on
+/// the blocking pool (the flock can park on a competing holder); the lock
+/// is released when the cycle's future completes.
+///
+/// For consumers whose RMW is entirely synchronous, [`with_file_lock`]
+/// wraps the same lock file — but a sync closure cannot await the commit
+/// actor; only this helper composes the two locks.
+pub async fn with_metadata_file_lock<T, F, Fut>(
+    metadata_path: &Path,
+    cycle: F,
+) -> StorageResult<T>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = StorageResult<T>>,
+{
+    let lock_path = lock_file_for_metadata(metadata_path);
+    let lock_path2 = lock_path.clone();
+    let _lock = tokio::task::spawn_blocking(move || FileLock::acquire(&lock_path2))
+        .await
+        .map_err(|e| StorageError::Io(format!("file lock task failed: {e}")))??;
+    with_commit_actor(metadata_path, cycle).await
 }
 
 /// Runs `write` under the dataset's write mailbox. `write` must be a

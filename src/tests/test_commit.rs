@@ -9,7 +9,9 @@ use std::sync::mpsc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
-use crate::commit::{lock_file_for_metadata, with_commit_actor, with_file_lock};
+use crate::commit::{
+    lock_file_for_metadata, with_commit_actor, with_file_lock, with_metadata_file_lock,
+};
 use crate::generations::write_json_atomic;
 
 use super::tmp_dir;
@@ -78,6 +80,100 @@ fn lock_file_convention_is_stem_dot_lock() {
         lock_file_for_metadata(Path::new("/base/registry")),
         PathBuf::from("/base/registry.lock")
     );
+}
+
+/// The composed helper (review feedback on #100) holds the advisory file
+/// lock across the whole awaited actor cycle: while a cycle is parked
+/// mid-RMW, another process-shaped lock holder stays excluded, and
+/// concurrent cycles on the same metadata file serialize (both increments
+/// land).
+#[tokio::test(flavor = "multi_thread")]
+async fn metadata_file_lock_holds_flock_across_the_actor_cycle() {
+    let base = tmp_dir("composed_lock_cycle").await;
+    let md = base.join("ds__g1_metadata.json");
+    write_json_atomic(&md, "0").unwrap();
+
+    // Park the composed cycle mid-RMW; a foreign flock holder must stay
+    // excluded until the cycle completes.
+    let (entered_tx, entered_rx) = mpsc::channel::<()>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let md_a = md.clone();
+    let md_a_ref = md_a.clone();
+    let cycle_a = tokio::spawn(async move {
+        with_metadata_file_lock(&md_a_ref, move || async move {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            let n: u8 = std::fs::read_to_string(&md_a).unwrap().trim().parse().unwrap();
+            write_json_atomic(&md_a, &(n + 1).to_string()).unwrap();
+            Ok(())
+        })
+        .await
+        .unwrap();
+    });
+    entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("composed cycle must start");
+
+    let (entered_b_tx, entered_b_rx) = mpsc::channel::<()>();
+    let lock_b = lock_file_for_metadata(&md);
+    let holder_b = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                with_file_lock(&lock_b, move || {
+                    entered_b_tx.send(()).unwrap();
+                    Ok(())
+                })
+                .await
+                .unwrap()
+            })
+    });
+    assert!(
+        entered_b_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+        "the flock must be held across the awaited cycle"
+    );
+
+    // Release; the cycle completes its write and the waiter enters.
+    release_tx.send(()).unwrap();
+    cycle_a.await.unwrap();
+    entered_b_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("waiter must acquire after the cycle releases");
+    holder_b.join().unwrap();
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Two concurrent composed cycles on the same metadata file serialize end
+/// to end — flock first, then actor — so both increments land.
+#[tokio::test(flavor = "multi_thread")]
+async fn metadata_file_lock_serializes_concurrent_cycles() {
+    let base = tmp_dir("composed_lock_concurrent").await;
+    let md = base.join("ds__g1_metadata.json");
+    write_json_atomic(&md, "0").unwrap();
+
+    let run = |md: PathBuf| async move {
+        let md_inner = md.clone();
+        with_metadata_file_lock(&md, move || async move {
+            let n: u8 = std::fs::read_to_string(&md_inner)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            write_json_atomic(&md_inner, &(n + 1).to_string()).unwrap();
+            Ok(())
+        })
+        .await
+        .unwrap();
+    };
+    let (ra, rb) = tokio::join!(run(md.clone()), run(md.clone()));
+    let _ = (ra, rb);
+
+    let final_count: u8 = std::fs::read_to_string(&md).unwrap().trim().parse().unwrap();
+    assert_eq!(final_count, 2, "concurrent composed cycles must not lose updates");
+
+    let _ = std::fs::remove_dir_all(&base);
 }
 
 use std::path::Path;
