@@ -108,6 +108,12 @@ pub trait StorageBackend: Send + Sync {
 
     /// Load initial data using columnar format from a file path.
     /// Implementations may use this as a helper for async `load_dense`.
+    ///
+    /// Supported parquet layouts: `vector: FixedSizeList<Float64>` (as
+    /// written by [`Self::save_dense_to_file`]) and the legacy wide layout
+    /// with `Float64` columns named `col_0..col_N`; anything else is rejected
+    /// with [`StorageError::Invalid`]. Supported lance layout: the vector
+    /// layout, read from the dataset directory at `path`.
     async fn load_dense_from_file(&self, path: &Path) -> StorageResult<DenseMatrix<f64>>;
 
     /// Compute the full Lance/parquet file path for a logical filetype.
@@ -583,5 +589,9 @@ pub trait StorageBackend: Send + Sync {
 
     async fn load_vector(&self, key: &str) -> StorageResult<Vec<f64>>;
 
+    /// Writes a dense matrix to `path` (`.lance` dataset directory or
+    /// `.parquet` file in the `vector: FixedSizeList<Float64>` layout, the
+    /// counterpart of [`Self::load_dense_from_file`]). Parent directories are
+    /// created as needed.
     async fn save_dense_to_file(data: &DenseMatrix<f64>, path: &Path) -> StorageResult<()>;
 }

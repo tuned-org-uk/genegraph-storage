@@ -5,6 +5,7 @@ mod test_lancefmt_conformance;
 mod test_lancefmt_gen;
 mod test_lancefmt_impl;
 mod test_metadata;
+mod test_parquet_io;
 
 use std::fs;
 use std::path::PathBuf;
