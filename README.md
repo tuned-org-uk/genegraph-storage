@@ -1,13 +1,17 @@
 # genegraph-storage
 
 A storage layer for graph-based vector databases.
-Currently implements only the Lance file format (parquet and other formats can be implemented using the `StorageBackend` trait).
+
+Implements the **Lance format with an in-house writer/reader** (`lancefmt`, pinned to the Lance v2.1 spec) — no dependency on the official `lance` crate. Parquet interop paths and other formats are available via the `StorageBackend` trait.
 
 Provided functionalities:
-* `save_metadata`, `load_metadata`: gives a simple wrapper for all the data in the directory
-* `save_*` dense matrices, sparse matrices, vectors, lambdas, indices
-* `load_*` dense matrices, sparse matrices, vectors, lambdas, indices
-* some other useful stuff
+* `save_metadata`, `load_metadata`: a simple wrapper for all the data in the directory
+* `save_*` / `load_*` dense matrices, sparse matrices, vectors, lambdas, indices
+* **named collections** (RFC #81): schema-driven vector spaces (`save_vectors` / `load_vectors`, any column layout with one non-null `FixedSizeList` vector column) and first-class graph storage (`save_graph` / `load_graph`, weighted or topology-only, `u32`/`u64` node ids)
+* vector-space ↔ graph linkage (a vector space references a graph collection through its `graph` property; resolved in one call with `Catalog::describe_vector_space`)
+* **transactional generations**: atomic metadata commits (tmp + fsync + rename), `scoped_generation(n)` handles, generation listing/deletion for sweeps, reader pins
+* **catalog contract** (`src/catalog.rs`): `TableDescriptor` + `Catalog` trait mirroring the Lance Namespace / Polaris Generic Table API shape, with `LocalRegistry` over the JSON metadata registry
+* parquet interop (`save_dense_to_file` / `load_dense_from_file`)
 
 A storage layer for:
 * [`javelin-tui`](https://github.com/tuned-org-uk/javelin-tui): a graph-based vector database Text-Interface and
@@ -29,32 +33,25 @@ use genegraph_storage::traits::metadata::Metadata;
 use smartcore::linalg::basic::arrays::{Array, Array2};
 use smartcore::linalg::basic::matrix::DenseMatrix;
 
-// instantiate a storage
+let base = std::env::temp_dir().join(format!("genegraph_doc_{}", std::process::id()));
 let storage = LanceStorageGraph::new(
-    "/tmp".to_string(),
-    "basic_test".to_string(),
+    base.to_string_lossy().to_string(),
+    "doc_example".to_string(),
 );
 
 // some 2D data
-let dense: Vec<Vec<f64>> = vec![
-    vec![0.1, 0.4, 0.5, 0.2, 0.9],
-    vec![0.4, 0.5, 0.2, 0.9, 0.3],
-    vec![0.03, 0.8, 0.56, 0.2, 0.9],
-    vec![0.1, 0.4, 0.5, 0.34, 0.9],
-    vec![0.05, 0.4, 0.2, 0.3, 0.7]
-];
-
+let dense: Vec<Vec<f64>> = vec![vec![0.1, 0.4], vec![0.5, 0.2], vec![0.03, 0.8]];
 let (nitems, nfeatures) = (dense.len(), dense[0].len());
 let data = DenseMatrix::<f64>::from_iterator(
     dense.iter().flatten().copied(), nitems, nfeatures, 0);
 
 // seed metadata FIRST to initialize the storage directory
-let md = GeneMetadata::seed_metadata("basic_test", nitems, nfeatures, &storage)
+let md = GeneMetadata::seed_metadata("doc_example", nitems, nfeatures, &storage)
     .await
     .unwrap();
 let md_path = storage.save_metadata(&md).await.unwrap();
 
-// your data is saved in an efficient format
+// your data is saved in an efficient Lance format
 storage
     .save_dense("my_dataset", &data, &md_path)
     .await
@@ -62,11 +59,36 @@ storage
 
 // Loading back
 let loaded = storage.load_dense("my_dataset").await.unwrap();
+assert_eq!(loaded.shape(), (nitems, nfeatures));
+
+std::fs::remove_dir_all(&base).ok();
 ```
+
+Graphs are stored as edge-list collections and convert to CSR at the API boundary:
+
+```rust
+use genegraph_storage::graph::{GraphEdge, GraphWriteOptions, NodeIdWidth};
+
+let edges = vec![GraphEdge::weighted(0, 1, 0.5), GraphEdge::weighted(1, 2, -0.25)];
+storage.save_graph("my_graph", &edges, &md_path).await.unwrap();
+
+let graph = storage.load_graph("my_graph").await.unwrap();
+let csr = graph.to_csr().unwrap(); // sprs CsMat<f64>
+```
+
+Append-style writers get immutable, atomically-committed generations:
+
+```rust
+let gen = storage.scoped_generation(1); // artifacts at {logical}__g1_{key}.lance
+```
+
+## Lance format
+
+The default build runs the in-house Lance v2.1 implementation (`lancefmt`) for all `StorageBackend` I/O: manifest with inline Overwrite transactions, txn files, version hints, MiniBlock pages with Flat / InlineBitpacking / FixedSizeList value compression. Encodings outside the supported subset are rejected with `StorageError::UnsupportedFormat` (never guessed). Interop conformance is fixture-based: golden fixtures written by the official lance crate are read back by the in-house reader's suite.
 
 ## Extending and traits
 
-Every custom definition of a Lance database (store or manifold or data-cube) should implement the `Metadata` trait (or reuse `GeneMetadata`) and the `StorageBackend` trait like `LanceStorageGraph` does with `GeneMetadata` and `LanceStorage`. 
+Every custom definition of a Lance database (store or manifold or data-cube) should implement the `Metadata` trait (or reuse `GeneMetadata`) and the `StorageBackend` trait like `LanceStorageGraph` does with `GeneMetadata` and `LanceStorage`. Collections additionally surface through the `Catalog` trait (`LocalRegistry` over `GeneMetadata`).
 
 Traits in `traits` module can also be reused to implement other formats. Other formats can use `StorageBackend` to implement similar child-traits alike to `LanceStorage`. Then if matched with a custom `Metadata` instance can make a database, so every database is simply a `StorageBackend + Metadata`.
 
