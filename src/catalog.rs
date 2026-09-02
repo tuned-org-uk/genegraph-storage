@@ -21,8 +21,9 @@ pub use crate::metadata::CollectionKind;
 use crate::metadata::{FileInfo, GeneMetadata};
 
 /// Computed descriptor properties that mirror `FileInfo` fields; user
-/// properties cannot shadow them.
-const RESERVED_PROPERTIES: [&str; 6] = [
+/// properties cannot shadow them (enforced both in `register_table` and on
+/// the direct `save_*_with` write paths).
+pub(crate) const RESERVED_PROPERTIES: [&str; 6] = [
     "filetype",
     "storage_format",
     "rows",
@@ -199,9 +200,23 @@ impl Catalog for LocalRegistry {
                 .transpose()
         };
         // RFC #81-P1: an explicit `kind` property wins; otherwise the typed
-        // `kind` field is authoritative. Unknown kinds are rejected.
+        // `kind` field is authoritative. Unknown kinds and disagreements
+        // between the two are rejected (review PR #96) — silently picking
+        // one side would let a property contradict the descriptor.
         let kind = match prop("kind") {
-            Some(k) => Some(CollectionKind::parse(&k)?),
+            Some(k) => {
+                let prop_kind = CollectionKind::parse(&k)?;
+                if prop_kind != table.kind {
+                    return Err(StorageError::Invalid(format!(
+                        "kind mismatch for table '{}': typed field is '{}', \
+                         'kind' property is '{}'",
+                        table.name,
+                        table.kind.as_str(),
+                        prop_kind.as_str()
+                    )));
+                }
+                Some(prop_kind)
+            }
             None => Some(table.kind),
         };
         // User properties (everything not computed above) are persisted on

@@ -12,7 +12,7 @@ use rand::{Rng, SeedableRng};
 use smartcore::linalg::basic::arrays::Array2;
 use sprs::{CsMat, TriMat};
 
-use crate::catalog::{Catalog, CollectionKind, LocalRegistry};
+use crate::catalog::{Catalog, CollectionKind, LocalRegistry, TableDescriptor};
 use crate::graph::{GraphEdge, GraphWriteOptions, NodeIdWidth, StoredGraph};
 use crate::lance_storage_graph::LanceStorageGraph;
 use crate::metadata::GeneMetadata;
@@ -359,12 +359,25 @@ async fn graph_topology_only_u64_roundtrip() {
     let graph = storage.load_graph("topology").await.expect("load_graph");
     assert_eq!(graph.node_id_width, NodeIdWidth::U64);
     assert!(!graph.weighted);
-    assert_graph_round_trip(&graph, &edges, n, false);
+    // Edge-list exactness only: CSR conversion allocates an O(num_nodes)
+    // indptr (~34 GB here) and is exercised separately on a small graph.
+    assert_eq!(graph.edges, edges);
+    assert_eq!(graph.num_nodes, n);
 
-    // unweighted CSR convention: weight 1.0
-    let csr = graph.to_csr().unwrap();
+    // unweighted CSR convention (weight 1.0) on a small-node u64 graph
+    let small_edges = vec![GraphEdge::unweighted(0, 2), GraphEdge::unweighted(2, 1)];
+    storage
+        .save_graph_with("topology_small", &small_edges, &options, &md_path)
+        .await
+        .expect("save_graph_with u64 small");
+    let small = storage
+        .load_graph("topology_small")
+        .await
+        .expect("load_graph u64 small");
+    assert_graph_round_trip(&small, &small_edges, 3, false);
+    let csr = small.to_csr().unwrap();
     assert_eq!(
-        csr.get(0, (n - 2) as usize).copied(),
+        csr.get(0, 2).copied(),
         Some(1.0),
         "topology-only edges get weight 1.0"
     );
@@ -577,4 +590,92 @@ async fn concurrent_saves_do_not_lose_registry_entries() {
         let loaded = storage.load_vector(&format!("vec_{k}")).await.unwrap();
         assert_eq!(loaded, vec![k as f64, (k * 2) as f64, (k * 3) as f64]);
     }
+}
+
+/// Review PR #96 finding 1: registry-reserved user properties are rejected
+/// on the direct write paths, same rule as `Catalog::register_table` — a
+/// caller-provided `rows`/`nnz`/... must not shadow computed facts.
+#[tokio::test(flavor = "multi_thread")]
+async fn write_paths_reject_registry_reserved_properties() {
+    let (_base, storage) = seeded_storage("reserved_props").await;
+    let md_path = storage.metadata_path();
+
+    let batch = f64_vector_batch(&[0, 1], &[vec![1.0, 2.0], vec![3.0, 4.0]]);
+
+    for reserved in [
+        "rows",
+        "cols",
+        "nnz",
+        "filetype",
+        "storage_format",
+        "size_bytes",
+    ] {
+        let mut props = BTreeMap::new();
+        props.insert(reserved.to_string(), "999".to_string());
+        let err = storage
+            .save_vectors_with("bad_vecs", &batch, &props, &md_path)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::StorageError::Invalid(_)),
+            "expected Invalid for '{reserved}', got {err:?}"
+        );
+
+        let edges = vec![GraphEdge::weighted(0, 1, 0.5)];
+        let options = GraphWriteOptions {
+            properties: props,
+            ..Default::default()
+        };
+        let err = storage
+            .save_graph_with("bad_graph", &edges, &options, &md_path)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::StorageError::Invalid(_)),
+            "expected Invalid for graph '{reserved}', got {err:?}"
+        );
+    }
+
+    // nothing was written for the rejected collections
+    let md = storage.load_metadata().await.unwrap();
+    assert!(md.files.get("bad_vecs").is_none());
+    assert!(md.files.get("bad_graph").is_none());
+}
+
+/// Review PR #96 finding 4: a `kind` property that contradicts the typed
+/// `kind` field is rejected instead of silently overriding it.
+#[tokio::test(flavor = "multi_thread")]
+async fn register_table_rejects_kind_mismatch() {
+    let base = tmp_dir("catalog_m_c1").await;
+    let mut registry = LocalRegistry::new(GeneMetadata::new("catalog_test"), base.to_path_buf());
+
+    let err = registry
+        .register_table(TableDescriptor {
+            name: "clashing".to_string(),
+            format: "lance".to_string(),
+            base_location: base.join("catalog_test_clashing.lance"),
+            kind: CollectionKind::VectorSpace,
+            properties: BTreeMap::from([("kind".to_string(), "graph".to_string())]),
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, crate::StorageError::Invalid(_)),
+        "got {err:?}"
+    );
+    assert!(!registry.table_exists("clashing").unwrap());
+
+    // agreement between the two sources of truth is fine
+    registry
+        .register_table(TableDescriptor {
+            name: "agreeing".to_string(),
+            format: "lance".to_string(),
+            base_location: base.join("catalog_test_agreeing.lance"),
+            kind: CollectionKind::Graph,
+            properties: BTreeMap::from([("kind".to_string(), "graph".to_string())]),
+        })
+        .expect("agreeing kinds register");
+    assert_eq!(
+        registry.describe_table("agreeing").unwrap().kind,
+        CollectionKind::Graph
+    );
 }

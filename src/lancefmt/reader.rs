@@ -149,6 +149,22 @@ fn leaf_of(dt: &DataType) -> StorageResult<Leaf> {
     }
 }
 
+/// The FL block holds 1024 values per chunk; a zero-width (constant)
+/// bitpacked chunk carries no packed words at all and decodes to zeros
+/// (review PR #96, finding 5).
+fn zeros_as<T>(values_in_chunk: u64) -> StorageResult<Vec<T>>
+where
+    T: Default + Clone,
+{
+    let n = values_in_chunk as usize;
+    if n > 1024 {
+        return Err(StorageError::Invalid(
+            "bitpacked chunk claims more than 1024 values".into(),
+        ));
+    }
+    Ok(vec![T::default(); n])
+}
+
 fn decode_chunk(
     buffer: &[u8],
     compression: &Compression,
@@ -213,6 +229,10 @@ fn decode_chunk(
                     return Err(StorageError::Invalid("bitpacked chunk too small".into()));
                 }
                 let width = u32::from_le_bytes(buffer[0..4].try_into().unwrap()) as usize;
+                if width == 0 {
+                    // constant / all-zero chunk: the packed block is empty
+                    return Ok(ChunkValues::U32(zeros_as::<u32>(values_in_chunk)?));
+                }
                 let packed = &buffer[4..];
                 if !packed.len().is_multiple_of(4) {
                     return Err(StorageError::Invalid(
@@ -233,7 +253,9 @@ fn decode_chunk(
                 }
                 let mut out = vec![0u32; 1024];
                 // SAFETY: `out` has exactly the FL block size for u32 and
-                // `words` holds one full block of packed words.
+                // `words` holds one full block of packed words. A zero width
+                // (constant chunk) has an empty block and is handled above
+                // the unpack via the `block_words == 0` short-circuit.
                 unsafe {
                     use lance_bitpacking::BitPacking;
                     <u32 as BitPacking>::unchecked_unpack(width, &words[..block_words], &mut out);
@@ -251,6 +273,10 @@ fn decode_chunk(
                     return Err(StorageError::Invalid("bitpacked chunk too small".into()));
                 }
                 let width = u32::from_le_bytes(buffer[0..4].try_into().unwrap()) as usize;
+                if width == 0 {
+                    // constant / all-zero chunk: the packed block is empty
+                    return Ok(ChunkValues::I64(zeros_as::<i64>(values_in_chunk)?));
+                }
                 let packed = &buffer[4..];
                 if !packed.len().is_multiple_of(8) {
                     return Err(StorageError::Invalid(
@@ -291,6 +317,10 @@ fn decode_chunk(
                     return Err(StorageError::Invalid("bitpacked chunk too small".into()));
                 }
                 let width = u32::from_le_bytes(buffer[0..4].try_into().unwrap()) as usize;
+                if width == 0 {
+                    // constant / all-zero chunk: the packed block is empty
+                    return Ok(ChunkValues::U64(zeros_as::<u64>(values_in_chunk)?));
+                }
                 let packed = &buffer[4..];
                 if !packed.len().is_multiple_of(8) {
                     return Err(StorageError::Invalid(
@@ -333,6 +363,10 @@ fn decode_chunk(
                     return Err(StorageError::Invalid(format!(
                         "u8 bitpacked width {width} exceeds 8 bits"
                     )));
+                }
+                if width == 0 {
+                    // constant / all-zero chunk: the packed block is empty
+                    return Ok(ChunkValues::U8(zeros_as::<u8>(values_in_chunk)?));
                 }
                 let packed = &buffer[4..];
                 let block_bytes = (1024usize * width).div_ceil(8);

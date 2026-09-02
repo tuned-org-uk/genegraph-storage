@@ -7,10 +7,29 @@ use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use log::{debug, info};
 
+use crate::catalog::RESERVED_PROPERTIES;
 use crate::graph::RESERVED_METADATA_KEYS;
 use crate::metadata::FileInfo;
 use crate::traits::backend::StorageBackend;
 use crate::{StorageError, StorageResult};
+
+/// Rejects user properties that would shadow computed registry facts
+/// (`RESERVED_PROPERTIES`, review of PR #96): the direct `save_*_with`
+/// write paths must enforce the same rule as `Catalog::register_table`, or
+/// a caller-provided `rows`/`nnz`/... would silently override the computed
+/// descriptor values.
+pub(crate) fn reject_reserved_user_properties(
+    properties: &BTreeMap<String, String>,
+) -> StorageResult<()> {
+    for key in properties.keys() {
+        if RESERVED_PROPERTIES.contains(&key.as_str()) {
+            return Err(StorageError::Invalid(format!(
+                "user property '{key}' is reserved (computed from the stored artifact)"
+            )));
+        }
+    }
+    Ok(())
+}
 
 /// Resolves a `file://` URI (as produced by `path_to_uri`) to a local path.
 fn uri_to_path(uri: &str) -> StorageResult<std::path::PathBuf> {

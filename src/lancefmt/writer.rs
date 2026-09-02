@@ -516,10 +516,15 @@ fn fsync_dir(dir: &Path) -> StorageResult<()> {
 ///
 /// Durability & concurrency (#95-3): the whole write — manifest-version
 /// allocation through commit-point publish — runs under a per-dataset write
-/// mailbox, and every artifact (data file, txn, manifest, version hint) is
-/// written tmp + fsync + rename with a directory fsync, in the order
+/// mailbox (a blocking `std::sync::Mutex` held across several fsyncs), and
+/// every artifact (data file, txn, manifest, version hint) is written
+/// tmp + fsync + rename with a directory fsync, in the order
 /// data → txn → manifest (commit) → hint. Readers observe either the
 /// previous or the complete new dataset version.
+///
+/// Blocking: because of that lock, callers on Tokio must reach this through
+/// `spawn_blocking` (as `LanceStorage::write_lance_batch_async` does), never
+/// directly on an async executor thread.
 pub fn write_dataset(batch: &RecordBatch, dir: &Path) -> StorageResult<()> {
     if batch.num_rows() == 0 {
         return Err(StorageError::Invalid(

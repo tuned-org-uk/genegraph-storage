@@ -141,7 +141,7 @@ impl StoredGraph {
         }
         let n = n as usize;
         let mut trimat = TriMat::new((n, n));
-        trimat.reserve(nnz_hint(self.edges.len()));
+        trimat.reserve(self.edges.len());
         for edge in &self.edges {
             let (src, dst) = (edge.src as usize, edge.dst as usize);
             if src >= n || dst >= n {
@@ -166,11 +166,6 @@ impl StoredGraph {
         }
         Ok(csr)
     }
-}
-
-fn nnz_hint(len: usize) -> usize {
-    // TriMat::reserve clamps to capacity; keep the hint modest.
-    len.min(1 << 20)
 }
 
 /// Dataset-level schema-metadata keys stamped by the `save_graph` /

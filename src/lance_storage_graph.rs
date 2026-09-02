@@ -22,7 +22,10 @@ use crate::graph::{GraphEdge, GraphWriteOptions, NodeIdWidth, StoredGraph};
 use crate::metadata::FileInfo;
 use crate::metadata::GeneMetadata;
 use crate::traits::backend::StorageBackend;
-use crate::traits::lance::{LanceStorage, validate_vector_space_schema, with_collection_metadata};
+use crate::traits::lance::{
+    LanceStorage, reject_reserved_user_properties, validate_vector_space_schema,
+    with_collection_metadata,
+};
 use crate::{StorageError, StorageResult};
 
 /// Checked `usize -> u32` conversion.
@@ -931,6 +934,7 @@ impl StorageBackend for LanceStorageGraph {
         properties: &BTreeMap<String, String>,
         md_path: &Path,
     ) -> StorageResult<()> {
+        reject_reserved_user_properties(properties)?;
         self.validate_initialized(md_path)?;
         if batch.num_rows() == 0 {
             return Err(StorageError::Invalid(
@@ -990,6 +994,7 @@ impl StorageBackend for LanceStorageGraph {
         options: &GraphWriteOptions,
         md_path: &Path,
     ) -> StorageResult<()> {
+        reject_reserved_user_properties(&options.properties)?;
         self.validate_initialized(md_path)?;
         if edges.is_empty() {
             return Err(StorageError::Invalid(
