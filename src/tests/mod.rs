@@ -1,5 +1,8 @@
+mod lancefmt_common;
 mod test_data;
 mod test_lance_layer;
+mod test_lancefmt_conformance;
+mod test_lancefmt_gen;
 mod test_metadata;
 
 use std::fs;

@@ -672,14 +672,21 @@ fn test_path_to_uri_rejects_relative_paths() {
 
 #[test]
 fn test_path_to_uri_absolute_missing_path_is_ok() {
-    let uri = <LanceStorageGraph as StorageBackend>::path_to_uri(Path::new(
-        "/tmp/genegraph-definitely-not-yet-written.lance",
-    ))
-    .unwrap();
-    assert_eq!(
-        uri,
-        "file:///tmp/genegraph-definitely-not-yet-written.lance"
-    );
+    // Windows requires a drive letter for absolute paths and renders file://
+    // URIs with the drive component (file:///C:/...).
+    let (path, expected) = if cfg!(windows) {
+        (
+            Path::new(r"C:\tmp\genegraph-definitely-not-yet-written.lance"),
+            "file:///C:/tmp/genegraph-definitely-not-yet-written.lance",
+        )
+    } else {
+        (
+            Path::new("/tmp/genegraph-definitely-not-yet-written.lance"),
+            "file:///tmp/genegraph-definitely-not-yet-written.lance",
+        )
+    };
+    let uri = <LanceStorageGraph as StorageBackend>::path_to_uri(path).unwrap();
+    assert_eq!(uri, expected);
 }
 
 #[test]
