@@ -117,7 +117,18 @@ For consumers whose whole cycle is synchronous,
 `commit::with_file_lock` takes the same lock file around a sync closure —
 it serializes across processes but does not compose with the in-process
 actor. Every writer of a given metadata file must take the same lock file
-before mutating it — arbitration is only as strong as the convention.
+before mutating it — arbitration is only as strong as the convention, and
+it is advisory: only cooperating writers are excluded.
+
+**Fail-fast contention (#105).** When the contract is to fail on a
+concurrent writer rather than wait, use the non-blocking variants
+`commit::try_with_file_lock` (sync closure, same lock file) and
+`commit::try_with_metadata_file_lock` (composed with the commit actor,
+lock resolved via `lock_file_for_metadata`). Acquisition is
+`flock(LOCK_EX | LOCK_NB)`: on contention the call returns immediately
+with `StorageError::LockWouldBlock { path }` naming the lock file, which
+consumers match on to map contention into their own taxonomy (e.g. CLI
+exit code 1). The lock file is still created on demand and left in place.
 
 **Operational note.** The flock wait is unbounded and runs through
 `spawn_blocking`: a parked waiter cannot be aborted, and many long-lived

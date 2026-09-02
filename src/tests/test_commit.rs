@@ -10,9 +10,11 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 use crate::commit::{
-    lock_file_for_metadata, with_commit_actor, with_file_lock, with_metadata_file_lock,
+    lock_file_for_metadata, try_with_file_lock, try_with_metadata_file_lock, with_commit_actor,
+    with_file_lock, with_metadata_file_lock,
 };
 use crate::generations::write_json_atomic;
+use crate::StorageError;
 
 use super::tmp_dir;
 
@@ -263,5 +265,130 @@ fn file_lock_creates_missing_parent_dirs() {
         .block_on(async { with_file_lock(&lock, || Ok(())).await })
         .unwrap();
     assert!(lock.is_file());
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// #105: the try variant runs the closure when uncontended, releases the
+/// lock on completion (a subsequent try acquires again), and the lock file
+/// stays in place as the rendezvous point.
+#[tokio::test(flavor = "multi_thread")]
+async fn try_file_lock_runs_closure_uncontended_and_releases() {
+    let base = tmp_dir("try_file_lock_uncontended").await;
+    let lock = base.join("ds__g1_metadata.lock");
+
+    let out = try_with_file_lock(&lock, || Ok::<_, StorageError>("ran")).await.unwrap();
+    assert_eq!(out, "ran", "closure output must pass through");
+
+    try_with_file_lock(&lock, || Ok::<_, StorageError>(())).await.unwrap();
+    assert!(lock.is_file(), "lock file is the rendezvous point, left in place");
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// #105: the try variant fails fast on contention — while a holder parks
+/// on the lock file, a second taker returns immediately with a
+/// distinctly matchable `LockWouldBlock` naming the lock file, instead of
+/// parking on the blocking pool.
+#[tokio::test(flavor = "multi_thread")]
+async fn try_file_lock_fails_fast_naming_lock_file_while_held() {
+    let base = tmp_dir("try_file_lock_contended").await;
+    let lock = base.join("ds__g1_metadata.lock");
+
+    let (held_tx, held_rx) = mpsc::channel::<()>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let lock_a = lock.clone();
+    let holder = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                with_file_lock(&lock_a, move || {
+                    held_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(())
+                })
+                .await
+                .unwrap()
+            })
+    });
+    held_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("holder must acquire the lock");
+
+    let started = std::time::Instant::now();
+    let err = try_with_file_lock(&lock, || Ok::<_, StorageError>(())).await.unwrap_err();
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "try variant must fail fast, not wait for the holder"
+    );
+    match err {
+        StorageError::LockWouldBlock { path } => {
+            assert_eq!(path, lock, "the error must name the lock file");
+        }
+        other => panic!("expected LockWouldBlock, got {other:?}"),
+    }
+
+    // After the holder releases, the try succeeds — the guard was RAII.
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+    try_with_file_lock(&lock, || Ok::<_, StorageError>(())).await.unwrap();
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// #105: the composed try helper resolves the lock through the blessed
+/// convention and fails fast, naming the derived lock file, when another
+/// holder has it; uncontended it runs the whole actor cycle.
+#[tokio::test(flavor = "multi_thread")]
+async fn try_metadata_file_lock_fails_fast_then_runs_cycle_uncontended() {
+    let base = tmp_dir("try_composed_lock").await;
+    let md = base.join("ds__g1_metadata.json");
+    write_json_atomic(&md, "0").unwrap();
+    let lock = lock_file_for_metadata(&md);
+
+    // A foreign holder parks on the derived lock file.
+    let (held_tx, held_rx) = mpsc::channel::<()>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let lock_a = lock.clone();
+    let holder = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                with_file_lock(&lock_a, move || {
+                    held_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(())
+                })
+                .await
+                .unwrap()
+            })
+    });
+    held_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("holder must acquire the derived lock file");
+
+    let err = try_with_metadata_file_lock(&md, || async { Ok(()) }).await.unwrap_err();
+    match err {
+        StorageError::LockWouldBlock { path } => {
+            assert_eq!(path, lock, "must name the derived lock file");
+        }
+        other => panic!("expected LockWouldBlock, got {other:?}"),
+    }
+
+    // Uncontended, the full RMW cycle runs under the actor and lands.
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+    let md_cycle = md.clone();
+    try_with_metadata_file_lock(&md, move || async move {
+        let n: u8 = std::fs::read_to_string(&md_cycle).unwrap().trim().parse().unwrap();
+        write_json_atomic(&md_cycle, &(n + 1).to_string()).unwrap();
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let count: u8 = std::fs::read_to_string(&md).unwrap().trim().parse().unwrap();
+    assert_eq!(count, 1, "the uncontended try cycle must publish its RMW");
+
     let _ = std::fs::remove_dir_all(&base);
 }

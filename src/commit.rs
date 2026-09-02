@@ -89,14 +89,27 @@
 //!      against in-process async `save_*` cycles. If that matters, use
 //!      [`with_metadata_file_lock`].
 //!
+//!    - **Fail-fast variants (#105)** — [`try_with_file_lock`] and
+//!      [`try_with_metadata_file_lock`] take the same lock files with the
+//!      same hold scopes, but acquisition is non-blocking
+//!      (`flock(LOCK_EX | LOCK_NB)`): on contention the caller gets
+//!      [`StorageError::LockWouldBlock`] naming the lock file immediately
+//!      instead of parking on the blocking pool. Consumers whose contract
+//!      is fail-fast on contention (a second concurrent append must exit
+//!      non-zero, never wait) map that variant onto their own taxonomy.
+//!
 //! The lock file is a rendezvous point for cooperating writers, not a
 //! commit artifact: it carries no data and is left in place after release.
 //! Arbitration is only as strong as the convention — every writer of the
-//! same metadata file must take the same lock file before mutating it.
+//! same metadata file must take the same lock file before mutating it,
+//! and advisory locking excludes only those cooperating writers, never
+//! arbitrary readers or unaware processes.
 //!
-//! Both lock forms wait on the blocking pool; see the operational caution
-//! on [`with_metadata_file_lock`] for the assumptions this puts on commit
-//! cycles and what to prefer when waits could be prolonged or numerous.
+//! The blocking lock forms wait on the blocking pool; see the operational
+//! caution on [`with_metadata_file_lock`] for the assumptions this puts on
+//! commit cycles and what to prefer when waits could be prolonged or
+//! numerous. Where that trade is unacceptable, the try forms above fail
+//! fast instead of waiting.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -207,6 +220,39 @@ where
     .map_err(|e| StorageError::Io(format!("file lock task failed: {e}")))?
 }
 
+/// Fail-fast counterpart of [`with_file_lock`] (#105): the same advisory
+/// `flock` on `lock_path` and the same hold scope — lock → read-modify-write
+/// → publish → release — but acquisition is non-blocking
+/// (`flock(LOCK_EX | LOCK_NB)`). On contention the call returns
+/// immediately with [`StorageError::LockWouldBlock`] naming the lock file
+/// instead of parking the waiter on the blocking pool, so consumers whose
+/// contract is fail-fast on contention (e.g. a multi-process CLI append
+/// that must exit non-zero on a concurrent append) can adopt the blessed
+/// convention without waiting.
+///
+/// Contention is distinctable: match on `StorageError::LockWouldBlock {
+/// path }` and map it into your own taxonomy (IO errors, task-join
+/// failures and the closure's own errors keep their original shapes).
+/// Everything [`with_file_lock`] documents holds here too: the lock file
+/// is created on demand (missing parents included) and left in place — a
+/// rendezvous point, not a commit artifact; the closure runs on the
+/// blocking pool and cannot await [`with_commit_actor`]; off unix this
+/// fails with [`StorageError::UnsupportedFormat`]. Advisory means only
+/// cooperating writers that resolve the same lock file are excluded.
+pub async fn try_with_file_lock<T, F>(lock_path: &Path, f: F) -> StorageResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> StorageResult<T> + Send + 'static,
+{
+    let lock_path = lock_path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let _lock = FileLock::try_acquire(&lock_path)?;
+        f()
+    })
+    .await
+    .map_err(|e| StorageError::Io(format!("file lock task failed: {e}")))?
+}
+
 /// The blessed lock-file path for a metadata file (#100):
 /// `{metadata-stem}.lock` next to it — `ds__g1_metadata.json` locks through
 /// `ds__g1_metadata.lock`. All cooperating writers of the same metadata
@@ -223,9 +269,9 @@ pub fn lock_file_for_metadata(metadata_path: &Path) -> PathBuf {
 }
 
 /// RAII advisory lock (unix `flock(2)`, exclusive). The lock is held by the
-/// open file description, so two `acquire` calls — in this process or
-/// another — exclude each other until the guard drops (explicit `LOCK_UN`,
-/// and again on close).
+/// open file description, so two `acquire`/`try_acquire` calls — in this
+/// process or another — exclude each other until the guard drops (explicit
+/// `LOCK_UN`, and again on close).
 #[cfg(unix)]
 struct FileLock(std::fs::File);
 
@@ -234,18 +280,7 @@ impl FileLock {
     fn acquire(lock_path: &Path) -> StorageResult<Self> {
         use std::os::unix::io::AsRawFd;
 
-        if let Some(parent) = lock_path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| StorageError::Io(format!("create lock parent {parent:?}: {e}")))?;
-        }
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(lock_path)
-            .map_err(|e| StorageError::Io(format!("open lock {lock_path:?}: {e}")))?;
+        let file = open_lock_file(lock_path)?;
         // SAFETY: fd is valid; flock(2) has no preconditions beyond it.
         let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
         if rc != 0 {
@@ -256,6 +291,49 @@ impl FileLock {
         }
         Ok(FileLock(file))
     }
+
+    /// Non-blocking variant (#105): `flock(LOCK_EX | LOCK_NB)`. On
+    /// contention (EWOULDBLOCK) the error is
+    /// [`StorageError::LockWouldBlock`] naming `lock_path`, so fail-fast
+    /// consumers can map it into their own taxonomy; the lock file is
+    /// still created if missing (the rendezvous point must exist for the
+    /// next taker).
+    fn try_acquire(lock_path: &Path) -> StorageResult<Self> {
+        use std::os::unix::io::AsRawFd;
+
+        let file = open_lock_file(lock_path)?;
+        // SAFETY: fd is valid; flock(2) has no preconditions beyond it.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                return Err(StorageError::LockWouldBlock {
+                    path: lock_path.to_path_buf(),
+                });
+            }
+            return Err(StorageError::Io(format!("flock {lock_path:?}: {err}")));
+        }
+        Ok(FileLock(file))
+    }
+}
+
+/// Opens (creating if missing) the lock file for `acquire`/`try_acquire`:
+/// missing parent directories are created, the file is opened
+/// write-only without truncation (it carries no data).
+#[cfg(unix)]
+fn open_lock_file(lock_path: &Path) -> StorageResult<std::fs::File> {
+    if let Some(parent) = lock_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| StorageError::Io(format!("create lock parent {parent:?}: {e}")))?;
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(lock_path)
+        .map_err(|e| StorageError::Io(format!("open lock {lock_path:?}: {e}")))
 }
 
 #[cfg(unix)]
@@ -279,6 +357,12 @@ impl FileLock {
     fn acquire(_lock_path: &Path) -> StorageResult<Self> {
         Err(StorageError::UnsupportedFormat(
             "cross-process file locking (with_file_lock) requires a POSIX platform".into(),
+        ))
+    }
+
+    fn try_acquire(_lock_path: &Path) -> StorageResult<Self> {
+        Err(StorageError::UnsupportedFormat(
+            "cross-process file locking (try_with_file_lock) requires a POSIX platform".into(),
         ))
     }
 }
@@ -335,6 +419,35 @@ where
     let lock_path = lock_file_for_metadata(metadata_path);
     let lock_path2 = lock_path.clone();
     let _lock = tokio::task::spawn_blocking(move || FileLock::acquire(&lock_path2))
+        .await
+        .map_err(|e| StorageError::Io(format!("file lock task failed: {e}")))??;
+    with_commit_actor(metadata_path, cycle).await
+}
+
+/// Fail-fast counterpart of [`with_metadata_file_lock`] (#105): the lock
+/// file is resolved through [`lock_file_for_metadata`] and acquired with
+/// [`FileLock::try_acquire`] — on cross-process contention the call
+/// returns [`StorageError::LockWouldBlock`] naming the derived lock file
+/// without parking; uncontended, the file lock is held across the whole
+/// awaited commit-actor cycle exactly as in [`with_metadata_file_lock`]
+/// (cross-process exclusion *and* in-process actor serialization).
+///
+/// The try applies to the **flock only**: once acquired, the awaited
+/// commit-actor cycle still serializes against in-process cycles as
+/// usual. Advisory, cooperating-writers-only, rendezvous-point semantics
+/// are identical to the blocking form; off unix this fails with
+/// [`StorageError::UnsupportedFormat`].
+pub async fn try_with_metadata_file_lock<T, F, Fut>(
+    metadata_path: &Path,
+    cycle: F,
+) -> StorageResult<T>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = StorageResult<T>>,
+{
+    let lock_path = lock_file_for_metadata(metadata_path);
+    let lock_path2 = lock_path.clone();
+    let _lock = tokio::task::spawn_blocking(move || FileLock::try_acquire(&lock_path2))
         .await
         .map_err(|e| StorageError::Io(format!("file lock task failed: {e}")))??;
     with_commit_actor(metadata_path, cycle).await

@@ -6,14 +6,20 @@
 //! `lock_file_for_metadata` lose their `pub` visibility, this file stops
 //! compiling.
 //!
+//! #105 extends the guarded surface with the fail-fast try forms
+//! (`try_with_file_lock`, `try_with_metadata_file_lock`) and the
+//! distinctly matchable `StorageError::LockWouldBlock`.
+//!
 //! Run with `cargo test --release --test api_public`.
 
 use std::path::PathBuf;
 
 use genegraph_storage::commit::{
-    lock_file_for_metadata, with_commit_actor, with_file_lock, with_metadata_file_lock,
+    lock_file_for_metadata, try_with_file_lock, try_with_metadata_file_lock, with_commit_actor,
+    with_file_lock, with_metadata_file_lock,
 };
 use genegraph_storage::generations::write_json_atomic;
+use genegraph_storage::StorageError;
 
 fn scratch_dir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -112,5 +118,76 @@ async fn in_process_actor_cycle_is_publicly_callable() {
     let result: genegraph_storage::StorageResult<()> =
         with_commit_actor(&metadata_path, || async { Ok(()) }).await;
     result.unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #105: the fail-fast try forms are publicly callable from downstream and
+/// surface contention as the distinctly matchable `LockWouldBlock` naming
+/// the lock file — the shape a multi-process CLI maps onto its own exit
+/// codes without waiting.
+#[tokio::test]
+async fn downstream_try_lock_cycle_maps_contention_to_lock_would_block() {
+    let dir = scratch_dir("try");
+    let metadata_path = dir.join("ds__g1_metadata.json");
+    write_json_atomic(&metadata_path, r#"{"count":0}"#).unwrap();
+    let lock_path = lock_file_for_metadata(&metadata_path);
+
+    // A foreign holder parks on the lock file, as an independent CLI
+    // process would.
+    let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+    let (proceed_tx, proceed_rx) = std::sync::mpsc::channel::<()>();
+    let lock_for_foreign = lock_path.clone();
+    let foreign = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                with_file_lock(&lock_for_foreign, move || {
+                    held_tx.send(()).unwrap();
+                    proceed_rx.recv().unwrap();
+                    Ok(())
+                })
+                .await
+                .unwrap()
+            })
+    });
+    held_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+
+    // Both try forms fail fast, naming the lock file.
+    let raw_err = try_with_file_lock(&lock_path, || Ok::<(), StorageError>(()))
+        .await
+        .unwrap_err();
+    let composed_err: StorageError =
+        try_with_metadata_file_lock(&metadata_path, || async { Ok(()) })
+            .await
+            .unwrap_err();
+    for err in [raw_err, composed_err] {
+        match err {
+            StorageError::LockWouldBlock { path } => {
+                assert_eq!(path, lock_path, "the error must name the lock file");
+            }
+            other => panic!("expected LockWouldBlock, got {other:?}"),
+        }
+    }
+
+    // Release; the try forms succeed downstream.
+    proceed_tx.send(()).unwrap();
+    foreign.join().unwrap();
+    let md = metadata_path.clone();
+    try_with_metadata_file_lock(&metadata_path, move || async move {
+        let mut doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&md).unwrap()).unwrap();
+        doc["count"] = serde_json::json!(doc["count"].as_u64().unwrap() + 1);
+        write_json_atomic(&md, &doc.to_string()).unwrap();
+        Ok(())
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&metadata_path).unwrap(),
+        r#"{"count":1}"#,
+        "the uncontended try cycle must publish its RMW"
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
 }

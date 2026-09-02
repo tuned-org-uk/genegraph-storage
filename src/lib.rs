@@ -41,6 +41,12 @@ pub enum StorageError {
     },
     /// A numeric value exceeds the range of the storage type it is written to.
     Overflow(String),
+    /// A non-blocking lock acquisition would block: the advisory lock file
+    /// is held by another cooperating writer. Distinctly matchable so
+    /// fail-fast consumers can map contention to their own taxonomy (#105).
+    LockWouldBlock {
+        path: std::path::PathBuf,
+    },
 }
 
 impl fmt::Display for StorageError {
@@ -63,6 +69,9 @@ impl fmt::Display for StorageError {
                 )
             }
             StorageError::Overflow(msg) => write!(f, "Overflow error: {}", msg),
+            StorageError::LockWouldBlock { path } => {
+                write!(f, "Lock would block: {} is held by another holder", path.display())
+            }
         }
     }
 }

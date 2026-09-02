@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.52.0 (2026-09-02)
+
+**Added**
+
+- Non-blocking file-lock variants for fail-fast consumer RMW cycles
+  (#105, follow-up to #100): `commit::try_with_file_lock(lock_path, f)`
+  and `commit::try_with_metadata_file_lock(metadata_path, cycle)` take
+  the same lock files with the same hold scopes as their blocking
+  counterparts, but acquisition is non-blocking (`flock(LOCK_EX |
+  LOCK_NB)`): on contention the call returns immediately with the new
+  distinctly matchable `StorageError::LockWouldBlock { path }` naming
+  the lock file, instead of parking the waiter on the blocking pool.
+  Advisory (cooperating-writers-only) and rendezvous-point semantics
+  (lock file created on demand, left in place) are unchanged and
+  documented next to the blocking forms; off unix the try forms fail
+  with `StorageError::UnsupportedFormat`.
+
 ## 0.51.0 (2026-09-02)
 
 Consumer-review follow-ups from the genefold-vd adoption line
