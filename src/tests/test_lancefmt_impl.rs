@@ -1,10 +1,6 @@
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-
-use futures::StreamExt;
 
 use arrow::array::{Array, FixedSizeListArray, Float64Array, UInt32Array};
-use arrow::datatypes::Schema as ArrowSchema;
 use arrow::record_batch::RecordBatch;
 
 use crate::lancefmt::{scan_all, write_dataset};
@@ -27,20 +23,6 @@ fn tmp_dir_sync(name: &str) -> PathBuf {
     ));
     std::fs::create_dir_all(&d).unwrap();
     d
-}
-
-fn read_with_official(dir: &Path) -> RecordBatch {
-    let abs = std::fs::canonicalize(dir).expect("dataset dir exists");
-    let uri = url::Url::from_file_path(&abs).unwrap().to_string();
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    rt.block_on(async move {
-        let dataset = lance::Dataset::open(&uri).await.expect("official open");
-        let schema = Arc::new(ArrowSchema::from(dataset.schema()));
-        let stream = dataset.scan().try_into_stream().await.expect("scan");
-        let batches: Vec<RecordBatch> =
-            futures::StreamExt::collect::<Vec<_>>(stream.map(|b| b.expect("batch"))).await;
-        arrow::compute::concat_batches(&schema, &batches).expect("concat")
-    })
 }
 
 fn assert_batch_f64(batch: &RecordBatch, expected: &[f64], col: usize, what: &str) {
@@ -155,66 +137,6 @@ fn impl_roundtrip_multichunk_f64() {
 }
 
 #[test]
-fn impl_official_reads_our_f64() {
-    let batch = fx::f64_batch();
-    let dir = tmp_dir_sync("lancefmt_impl_off_f64");
-    write_dataset(&batch, &dir).expect("write");
-    let loaded = read_with_official(&dir);
-    assert_batch_f64(&loaded, &fx::f64_small_values(), 0, "ours->official f64");
-}
-
-#[test]
-fn impl_official_reads_our_uint32() {
-    let batch = fx::u32_batch();
-    let dir = tmp_dir_sync("lancefmt_impl_off_u32");
-    write_dataset(&batch, &dir).expect("write");
-    let loaded = read_with_official(&dir);
-    assert_batch_u32(&loaded, &fx::u32_values(), 0, "ours->official u32");
-}
-
-#[test]
-fn impl_official_reads_our_fsl() {
-    let batch = fx::fsl_batch();
-    let dir = tmp_dir_sync("lancefmt_impl_off_fsl");
-    write_dataset(&batch, &dir).expect("write");
-    let loaded = read_with_official(&dir);
-    assert_batch_fsl(
-        &loaded,
-        &fx::fsl_values(),
-        fx::FSL_DIMS,
-        "ours->official fsl",
-    );
-}
-
-#[test]
-fn impl_official_reads_our_multichunk() {
-    let batch = fx::f64_multipage_record_batch();
-    let dir = tmp_dir_sync("lancefmt_impl_off_multi");
-    write_dataset(&batch, &dir).expect("write");
-    let loaded = read_with_official(&dir);
-    assert_batch_f64(
-        &loaded,
-        &multipage_expected(),
-        0,
-        "ours->official multichunk",
-    );
-}
-
-#[test]
-fn impl_official_reads_our_sparse_metadata() {
-    let batch = fx::sparse_batch();
-    let dir = tmp_dir_sync("lancefmt_impl_off_sparse");
-    write_dataset(&batch, &dir).expect("write");
-    let loaded = read_with_official(&dir);
-    let schema = loaded.schema();
-    assert_eq!(
-        schema.metadata().get("rows").map(String::as_str),
-        Some("100"),
-        "official must read back schema metadata we wrote"
-    );
-}
-
-#[test]
 fn impl_our_reader_reads_official_fixtures_f64() {
     let dir = Path::new(fx::FIXTURES_DIR).join("float64_nonnull.lance");
     let loaded = scan_all(&dir).expect("our scan of official fixture");
@@ -293,15 +215,6 @@ fn impl_overwrite_bumps_manifest_version() {
 
     let loaded = scan_all(&dir).expect("scan after overwrite");
     assert_batch_f64(&loaded, &[9.5, -2.0, 7.25], 0, "overwrite round-trip");
-
-    // the official reader must also land on the latest version
-    let official = read_with_official(&dir);
-    assert_batch_f64(
-        &official,
-        &[9.5, -2.0, 7.25],
-        0,
-        "official reads latest version",
-    );
 }
 
 #[test]
@@ -311,15 +224,6 @@ fn impl_roundtrip_int64_nonnull() {
     write_dataset(&batch, &dir).expect("write");
     let loaded = scan_all(&dir).expect("our scan");
     assert_batch_i64(&loaded, &fx::i64_values(), 0, "ours->ours i64");
-}
-
-#[test]
-fn impl_official_reads_our_int64() {
-    let batch = fx::i64_batch();
-    let dir = tmp_dir_sync("lancefmt_impl_off_i64");
-    write_dataset(&batch, &dir).expect("write");
-    let loaded = read_with_official(&dir);
-    assert_batch_i64(&loaded, &fx::i64_values(), 0, "ours->official i64");
 }
 
 fn assert_batch_i64(batch: &RecordBatch, expected: &[i64], col: usize, what: &str) {

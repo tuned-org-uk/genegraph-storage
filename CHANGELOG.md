@@ -6,6 +6,16 @@ Version line for the post-M5 development cycle (in-house Lance v2.1
 implementation shipped and verified in 0.20.0; see #75 close-out and
 RFC #81 for the generic vector-space + graph storage plan).
 
+**Removed**
+
+- The `official-lance` feature (M5 transition escape hatch) after one
+  release cycle, and the `lance` dev-dependency itself: the crate no
+  longer references the official lance crate anywhere in its dependency
+  graph (#75 M5 plan). Interop conformance is now fixture-based — the
+  golden fixtures written by the official crate (0.13.2) are read back
+  by the in-house reader's suite; the fixture generator and
+  official-reader round-trip tests were pruned with the dev-dependency.
+
 **Added**
 
 - Ergonomic metadata construction: `GeneMetadata::{new, with_base,
