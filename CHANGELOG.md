@@ -8,6 +8,10 @@ RFC #81 for the generic vector-space + graph storage plan).
 
 **Added**
 
+- Ergonomic metadata construction: `GeneMetadata::{new, with_base,
+  with_dimensions, add_file, new_fileinfo}` are now inherent methods,
+  so the common construction chain no longer requires importing the
+  `Metadata` trait (the trait remains for generic code).
 - (cycle opens) RFC #81: named collections, generic dense vector
   widths, first-class graph storage (edges + weights), vector-space to
   graph linkage.

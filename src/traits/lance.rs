@@ -8,7 +8,6 @@ use log::{debug, info};
 
 use crate::metadata::FileInfo;
 use crate::traits::backend::StorageBackend;
-use crate::traits::metadata::Metadata;
 use crate::{StorageError, StorageResult};
 
 #[cfg(feature = "official-lance")]
