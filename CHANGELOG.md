@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.51.0 (2026-09-02)
+
+Consumer-review follow-ups from the genefold-vd adoption line
+(genegraph-storage #100, #101, #102).
+
+**Added**
+
+- `commit::with_commit_actor` is public: downstream consumers running
+  their own metadata read-modify-write cycles serialize against the same
+  per-path in-process commit actor the `save_*` registry paths use
+  (#100).
+- Cross-process arbitration convention (#100): `commit::with_file_lock`
+  (advisory `flock`, hold scope = the closure, runs on the blocking
+  pool; typed `UnsupportedFormat` off unix) and
+  `commit::lock_file_for_metadata` (`{metadata-stem}.lock` next to the
+  metadata file). Contract documented in the `commit` module docs and
+  the README; `tests/api_public.rs` guards the public surface by
+  compiling the crate as an external consumer.
+
+**Changed**
+
+- `generations::write_json_atomic` fsyncs the parent directory after the
+  rename, and on a freshly created parent the new directory (and its
+  parent) as well, so the metadata commit pointer survives a post-rename
+  crash (#101). The directory-fsync helper moves from the lancefmt
+  writer to `generations::fsync_dir` as the shared discipline; bare
+  filenames (`parent() == ""`) resolve to `.` and keep working.
+- `StorageBackend::save_sparse` rejects `nnz=0` matrices early and typed
+  (`StorageError::Invalid` — "fully disconnected: adjacency nnz=0")
+  before the metadata commit cycle and any artifact write, so a
+  disconnected graph leaves no partial directory behind (#102). The
+  lancefmt writer's empty-batch guard remains as the format-layer
+  backstop.
+
 ## 0.26.0 (2026-09-02)
 
 Transactional generations: the durability layer for append-style writers

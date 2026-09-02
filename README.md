@@ -82,6 +82,56 @@ Append-style writers get immutable, atomically-committed generations:
 let gen = storage.scoped_generation(1); // artifacts at {logical}__g1_{key}.lance
 ```
 
+### Concurrent writers and metadata safety
+
+Every `save_*` call runs its metadata registry update through a per-path
+commit actor, so concurrent tasks inside one process never lose updates.
+Downstream code that performs its **own** metadata read-modify-write cycles
+must use the same serialization. Two levels are public:
+
+- **In-process** — `commit::with_commit_actor(metadata_path, cycle)`
+  serializes your cycle against the registry paths of the same metadata
+  file.
+- **Cross-process** — the commit actor is per-process only. Independent
+  processes (e.g. separate CLI invocations) take an advisory lock file
+  around the whole cycle, resolved through the blessed convention
+  `commit::lock_file_for_metadata(metadata_path)` (`{metadata-stem}.lock`
+  next to the metadata file). The composed recipe — file lock held across
+  the awaited actor cycle — is
+  `commit::with_metadata_file_lock(metadata_path, cycle)`:
+
+```rust
+use genegraph_storage::commit::with_metadata_file_lock;
+
+let metadata_path = std::path::Path::new("base/ds__g1_metadata.json");
+with_metadata_file_lock(metadata_path, || async {
+    // load → mutate → publish here: serialized across processes *and*
+    // against in-process save_* cycles
+    Ok(())
+})
+.await
+.unwrap();
+```
+
+For consumers whose whole cycle is synchronous,
+`commit::with_file_lock` takes the same lock file around a sync closure —
+it serializes across processes but does not compose with the in-process
+actor. Every writer of a given metadata file must take the same lock file
+before mutating it — arbitration is only as strong as the convention.
+
+**Operational note.** The flock wait is unbounded and runs through
+`spawn_blocking`: a parked waiter cannot be aborted, and many long-lived
+waiters can exhaust the runtime's blocking-thread capacity. That is a
+sound trade for metadata commits *if* cycles stay short, contention is
+normally brief, nothing under the lock does lengthy compute/network I/O
+or waits indefinitely, and you understand shutdown behavior with a stuck
+holder (blocked `spawn_blocking` tasks are abandoned by
+`Runtime::shutdown_timeout`, awaited by `shutdown_background`; process
+exit always releases the flock). If waits could be prolonged or numerous,
+prefer a dedicated lock-management thread, an explicit timeout or
+cancellation strategy, or a storage system with transactional
+coordination.
+
 ## Lance format
 
 The default build runs the in-house Lance v2.1 implementation (`lancefmt`) for all `StorageBackend` I/O: manifest with inline Overwrite transactions, txn files, version hints, MiniBlock pages with Flat / InlineBitpacking / FixedSizeList value compression. Encodings outside the supported subset are rejected with `StorageError::UnsupportedFormat` (never guessed). Interop conformance is fixture-based: golden fixtures written by the official lance crate are read back by the in-house reader's suite.
