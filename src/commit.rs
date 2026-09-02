@@ -15,6 +15,12 @@
 //! commit-point publish of one dataset directory are serialized, so two
 //! concurrent overwrites cannot mint the same `N.manifest` (#95).
 //!
+//! Both registries hold **weak** references (#98): a mailbox stays alive
+//! only while some caller holds its `Arc` (i.e. while a commit cycle or
+//! dataset write is in flight), and dead entries are swept on insert.
+//! Instances that churn (create/drop thousands of collections) keep the
+//! registries bounded.
+//!
 //! Durability of the commit itself is the tmp + fsync + rename discipline
 //! ([`crate::generations::write_json_atomic`] for metadata, the same
 //! sequence inside the lancefmt writer for data/txn/manifest files):
@@ -25,24 +31,49 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 
 use tokio::sync::Mutex;
 
 use crate::{StorageError, StorageResult};
 
-/// One commit-actor mailbox per metadata path (process-wide).
+/// Commit-actor mailboxes, keyed by metadata path (weak-valued, #98).
+static COMMIT_LOCKS: OnceLock<StdMutex<HashMap<String, Weak<Mutex<()>>>>> = OnceLock::new();
+/// Dataset-write mailboxes, keyed by dataset dir (weak-valued, #98).
+static DATASET_LOCKS: OnceLock<StdMutex<HashMap<String, Weak<StdMutex<()>>>>> = OnceLock::new();
+
+/// Shared weak-registry lookup (#98): reuse the live mailbox for `key` if
+/// one exists, otherwise sweep dead entries and insert `fresh`.
+pub(crate) fn weak_lookup<T>(
+    registry: &'static OnceLock<StdMutex<HashMap<String, Weak<T>>>>,
+    key: String,
+    fresh: Arc<T>,
+) -> Arc<T> {
+    let mut map = registry
+        .get_or_init(|| StdMutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(weak) = map.get(&key)
+        && let Some(strong) = weak.upgrade()
+    {
+        return strong;
+    }
+    map.retain(|_, weak| weak.strong_count() > 0);
+    let arc = Arc::clone(&fresh);
+    map.insert(key, Arc::downgrade(&fresh));
+    arc
+}
+
+/// One commit-actor mailbox per metadata path.
 fn lock_for(metadata_path: &Path) -> Arc<Mutex<()>> {
-    static LOCKS: OnceLock<StdMutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
-    let locks = LOCKS.get_or_init(|| StdMutex::new(HashMap::new()));
     let key = metadata_path.to_string_lossy().to_string();
-    Arc::clone(
-        locks
-            .lock()
-            .expect("commit lock registry poisoned")
-            .entry(key)
-            .or_insert_with(|| Arc::new(Mutex::new(()))),
-    )
+    weak_lookup(&COMMIT_LOCKS, key, Arc::new(Mutex::new(())))
+}
+
+/// One dataset-write mailbox per dataset directory.
+fn dataset_lock_for(dataset_dir: &Path) -> Arc<StdMutex<()>> {
+    let key = dataset_dir.to_string_lossy().to_string();
+    weak_lookup(&DATASET_LOCKS, key, Arc::new(StdMutex::new(())))
 }
 
 /// Runs `commit` (a full metadata read-modify-write cycle) under the
@@ -61,26 +92,6 @@ where
     commit().await
 }
 
-/// One dataset-write mailbox per dataset directory (process-wide, sync —
-/// `write_dataset` runs on the blocking pool).
-///
-/// Serializes manifest-version allocation (`latest_manifest_version` →
-/// `+1`) against concurrent overwrites of the same dataset (#95): without
-/// it two writers could mint the same `N.manifest` and one overwrite would
-/// be silently lost.
-fn dataset_lock_for(dataset_dir: &Path) -> Arc<StdMutex<()>> {
-    static LOCKS: OnceLock<StdMutex<HashMap<String, Arc<StdMutex<()>>>>> = OnceLock::new();
-    let locks = LOCKS.get_or_init(|| StdMutex::new(HashMap::new()));
-    let key = dataset_dir.to_string_lossy().to_string();
-    Arc::clone(
-        locks
-            .lock()
-            .expect("dataset lock registry poisoned")
-            .entry(key)
-            .or_insert_with(|| Arc::new(StdMutex::new(()))),
-    )
-}
-
 /// Runs `write` under the dataset's write mailbox. `write` must be a
 /// non-async closure: the whole dataset write — version allocation through
 /// commit-point publish — happens under the lock.
@@ -93,4 +104,18 @@ pub(crate) fn with_dataset_write_lock<T>(
         .lock()
         .map_err(|_| StorageError::InvalidState("dataset write lock poisoned".into()))?;
     write()
+}
+
+/// Test hook: (commit-registry size, dataset-registry size).
+#[cfg(test)]
+pub(crate) fn registry_sizes() -> (usize, usize) {
+    let commit = COMMIT_LOCKS
+        .get()
+        .map(|m| m.lock().unwrap().len())
+        .unwrap_or(0);
+    let dataset = DATASET_LOCKS
+        .get()
+        .map(|m| m.lock().unwrap().len())
+        .unwrap_or(0);
+    (commit, dataset)
 }
