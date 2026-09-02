@@ -194,6 +194,8 @@ async fn test_metadata_roundtrip_with_sparse_info() {
             cols: 1000,
             nnz: Some(5000), // Sparse matrix with 5000 non-zero entries
             size_bytes: Some(120000),
+            kind: Some(crate::metadata::CollectionKind::Graph),
+            properties: std::collections::BTreeMap::new(),
         },
     );
 

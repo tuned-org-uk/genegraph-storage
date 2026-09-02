@@ -39,6 +39,10 @@ pub fn generation_name(logical: &str, generation: u64) -> String {
 
 /// Parse the generation number out of a gen-qualified instance name.
 /// Returns `None` for plain logical names or malformed suffixes.
+///
+/// Note (#95): digit suffixes above `u64::MAX` parse to `None` here; the
+/// scanners combine this with a `unwrap_or(u64::MAX)` fallback so such names
+/// sort last consistently instead of crashing discovery.
 pub fn parse_generation(name: &str) -> Option<u64> {
     let pos = name.rfind(GENERATION_SEP)?;
     let suffix = &name[pos + GENERATION_SEP.len()..];
@@ -104,6 +108,13 @@ pub async fn list_artifact_generations(base: &Path, logical: &str) -> StorageRes
 /// metadata commit pointer. Prefix matching is exact on
 /// `{logical}__g{gen}_`, so sibling datasets (`ds` vs `ds2`) are untouched.
 /// Safe to call on orphaned generations (no metadata) and on missing ones.
+///
+/// Reader isolation (#95): there is no reference counting of in-flight
+/// readers. A sweep that removes a generation a reader is currently scanning
+/// will surface as an `Io` error mid-read; callers must serialize sweeps
+/// against reads (e.g. via the commit actor) or treat absence as
+/// "generation retired". Readers that need stable views should open by
+/// generation number and re-resolve on failure.
 pub async fn delete_generation(base: &Path, logical: &str, generation: u64) -> StorageResult<()> {
     let prefix = format!("{logical}{GENERATION_SEP}{generation}_");
     let mut rd = tokio::fs::read_dir(base)
@@ -131,16 +142,20 @@ pub async fn delete_generation(base: &Path, logical: &str, generation: u64) -> S
     Ok(())
 }
 
-/// Atomic JSON publish: write to `{path}.tmp`, fsync, rename over `path`.
+/// Atomic JSON publish: write to a unique `{path}.tmp`, fsync, rename over
+/// `path`.
 ///
 /// The rename is the single commit point (POSIX-atomic within a directory):
 /// concurrent readers observe either the previous file or the complete new
 /// one, never a truncated write. This is the ONLY sanctioned way to publish
-/// a metadata file.
+/// a metadata file. The tmp name is uuid-unique (#95) so concurrent
+/// publishers of the same path cannot corrupt each other's staging file;
+/// the last rename wins, which makes last-writer-wins explicit instead of
+/// interleaved.
 pub fn write_json_atomic(path: &Path, contents: &str) -> StorageResult<()> {
     use std::io::Write;
 
-    let tmp = path.with_extension("json.tmp");
+    let tmp = path.with_extension(format!("json.tmp.{}", uuid::Uuid::new_v4().simple()));
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| StorageError::Io(e.to_string()))?;
     }

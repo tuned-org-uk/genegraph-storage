@@ -9,7 +9,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, FixedSizeListArray, Float64Array, UInt32Array};
+use arrow::array::{ArrayRef, FixedSizeListArray, Float32Array, Float64Array, UInt32Array};
 use arrow::datatypes::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use arrow::record_batch::RecordBatch;
 use prost::Message;
@@ -113,7 +113,10 @@ fn decode_direct_any(encoding: &Option<lfv2::Encoding>) -> StorageResult<Vec<u8>
 /// One decoded chunk: `values` holds the logical values of the chunk.
 enum ChunkValues {
     F64(Vec<f64>),
+    F32(Vec<f32>),
+    U8(Vec<u8>),
     U32(Vec<u32>),
+    U64(Vec<u64>),
     I64(Vec<i64>),
 }
 
@@ -122,15 +125,26 @@ enum ChunkValues {
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Leaf {
     F64,
+    F32,
+    U8,
     U32,
+    U64,
     I64,
 }
 
 fn leaf_of(dt: &DataType) -> StorageResult<Leaf> {
     match dt {
-        DataType::Float64 | DataType::FixedSizeList(_, _) => Ok(Leaf::F64),
+        DataType::Float64 => Ok(Leaf::F64),
+        DataType::Float32 => Ok(Leaf::F32),
+        DataType::UInt8 => Ok(Leaf::U8),
         DataType::UInt32 => Ok(Leaf::U32),
+        DataType::UInt64 => Ok(Leaf::U64),
         DataType::Int64 => Ok(Leaf::I64),
+        DataType::FixedSizeList(child, _) => match child.data_type() {
+            DataType::Float64 => Ok(Leaf::F64),
+            DataType::Float32 => Ok(Leaf::F32),
+            other => Err(unsupported(&format!("fsl item type {other:?}"))),
+        },
         other => Err(unsupported(&format!("column type {other:?}"))),
     }
 }
@@ -152,6 +166,15 @@ fn decode_chunk(
                     .collect();
                 Ok(ChunkValues::F64(values))
             }
+            (Leaf::F32, 32) => {
+                let values = buffer
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| f32::from_le_bytes(*b))
+                    .collect();
+                Ok(ChunkValues::F32(values))
+            }
             (Leaf::I64, 64) => {
                 let values = buffer
                     .as_chunks::<8>()
@@ -160,6 +183,15 @@ fn decode_chunk(
                     .map(|b| i64::from_le_bytes(*b))
                     .collect();
                 Ok(ChunkValues::I64(values))
+            }
+            (Leaf::U64, 64) => {
+                let values = buffer
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|b| u64::from_le_bytes(*b))
+                    .collect();
+                Ok(ChunkValues::U64(values))
             }
             (Leaf::U32, 32) => {
                 let values = buffer
@@ -170,6 +202,7 @@ fn decode_chunk(
                     .collect();
                 Ok(ChunkValues::U32(values))
             }
+            (Leaf::U8, 8) => Ok(ChunkValues::U8(buffer.to_vec())),
             (leaf, bits) => Err(unsupported(&format!(
                 "Flat bits_per_value={bits} for leaf {leaf:?}"
             ))),
@@ -253,11 +286,127 @@ fn decode_chunk(
                     out[..n].iter().map(|v| *v as i64).collect(),
                 ))
             }
+            (Leaf::U64, 64) => {
+                if buffer.len() < 4 {
+                    return Err(StorageError::Invalid("bitpacked chunk too small".into()));
+                }
+                let width = u32::from_le_bytes(buffer[0..4].try_into().unwrap()) as usize;
+                let packed = &buffer[4..];
+                if !packed.len().is_multiple_of(8) {
+                    return Err(StorageError::Invalid(
+                        "bitpacked chunk not word-aligned".into(),
+                    ));
+                }
+                let words: Vec<u64> = packed
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|b| u64::from_le_bytes(*b))
+                    .collect();
+                let block_words = (1024usize * width).div_ceil(64);
+                if words.len() < block_words {
+                    return Err(StorageError::Invalid(
+                        "bitpacked chunk shorter than one FL block".into(),
+                    ));
+                }
+                let mut out = vec![0u64; 1024];
+                // SAFETY: `out` has exactly the FL block size for u64 and
+                // `words` holds one full block of packed words.
+                unsafe {
+                    use lance_bitpacking::BitPacking;
+                    <u64 as BitPacking>::unchecked_unpack(width, &words[..block_words], &mut out);
+                }
+                let n = values_in_chunk as usize;
+                if n > 1024 {
+                    return Err(StorageError::Invalid(
+                        "bitpacked chunk claims more than 1024 values".into(),
+                    ));
+                }
+                Ok(ChunkValues::U64(out[..n].to_vec()))
+            }
+            (Leaf::U8, 8) => {
+                if buffer.len() < 4 {
+                    return Err(StorageError::Invalid("bitpacked chunk too small".into()));
+                }
+                let width = u32::from_le_bytes(buffer[0..4].try_into().unwrap()) as usize;
+                if width > 8 {
+                    return Err(StorageError::Invalid(format!(
+                        "u8 bitpacked width {width} exceeds 8 bits"
+                    )));
+                }
+                let packed = &buffer[4..];
+                let block_bytes = (1024usize * width).div_ceil(8);
+                if packed.len() < block_bytes {
+                    return Err(StorageError::Invalid(
+                        "bitpacked chunk shorter than one FL block".into(),
+                    ));
+                }
+                let mut out = vec![0u8; 1024];
+                // SAFETY: `out` has exactly the FL block size for u8 and
+                // `packed` starts with one full block of packed bytes.
+                unsafe {
+                    use lance_bitpacking::BitPacking;
+                    <u8 as BitPacking>::unchecked_unpack(width, &packed[..block_bytes], &mut out);
+                }
+                let n = values_in_chunk as usize;
+                if n > 1024 {
+                    return Err(StorageError::Invalid(
+                        "bitpacked chunk claims more than 1024 values".into(),
+                    ));
+                }
+                Ok(ChunkValues::U8(out[..n].to_vec()))
+            }
             (leaf, bits) => Err(unsupported(&format!(
                 "InlineBitpacking uncompressed_bits_per_value={bits} for leaf {leaf:?}"
             ))),
         },
         other => Err(unsupported(&format!("value compression {other:?}"))),
+    }
+}
+
+/// Per-leaf decoded value accumulators for one page.
+#[derive(Default)]
+struct ColumnValues {
+    f64: Vec<f64>,
+    f32: Vec<f32>,
+    u8: Vec<u8>,
+    u32: Vec<u32>,
+    u64: Vec<u64>,
+    i64: Vec<i64>,
+}
+
+impl ColumnValues {
+    fn append(&mut self, values: ChunkValues) {
+        match values {
+            ChunkValues::F64(mut v) => self.f64.append(&mut v),
+            ChunkValues::F32(mut v) => self.f32.append(&mut v),
+            ChunkValues::U8(mut v) => self.u8.append(&mut v),
+            ChunkValues::U32(mut v) => self.u32.append(&mut v),
+            ChunkValues::U64(mut v) => self.u64.append(&mut v),
+            ChunkValues::I64(mut v) => self.i64.append(&mut v),
+        }
+    }
+
+    /// Rejects chunks decoded into any leaf type other than the expected
+    /// ones for the column (guards against encoding/schema confusion).
+    fn keep_only(&self, keep: &[&str]) -> StorageResult<()> {
+        let checks: [(&str, usize); 6] = [
+            ("f64", self.f64.len()),
+            ("f32", self.f32.len()),
+            ("u8", self.u8.len()),
+            ("u32", self.u32.len()),
+            ("u64", self.u64.len()),
+            ("i64", self.i64.len()),
+        ];
+        for (name, len) in checks {
+            if len > 0 && !keep.contains(&name) {
+                return Err(StorageError::Invalid(format!(
+                    "{name} values in {} column",
+                    keep.join("|")
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -304,9 +453,7 @@ fn decode_page(
     // Walk chunks: metadata is one u16 per chunk; the data buffer holds the
     // chunks back to back.
     let leaf = leaf_of(expected_type)?;
-    let mut f64_out: Vec<f64> = Vec::new();
-    let mut u32_out: Vec<u32> = Vec::new();
-    let mut i64_out: Vec<i64> = Vec::new();
+    let mut out = ColumnValues::default();
     let mut chunk_data_pos = 0usize;
     let mut vals_so_far: u64 = 0;
     let num_chunks = metadata.len() / 2;
@@ -357,27 +504,44 @@ fn decode_page(
                 else {
                     return Err(unsupported("FixedSizeList without Flat values"));
                 };
-                if flat.bits_per_value != 64 {
-                    return Err(unsupported("FixedSizeList with non-64-bit items"));
+                let expected_bits = match leaf {
+                    Leaf::F64 => 64,
+                    Leaf::F32 => 32,
+                    other => {
+                        return Err(unsupported(&format!("FixedSizeList with {other:?} items")));
+                    }
+                };
+                if flat.bits_per_value != expected_bits {
+                    return Err(unsupported(&format!(
+                        "FixedSizeList with {}-bit items",
+                        flat.bits_per_value
+                    )));
                 }
-                match decode_chunk(
-                    buffer,
-                    &Compression::Flat(*flat),
-                    Leaf::F64,
-                    values_in_chunk,
-                )? {
+                let items_expected = values_in_chunk as usize * fsl.items_per_value as usize;
+                match decode_chunk(buffer, &Compression::Flat(*flat), leaf, values_in_chunk)? {
                     ChunkValues::F64(mut items) => {
-                        let items_expected =
-                            values_in_chunk as usize * fsl.items_per_value as usize;
                         if items.len() != items_expected {
                             return Err(StorageError::DimensionMismatch {
                                 expected: format!("{items_expected} items"),
                                 found: format!("{} items", items.len()),
                             });
                         }
-                        f64_out.append(&mut items);
+                        out.f64.append(&mut items);
                     }
-                    _ => return Err(StorageError::Invalid("fsl decoded as non-f64".into())),
+                    ChunkValues::F32(mut items) => {
+                        if items.len() != items_expected {
+                            return Err(StorageError::DimensionMismatch {
+                                expected: format!("{items_expected} items"),
+                                found: format!("{} items", items.len()),
+                            });
+                        }
+                        out.f32.append(&mut items);
+                    }
+                    _ => {
+                        return Err(StorageError::Invalid(
+                            "fsl decoded as non-float values".into(),
+                        ));
+                    }
                 }
             }
             other => {
@@ -386,11 +550,8 @@ fn decode_page(
                 } else {
                     values_in_chunk
                 };
-                match decode_chunk(buffer, other, leaf, values_in_chunk)? {
-                    ChunkValues::F64(mut v) => f64_out.append(&mut v),
-                    ChunkValues::U32(mut v) => u32_out.append(&mut v),
-                    ChunkValues::I64(mut v) => i64_out.append(&mut v),
-                }
+                let values = decode_chunk(buffer, other, leaf, values_in_chunk)?;
+                out.append(values);
             }
         }
         chunk_data_pos += chunk_bytes;
@@ -403,7 +564,7 @@ fn decode_page(
         )));
     }
 
-    build_array(expected_type, f64_out, u32_out, i64_out, page.length)
+    build_array(expected_type, out, page.length)
 }
 
 fn validate_miniblock(miniblock: &MiniBlockLayout) -> StorageResult<()> {
@@ -428,68 +589,113 @@ fn validate_miniblock(miniblock: &MiniBlockLayout) -> StorageResult<()> {
 
 fn build_array(
     expected_type: &DataType,
-    f64_out: Vec<f64>,
-    u32_out: Vec<u32>,
-    i64_out: Vec<i64>,
+    values: ColumnValues,
     expected_rows: u64,
 ) -> StorageResult<ArrayRef> {
     let arr: ArrayRef = match expected_type {
         DataType::Float64 => {
-            if !u32_out.is_empty() {
-                return Err(StorageError::Invalid("u32 values in f64 column".into()));
-            }
-            if f64_out.len() as u64 != expected_rows {
+            values.keep_only(&["f64"])?;
+            if values.f64.len() as u64 != expected_rows {
                 return Err(StorageError::DimensionMismatch {
                     expected: format!("{expected_rows} values"),
-                    found: format!("{} values", f64_out.len()),
+                    found: format!("{} values", values.f64.len()),
                 });
             }
-            Arc::new(Float64Array::from(f64_out))
+            Arc::new(Float64Array::from(values.f64))
+        }
+        DataType::Float32 => {
+            values.keep_only(&["f32"])?;
+            if values.f32.len() as u64 != expected_rows {
+                return Err(StorageError::DimensionMismatch {
+                    expected: format!("{expected_rows} values"),
+                    found: format!("{} values", values.f32.len()),
+                });
+            }
+            Arc::new(Float32Array::from(values.f32))
+        }
+        DataType::UInt8 => {
+            values.keep_only(&["u8"])?;
+            if values.u8.len() as u64 != expected_rows {
+                return Err(StorageError::DimensionMismatch {
+                    expected: format!("{expected_rows} values"),
+                    found: format!("{} values", values.u8.len()),
+                });
+            }
+            Arc::new(arrow::array::UInt8Array::from(values.u8))
         }
         DataType::UInt32 => {
-            if !f64_out.is_empty() {
-                return Err(StorageError::Invalid("f64 values in u32 column".into()));
-            }
-            if u32_out.len() as u64 != expected_rows {
+            values.keep_only(&["u32"])?;
+            if values.u32.len() as u64 != expected_rows {
                 return Err(StorageError::DimensionMismatch {
                     expected: format!("{expected_rows} values"),
-                    found: format!("{} values", u32_out.len()),
+                    found: format!("{} values", values.u32.len()),
                 });
             }
-            Arc::new(UInt32Array::from(u32_out))
+            Arc::new(UInt32Array::from(values.u32))
+        }
+        DataType::UInt64 => {
+            values.keep_only(&["u64"])?;
+            if values.u64.len() as u64 != expected_rows {
+                return Err(StorageError::DimensionMismatch {
+                    expected: format!("{expected_rows} values"),
+                    found: format!("{} values", values.u64.len()),
+                });
+            }
+            Arc::new(arrow::array::UInt64Array::from(values.u64))
         }
         DataType::Int64 => {
-            if !f64_out.is_empty() || !u32_out.is_empty() {
-                return Err(StorageError::Invalid("non-i64 values in i64 column".into()));
-            }
-            if i64_out.len() as u64 != expected_rows {
+            values.keep_only(&["i64"])?;
+            if values.i64.len() as u64 != expected_rows {
                 return Err(StorageError::DimensionMismatch {
                     expected: format!("{expected_rows} values"),
-                    found: format!("{} values", i64_out.len()),
+                    found: format!("{} values", values.i64.len()),
                 });
             }
-            Arc::new(arrow::array::Int64Array::from(i64_out))
+            Arc::new(arrow::array::Int64Array::from(values.i64))
         }
-        DataType::FixedSizeList(_child, dim) => {
-            if !u32_out.is_empty() {
-                return Err(StorageError::Invalid("u32 values in fsl column".into()));
+        DataType::FixedSizeList(child, dim) => {
+            match child.data_type() {
+                DataType::Float64 => {
+                    values.keep_only(&["f64"])?;
+                    let items_expected = expected_rows * *dim as u64;
+                    if values.f64.len() as u64 != items_expected {
+                        return Err(StorageError::DimensionMismatch {
+                            expected: format!("{items_expected} items"),
+                            found: format!("{} items", values.f64.len()),
+                        });
+                    }
+                    let values = Float64Array::from(values.f64);
+                    // Mirror official-reader behavior: the FSL child field is nullable.
+                    let child = ArrowField::new("item", DataType::Float64, true);
+                    Arc::new(FixedSizeListArray::new(
+                        Arc::new(child),
+                        *dim,
+                        Arc::new(values),
+                        None,
+                    ))
+                }
+                DataType::Float32 => {
+                    values.keep_only(&["f32"])?;
+                    let items_expected = expected_rows * *dim as u64;
+                    if values.f32.len() as u64 != items_expected {
+                        return Err(StorageError::DimensionMismatch {
+                            expected: format!("{items_expected} items"),
+                            found: format!("{} items", values.f32.len()),
+                        });
+                    }
+                    let values = Float32Array::from(values.f32);
+                    let child = ArrowField::new("item", DataType::Float32, true);
+                    Arc::new(FixedSizeListArray::new(
+                        Arc::new(child),
+                        *dim,
+                        Arc::new(values),
+                        None,
+                    ))
+                }
+                other => {
+                    return Err(unsupported(&format!("fsl item type {other:?}")));
+                }
             }
-            let items_expected = expected_rows * *dim as u64;
-            if f64_out.len() as u64 != items_expected {
-                return Err(StorageError::DimensionMismatch {
-                    expected: format!("{items_expected} items"),
-                    found: format!("{} items", f64_out.len()),
-                });
-            }
-            let values = Float64Array::from(f64_out);
-            // Mirror official-reader behavior: the FSL child field is nullable.
-            let child = ArrowField::new("item", DataType::Float64, true);
-            Arc::new(FixedSizeListArray::new(
-                Arc::new(child),
-                *dim,
-                Arc::new(values),
-                None,
-            ))
         }
         other => {
             return Err(unsupported(&format!("column type {other:?}")));

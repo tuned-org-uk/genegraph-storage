@@ -1,8 +1,9 @@
 //! Arrow schema <-> Lance field conversion for the supported type subset.
 //!
-//! Supported: `Float64` ("double"), `UInt32` ("uint32") and
-//! `FixedSizeList<Float64>` ("fixed_size_list:double:N"), all non-nullable
-//! at the top level. Anything else is rejected with
+//! Supported: `Float64` ("double"), `Float32` ("float"), `UInt8` ("uint8"),
+//! `UInt32` ("uint32"), `UInt64` ("uint64"), `Int64` ("int64") and
+//! `FixedSizeList<Float64|Float32>` ("fixed_size_list:double|float:N"), all
+//! non-nullable at the top level. Anything else is rejected with
 //! [`StorageError::UnsupportedFormat`] (never guessed, see #75).
 
 use std::sync::Arc;
@@ -19,11 +20,18 @@ pub(crate) const PLAIN_ENCODING: i32 = 1;
 pub(crate) fn logical_type_name(dt: &DataType) -> StorageResult<String> {
     match dt {
         DataType::Float64 => Ok("double".to_string()),
+        DataType::Float32 => Ok("float".to_string()),
+        DataType::UInt8 => Ok("uint8".to_string()),
         DataType::UInt32 => Ok("uint32".to_string()),
+        DataType::UInt64 => Ok("uint64".to_string()),
         DataType::Int64 => Ok("int64".to_string()),
-        DataType::FixedSizeList(child, n) if matches!(child.data_type(), DataType::Float64) => {
-            Ok(format!("fixed_size_list:double:{n}"))
-        }
+        DataType::FixedSizeList(child, n) => match child.data_type() {
+            DataType::Float64 => Ok(format!("fixed_size_list:double:{n}")),
+            DataType::Float32 => Ok(format!("fixed_size_list:float:{n}")),
+            other => Err(StorageError::UnsupportedFormat(format!(
+                "unsupported fixed_size_list item type for lancefmt: {other:?}"
+            ))),
+        },
         other => Err(StorageError::UnsupportedFormat(format!(
             "unsupported Arrow type for lancefmt: {other:?}"
         ))),
@@ -33,15 +41,24 @@ pub(crate) fn logical_type_name(dt: &DataType) -> StorageResult<String> {
 fn parse_logical_type(name: &str) -> StorageResult<DataType> {
     match name {
         "double" => Ok(DataType::Float64),
+        "float" => Ok(DataType::Float32),
+        "uint8" => Ok(DataType::UInt8),
         "uint32" => Ok(DataType::UInt32),
+        "uint64" => Ok(DataType::UInt64),
         "int64" => Ok(DataType::Int64),
         _ => {
-            if let Some(rest) = name.strip_prefix("fixed_size_list:double:") {
+            let fsl = match name.strip_prefix("fixed_size_list:double:") {
+                Some(rest) => Some((rest, DataType::Float64)),
+                None => name
+                    .strip_prefix("fixed_size_list:float:")
+                    .map(|rest| (rest, DataType::Float32)),
+            };
+            if let Some((rest, item)) = fsl {
                 let dim: i32 = rest.parse().map_err(|_| {
                     StorageError::UnsupportedFormat(format!("bad fixed_size_list dim: {name}"))
                 })?;
                 return Ok(DataType::FixedSizeList(
-                    Arc::new(Field::new("item", DataType::Float64, true)),
+                    Arc::new(Field::new("item", item, true)),
                     dim,
                 ));
             }

@@ -1,6 +1,6 @@
 [package]
 name = "genegraph-storage"
-version = "0.27.0"
+version = "0.28.0"
 edition = "2024"
 description = "vector database: base Lance storage"
 authors = ["Lorenzo <tunedconsulting@gmail.com>"]
@@ -18,7 +18,7 @@ exclude = [
     ".github/*",
     "*.tmp",
     "docs/*",
-    "becnhes/*",
+    "benches/*",
     "examples/*"
 
 ]
@@ -37,7 +37,7 @@ arrow = { version = "^58.0.0" }
 uuid = { version = "1.21.0", features = ["v4", "serde"] }
 futures = "0.3.32"
 url = "2.5.8"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "sync"] }
 parquet = { version = "^58.0.0" }
 prost = "0.14"
 prost-types = "0.14"

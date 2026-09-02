@@ -17,7 +17,19 @@ use std::path::PathBuf;
 
 use crate::StorageError;
 use crate::StorageResult;
+pub use crate::metadata::CollectionKind;
 use crate::metadata::{FileInfo, GeneMetadata};
+
+/// Computed descriptor properties that mirror `FileInfo` fields; user
+/// properties cannot shadow them.
+const RESERVED_PROPERTIES: [&str; 6] = [
+    "filetype",
+    "storage_format",
+    "rows",
+    "cols",
+    "nnz",
+    "size_bytes",
+];
 
 /// Generic Table API-compatible table descriptor.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,8 +40,25 @@ pub struct TableDescriptor {
     pub format: String,
     /// Location of the table root (a `*.lance` dataset directory).
     pub base_location: PathBuf,
-    /// Free-form key/value properties (filetype, shape, ...).
+    /// First-class collection kind (RFC #81-P1): `vector-space`, `graph` or
+    /// `table`.
+    pub kind: CollectionKind,
+    /// Free-form key/value properties (filetype, shape, ...), merged with
+    /// the collection's user properties (RFC #81-P1).
     pub properties: BTreeMap<String, String>,
+}
+
+/// Vector-space descriptor plus its linked graph collection (RFC #81-P4).
+///
+/// A vector space references a graph collection by name through its `graph`
+/// user property; [`Catalog::describe_vector_space`] resolves both in one
+/// call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VectorSpaceDescriptor {
+    /// The vector-space collection itself.
+    pub vectors: TableDescriptor,
+    /// The linked graph collection, if the `graph` property is set.
+    pub graph: Option<TableDescriptor>,
 }
 
 /// Registry of Lance tables backing a storage instance.
@@ -45,6 +74,25 @@ pub trait Catalog {
     fn register_table(&mut self, table: TableDescriptor) -> StorageResult<()>;
     /// Removes `name` from the registry without deleting the dataset.
     fn deregister_table(&mut self, name: &str) -> StorageResult<()>;
+
+    /// Describes a vector-space collection together with the graph
+    /// collection it references through the `graph` user property
+    /// (RFC #81-P4). Fails with [`StorageError::Invalid`] if `name` is not a
+    /// vector-space collection or the linked graph is not registered.
+    fn describe_vector_space(&self, name: &str) -> StorageResult<VectorSpaceDescriptor> {
+        let vectors = self.describe_table(name)?;
+        if vectors.kind != CollectionKind::VectorSpace {
+            return Err(StorageError::Invalid(format!(
+                "collection '{name}' has kind '{}', not a vector space",
+                vectors.kind.as_str()
+            )));
+        }
+        let graph = match vectors.properties.get("graph") {
+            Some(graph_name) => Some(self.describe_table(graph_name)?),
+            None => None,
+        };
+        Ok(VectorSpaceDescriptor { vectors, graph })
+    }
 }
 
 /// [`Catalog`] implementation over the existing JSON metadata registry.
@@ -76,6 +124,10 @@ impl LocalRegistry {
     }
 
     fn descriptor(&self, key: &str, info: &FileInfo) -> TableDescriptor {
+        let kind = info
+            .kind
+            .or_else(|| CollectionKind::for_filetype(&info.filetype))
+            .unwrap_or(CollectionKind::Table);
         let mut properties = BTreeMap::new();
         properties.insert("filetype".to_string(), info.filetype.clone());
         properties.insert("storage_format".to_string(), info.storage_format.clone());
@@ -87,10 +139,17 @@ impl LocalRegistry {
         if let Some(size) = info.size_bytes {
             properties.insert("size_bytes".to_string(), size.to_string());
         }
+        // User properties overlay the computed ones; `kind` is always the
+        // authoritative typed value.
+        for (k, v) in &info.properties {
+            properties.insert(k.clone(), v.clone());
+        }
+        properties.insert("kind".to_string(), kind.as_str().to_string());
         TableDescriptor {
             name: key.to_string(),
             format: "lance".to_string(),
             base_location: self.base.join(&info.filename),
+            kind,
             properties,
         }
     }
@@ -139,7 +198,22 @@ impl Catalog for LocalRegistry {
                 })
                 .transpose()
         };
-        let info = FileInfo::new(
+        // RFC #81-P1: an explicit `kind` property wins; otherwise the typed
+        // `kind` field is authoritative. Unknown kinds are rejected.
+        let kind = match prop("kind") {
+            Some(k) => Some(CollectionKind::parse(&k)?),
+            None => Some(table.kind),
+        };
+        // User properties (everything not computed above) are persisted on
+        // the FileInfo so they survive the descriptor -> registry -> describe
+        // round-trip.
+        let user_properties: BTreeMap<String, String> = table
+            .properties
+            .iter()
+            .filter(|(k, _)| !RESERVED_PROPERTIES.contains(&k.as_str()) && k.as_str() != "kind")
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let mut info = FileInfo::new(
             table
                 .base_location
                 .file_name()
@@ -150,6 +224,8 @@ impl Catalog for LocalRegistry {
             parse("nnz")?,
             None,
         )?;
+        info.kind = kind;
+        info.properties = user_properties;
         self.metadata.files.insert(table.name, info);
         Ok(())
     }

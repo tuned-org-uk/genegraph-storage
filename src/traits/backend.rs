@@ -8,6 +8,7 @@ use sprs::{CsMat, TriMat};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::graph::{GraphEdge, GraphWriteOptions, StoredGraph};
 use crate::metadata::GeneMetadata;
 use crate::{StorageError, StorageResult};
 
@@ -591,4 +592,66 @@ pub trait StorageBackend: Send + Sync {
     /// counterpart of [`Self::load_dense_from_file`]). Parent directories are
     /// created as needed.
     async fn save_dense_to_file(data: &DenseMatrix<f64>, path: &Path) -> StorageResult<()>;
+
+    // =========
+    // NAMED COLLECTIONS (RFC #81)
+    // =========
+
+    /// Saves a schema-driven vector-space collection (RFC #81-P2) without
+    /// user properties; see [`Self::save_vectors_with`].
+    ///
+    /// `save_dense` remains as the fixed-key `f64` wrapper for compat.
+    async fn save_vectors(
+        &self,
+        name: &str,
+        batch: &RecordBatch,
+        md_path: &Path,
+    ) -> StorageResult<()> {
+        self.save_vectors_with(name, batch, &Default::default(), md_path)
+            .await
+    }
+
+    /// Saves a vector-space collection with user properties (e.g. the
+    /// `graph` linkage of RFC #81-P4: `properties.graph = <name>`).
+    async fn save_vectors_with(
+        &self,
+        name: &str,
+        batch: &RecordBatch,
+        properties: &std::collections::BTreeMap<String, String>,
+        md_path: &Path,
+    ) -> StorageResult<()>;
+
+    /// Loads a vector-space collection back as a `RecordBatch` with its
+    /// original schema (including collection metadata).
+    async fn load_vectors(&self, name: &str) -> StorageResult<RecordBatch>;
+
+    /// Saves an edge-list graph collection (RFC #81-P3) with `u32` node ids
+    /// (the default width). Edges above `u32::MAX` surface
+    /// [`StorageError::Overflow`] instead of being truncated.
+    ///
+    /// The collection is either fully weighted (`weight: Float32` column) or
+    /// topology-only (`src`/`dst` only); mixed edges are rejected.
+    async fn save_graph(
+        &self,
+        name: &str,
+        edges: &[GraphEdge],
+        md_path: &Path,
+    ) -> StorageResult<()> {
+        self.save_graph_with(name, edges, &GraphWriteOptions::default(), md_path)
+            .await
+    }
+
+    /// Saves a graph collection with explicit options (node-id width,
+    /// node count, user properties for vector-space linkage, RFC #81-P4).
+    async fn save_graph_with(
+        &self,
+        name: &str,
+        edges: &[GraphEdge],
+        options: &GraphWriteOptions,
+        md_path: &Path,
+    ) -> StorageResult<()>;
+
+    /// Loads a graph collection back as an edge list; convert to CSR at the
+    /// API boundary with [`StoredGraph::to_csr`].
+    async fn load_graph(&self, name: &str) -> StorageResult<StoredGraph>;
 }
