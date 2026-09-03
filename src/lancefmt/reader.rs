@@ -791,6 +791,14 @@ fn concat_pages(pages: Vec<ArrayRef>) -> StorageResult<ArrayRef> {
     Ok(combined.column(0).clone())
 }
 
+/// Metadata-only read of a dataset directory: parses the flat schema
+/// (fields + KV metadata) from the newest manifest without decoding any
+/// column buffers (#109). The result matches `scan_all(...).schema()`.
+pub fn read_schema(dir: &Path) -> StorageResult<ArrowSchema> {
+    let manifest = open_manifest(dir)?;
+    from_lance_fields(&manifest.fields, &manifest.schema_metadata)
+}
+
 /// Full scan of a dataset directory into a single `RecordBatch`.
 pub fn scan_all(dir: &Path) -> StorageResult<RecordBatch> {
     let manifest = open_manifest(dir)?;

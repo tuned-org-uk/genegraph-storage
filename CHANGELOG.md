@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.61.0 (2026-09-03)
+
+Completes the registry-free collections API (#107) and makes the
+metadata-only read path first-class (#109), with an opt-in strict graph
+read mode (#108). A registry-owning consumer (genefold-vd Workstream B)
+can now save and reload scalar collections with no GeneMetadata I/O and
+no hand-written schema metadata, gate on dataset kind/stamps without a
+full columnar scan, and detect the unstamped-`num_nodes` hazard at the
+API instead of silently resizing.
+
+**Added**
+
+- `save_scalars_to_path` / `load_scalars_from_path` (#107): registry-free
+  scalar collection I/O mirroring the reader's exact contract. A single
+  non-nullable `Float64` column (neutral default name `lambda`), dataset
+  stamped `kind = vector-space`, parent dirs created, no `GeneMetadata`
+  read or write. `load_scalars` now delegates to the path-based reader.
+- `lancefmt::read_schema` (#109): metadata-only dataset read that parses
+  the flat schema (fields + KV metadata) from the newest manifest without
+  decoding any column buffers; matches `scan_all(...).schema()`. Surfaced
+  on the backend as `collection_schema_from_path` / `collection_schema`.
+- Strict graph read mode (#108): `GraphReadOptions` with a `strict` flag,
+  plus `load_graph_from_path_with_options` and the
+  `load_graph_from_path_strict` convenience variant. Strict mode rejects
+  datasets without a `num_nodes` stamp with a typed `StorageError::Invalid`
+  (instead of silently resizing to `max_id + 1`) and validates the
+  `src`/`dst`/`weight` column names, positively identifying pre-collections
+  triplet artifacts (`row`/`col`/`value`) rather than positionally coercing
+  them. The tolerant default is unchanged (the compat shim).
+
+**Changed**
+
+- `load_scalars` is now a thin delegate over `load_scalars_from_path`;
+  the kind gate and single-column/`Float64|Float32` validation are shared.
+- **Breaking**: `StorageBackend` gains the required registry-free methods
+  `save_scalars_to_path`, `load_scalars_from_path`,
+  `load_graph_from_path_with_options`, `load_graph_from_path_strict` and
+  `collection_schema_from_path` (four of which have no default
+  implementation), so external implementors of the trait must add them.
+  `collection_schema` is provided with a default implementation.
+
+Refs: #107, #108, #109, Genefold/genefold-vd#46.
+
 ## 0.60.0 (2026-09-03)
 
 First catalog-complete release line (#106): the catalog contract

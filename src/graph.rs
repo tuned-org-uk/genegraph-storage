@@ -192,6 +192,32 @@ impl GraphWriteOptions {
     }
 }
 
+/// Options for the graph read path (#108).
+///
+/// The tolerant default is the compat shim: an unstamped dataset loads with
+/// `num_nodes = max_id + 1` and columns are read positionally (name-agnostic),
+/// so pre-collections triplet artifacts still load. Strict mode makes the
+/// hazard detectable at the API instead of silently resizing.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GraphReadOptions {
+    /// When `true`, reject datasets without a `num_nodes` stamp with a typed
+    /// [`StorageError::Invalid`] instead of silently resizing to `max_id + 1`
+    /// (a graph whose trailing vertices are isolated would otherwise load
+    /// with a smaller node count than was written). Also validates the
+    /// `src`/`dst`/`weight` column names, positively identifying
+    /// pre-collections triplet artifacts (`row`/`col`/`value`) rather than
+    /// positionally coercing them.
+    pub strict: bool,
+}
+
+impl GraphReadOptions {
+    /// Strict read mode: reject unstamped `num_nodes` and validate column
+    /// names (#108).
+    pub fn strict() -> Self {
+        Self { strict: true }
+    }
+}
+
 /// A graph collection loaded back from storage (RFC #81-P3).
 #[derive(Debug, Clone, PartialEq)]
 pub struct StoredGraph {

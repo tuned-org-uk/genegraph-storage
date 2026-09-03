@@ -11,7 +11,8 @@ use log::{debug, info};
 
 use crate::catalog::RESERVED_PROPERTIES;
 use crate::graph::{
-    GraphEdge, GraphWriteOptions, NodeIdWidth, RESERVED_METADATA_KEYS, StoredGraph, WeightType,
+    GraphEdge, GraphReadOptions, GraphWriteOptions, NodeIdWidth, RESERVED_METADATA_KEYS,
+    StoredGraph, WeightType,
 };
 use crate::metadata::FileInfo;
 use crate::traits::backend::StorageBackend;
@@ -296,8 +297,16 @@ pub(crate) fn graph_record_batch(
 /// counterpart of [`graph_record_batch`], shared by `load_graph` and the
 /// registry-free `load_graph_from_path`): shared src/dst width, a
 /// `Float32|Float64` weight column (#106), lossless f32 upcasting, and
-/// the node count from dataset metadata.
-pub(crate) fn stored_graph_from_batch(batch: RecordBatch) -> StorageResult<StoredGraph> {
+/// the node count from dataset metadata. In strict mode (#108), a dataset
+/// without a `num_nodes` stamp is rejected with a typed
+/// [`StorageError::Invalid`] instead of silently resizing to `max_id + 1`,
+/// and the `src`/`dst`/`weight` column names are validated so
+/// pre-collections triplet artifacts (`row`/`col`/`value`) are positively
+/// identified rather than positionally coerced.
+pub(crate) fn stored_graph_from_batch_with_options(
+    batch: RecordBatch,
+    options: &GraphReadOptions,
+) -> StorageResult<StoredGraph> {
     let schema = batch.schema();
     let n_cols = schema.fields().len();
     if !(2..=3).contains(&n_cols) {
@@ -305,6 +314,22 @@ pub(crate) fn stored_graph_from_batch(batch: RecordBatch) -> StorageResult<Store
             "graph edge-list schema expects src/dst (and optionally weight) columns, \
              found {n_cols}"
         )));
+    }
+    // Strict column-name validation (#108): the canonical graph collection
+    // names its columns src/dst/weight; a pre-collections triplet artifact
+    // (row/col/value) is positively identified and rejected rather than
+    // positionally coerced.
+    if options.strict {
+        let expected = ["src", "dst", "weight"];
+        for (i, want) in expected.iter().enumerate().take(n_cols) {
+            if schema.field(i).name() != *want {
+                return Err(StorageError::Invalid(format!(
+                    "strict graph read: column {i} is named '{}', expected '{want}' \
+                     (a pre-collections triplet artifact?)",
+                    schema.field(i).name()
+                )));
+            }
+        }
     }
     let width = match (schema.field(0).data_type(), schema.field(1).data_type()) {
         (DataType::UInt32, DataType::UInt32) => NodeIdWidth::U32,
@@ -394,11 +419,22 @@ pub(crate) fn stored_graph_from_batch(batch: RecordBatch) -> StorageResult<Store
         .map(|(s, d)| (*s).max(*d))
         .max()
         .unwrap_or(0);
-    let num_nodes = schema
+    let stamped_num_nodes = schema
         .metadata()
         .get("num_nodes")
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(max_id + 1);
+        .and_then(|v| v.parse::<u64>().ok());
+    // Strict mode (#108): an unstamped dataset is rejected instead of
+    // silently resizing to max_id + 1 — a graph whose trailing vertices are
+    // isolated (degree-0 laplacian rows store no entries) would otherwise
+    // load with a smaller node count than was written.
+    if options.strict && stamped_num_nodes.is_none() {
+        return Err(StorageError::Invalid(format!(
+            "strict graph read: dataset has no 'num_nodes' stamp; refusing to \
+             silently resize to max_id + 1 = {}",
+            max_id + 1
+        )));
+    }
+    let num_nodes = stamped_num_nodes.unwrap_or(max_id + 1);
     let edges: Vec<GraphEdge> = match &weights {
         Some(weights) => src
             .iter()

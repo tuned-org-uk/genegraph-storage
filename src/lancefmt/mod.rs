@@ -35,5 +35,5 @@ mod reader;
 mod schema;
 mod writer;
 
-pub use reader::scan_all;
+pub use reader::{read_schema, scan_all};
 pub use writer::write_dataset;

@@ -1303,6 +1303,298 @@ async fn scalar_collections_load_via_load_scalars() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// #107: registry-free scalar collections
+// ---------------------------------------------------------------------------
+
+/// The #107 acceptance: a consumer whose metadata path holds its own
+/// metadata document saves and reloads a scalar collection (single Float64
+/// column, e.g. lambdas/norms) with no GeneMetadata read or write and no
+/// hand-written schema metadata. `load_scalars` delegates to the path-based
+/// reader.
+#[tokio::test(flavor = "multi_thread")]
+async fn registry_free_scalar_collections_roundtrip() {
+    let base = tmp_dir("registry_free_scalars").await;
+    let storage =
+        LanceStorageGraph::new(base.to_string_lossy().to_string(), "app_owned".to_string());
+
+    // the consumer's own single commit pointer at the instance metadata path
+    let app_metadata = r#"{"commit_pointer":"app__g7","format":"arrowspace"}"#;
+    tokio::fs::write(storage.metadata_path(), app_metadata)
+        .await
+        .unwrap();
+
+    let values: Vec<f64> = vec![0.0, 1.5, -2.25, f64::MIN_POSITIVE, 1.0e-300, 0.1];
+    let path = storage.file_path("lambdas");
+    storage
+        .save_scalars_to_path(&path, &values)
+        .await
+        .expect("save_scalars_to_path");
+
+    // path-based reader round-trips exact values
+    let loaded = storage
+        .load_scalars_from_path(&path)
+        .await
+        .expect("load_scalars_from_path");
+    assert_eq!(loaded.len(), values.len());
+    for (got, want) in loaded.iter().zip(values.iter()) {
+        assert_eq!(got.to_bits(), want.to_bits());
+    }
+
+    // the name-based reader delegates to the path-based one
+    let via_name = storage.load_scalars("lambdas").await.expect("load_scalars");
+    assert_eq!(via_name, loaded);
+
+    // the stamped dataset kind is vector-space, so the kind gate passes
+    let schema = crate::lancefmt::read_schema(&path).unwrap();
+    assert_eq!(
+        schema.metadata().get("kind").map(String::as_str),
+        Some("vector-space")
+    );
+
+    // the consumer's metadata document is byte-identical: no write occurred,
+    // and (being unreadable as GeneMetadata) no read occurred either
+    let after = tokio::fs::read_to_string(storage.metadata_path())
+        .await
+        .unwrap();
+    assert_eq!(after, app_metadata);
+}
+
+/// #107: empty scalar collections are rejected (mirrors the vector/graph
+/// writers), and the kind gate on the path-based reader is identical to
+/// `load_scalars` — a foreign one-column artifact is rejected.
+#[tokio::test(flavor = "multi_thread")]
+async fn registry_free_scalars_reject_empty_and_foreign() {
+    let base = tmp_dir("registry_free_scalars_invalid").await;
+    let storage =
+        LanceStorageGraph::new(base.to_string_lossy().to_string(), "app_owned".to_string());
+
+    // empty values are rejected
+    let err = storage
+        .save_scalars_to_path(&storage.file_path("empty"), &[])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, crate::StorageError::Invalid(_)),
+        "got {err:?}"
+    );
+
+    // a foreign one-column artifact (no kind stamp) is rejected by the
+    // path-based reader, same gate as load_scalars
+    let bare = {
+        let schema = Schema::new(vec![Field::new("value", DataType::Float64, false)]);
+        RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(Float64Array::from(vec![1.0, 2.0])) as _],
+        )
+        .unwrap()
+    };
+    crate::lancefmt::write_dataset(&bare, &storage.file_path("foreign")).unwrap();
+    let err = storage
+        .load_scalars_from_path(&storage.file_path("foreign"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, crate::StorageError::Invalid(_)),
+        "got {err:?}"
+    );
+    assert!(
+        err.to_string().contains("kind"),
+        "the rejection must name the kind mismatch: {err}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #108: strict graph read mode
+// ---------------------------------------------------------------------------
+
+/// #108: the tolerant default (compat shim) loads an unstamped dataset with
+/// `num_nodes = max_id + 1`; strict mode rejects it with a typed error
+/// instead of silently resizing. A CSR with trailing isolated rows saved
+/// unstamped (raw writer) loads exact under tolerant mode or fails under
+/// strict — never silently resized when strict.
+#[tokio::test(flavor = "multi_thread")]
+async fn strict_graph_read_rejects_unstamped_num_nodes() {
+    let (_base, storage) = seeded_storage("strict_graph").await;
+
+    // a graph whose trailing vertices are isolated: edges only touch ids
+    // 0..3, but the true node count is 5 (ids 3 and 4 are isolated). Saved
+    // unstamped via the raw writer, so no num_nodes metadata exists.
+    let schema = Schema::new(vec![
+        Field::new("src", DataType::UInt32, false),
+        Field::new("dst", DataType::UInt32, false),
+    ]);
+    let batch = RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(UInt32Array::from(vec![0u32, 1, 2])) as _,
+            Arc::new(UInt32Array::from(vec![1u32, 2, 0])) as _,
+        ],
+    )
+    .unwrap();
+    crate::lancefmt::write_dataset(&batch, &storage.file_path("unstamped")).unwrap();
+
+    // tolerant default: loads with num_nodes = max_id + 1 = 3 (the silent
+    // resize the strict mode exists to make detectable)
+    let tolerant = storage
+        .load_graph_from_path(&storage.file_path("unstamped"))
+        .await
+        .expect("tolerant load of unstamped dataset");
+    assert_eq!(tolerant.num_nodes, 3);
+
+    // strict: rejects the unstamped dataset with a typed error
+    let err = storage
+        .load_graph_from_path_strict(&storage.file_path("unstamped"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, crate::StorageError::Invalid(_)),
+        "got {err:?}"
+    );
+    assert!(
+        err.to_string().contains("num_nodes"),
+        "the strict rejection must name the missing stamp: {err}"
+    );
+}
+
+/// #108: strict mode also validates column names — a pre-collections triplet
+/// artifact (`row`/`col`/`value`) is positively identified and rejected
+/// rather than positionally coerced into a graph collection.
+#[tokio::test(flavor = "multi_thread")]
+async fn strict_graph_read_rejects_triplet_column_names() {
+    let (_base, storage) = seeded_storage("strict_graph_triplet").await;
+
+    // a pre-collections triplet artifact (row/col/value), stamped with a
+    // num_nodes so only the column-name check is exercised
+    let schema = Schema::new(vec![
+        Field::new("row", DataType::UInt32, false),
+        Field::new("col", DataType::UInt32, false),
+        Field::new("value", DataType::Float64, false),
+    ]);
+    let batch = RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(UInt32Array::from(vec![0u32, 1])) as _,
+            Arc::new(UInt32Array::from(vec![1u32, 2])) as _,
+            Arc::new(Float64Array::from(vec![1.0, 1.0])) as _,
+        ],
+    )
+    .unwrap();
+    crate::lancefmt::write_dataset(&batch, &storage.file_path("triplet")).unwrap();
+
+    // tolerant default: position-based, name-agnostic — loads as a graph
+    let tolerant = storage
+        .load_graph_from_path(&storage.file_path("triplet"))
+        .await
+        .expect("tolerant load of triplet artifact");
+    assert_eq!(tolerant.edges.len(), 2);
+
+    // strict: the column names are not src/dst/weight, so it is rejected
+    let err = storage
+        .load_graph_from_path_strict(&storage.file_path("triplet"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, crate::StorageError::Invalid(_)),
+        "got {err:?}"
+    );
+}
+
+/// #108: a properly stamped graph (written through `save_graph*`) loads
+/// identically under tolerant and strict modes — strictness only rejects
+/// the hazard, never the well-formed artifact.
+#[tokio::test(flavor = "multi_thread")]
+async fn strict_graph_read_accepts_stamped_graph() {
+    let (_base, storage) = seeded_storage("strict_graph_stamped").await;
+    let md_path = storage.metadata_path();
+
+    let edges = generated_graph(5, 9, 7, true);
+    storage
+        .save_graph("g", &edges, &md_path)
+        .await
+        .expect("save_graph");
+
+    let tolerant = storage
+        .load_graph_from_path(&storage.file_path("g"))
+        .await
+        .expect("tolerant load");
+    let strict = storage
+        .load_graph_from_path_strict(&storage.file_path("g"))
+        .await
+        .expect("strict load of a stamped graph");
+    assert_eq!(tolerant, strict);
+    assert_eq!(strict.num_nodes, 5);
+}
+
+// ---------------------------------------------------------------------------
+// #109: lancefmt metadata-only read_schema
+// ---------------------------------------------------------------------------
+
+/// #109: `read_schema` on a dataset written by `write_dataset` returns the
+/// same schema (fields + metadata) as `scan_all(...).schema()`, with no
+/// column data parsed.
+#[tokio::test(flavor = "multi_thread")]
+async fn read_schema_matches_scan_all_without_decoding() {
+    let (_base, storage) = seeded_storage("read_schema").await;
+    let md_path = storage.metadata_path();
+
+    let edges = generated_graph(5, 9, 7, true);
+    storage
+        .save_graph("g", &edges, &md_path)
+        .await
+        .expect("save_graph");
+
+    let path = storage.file_path("g");
+    let schema = crate::lancefmt::read_schema(&path).expect("read_schema");
+    let scanned = crate::lancefmt::scan_all(&path).expect("scan_all");
+    assert_eq!(schema, *scanned.schema());
+    assert_eq!(
+        schema.metadata().get("kind").map(String::as_str),
+        Some("graph")
+    );
+    assert_eq!(
+        schema.metadata().get("num_nodes").map(String::as_str),
+        Some("5")
+    );
+    assert_eq!(schema.fields().len(), 3);
+}
+
+/// #109: missing/malformed datasets surface a typed `StorageError` (no
+/// panic), matching `scan_all`'s taxonomy.
+#[tokio::test(flavor = "multi_thread")]
+async fn read_schema_errors_on_missing_dataset() {
+    let base = tmp_dir("read_schema_missing").await;
+    let err = crate::lancefmt::read_schema(&base.join("nope")).unwrap_err();
+    assert!(matches!(err, crate::StorageError::Io(_)), "got {err:?}");
+}
+
+/// #109: the backend surfaces the metadata-only schema read so consumers
+/// don't drop to `lancefmt` directly.
+#[tokio::test(flavor = "multi_thread")]
+async fn collection_schema_surfaces_on_backend() {
+    let (_base, storage) = seeded_storage("collection_schema").await;
+    let md_path = storage.metadata_path();
+
+    let edges = generated_graph(5, 9, 7, true);
+    storage
+        .save_graph("g", &edges, &md_path)
+        .await
+        .expect("save_graph");
+
+    let schema = storage
+        .collection_schema("g")
+        .await
+        .expect("collection_schema");
+    assert_eq!(
+        schema.metadata().get("kind").map(String::as_str),
+        Some("graph")
+    );
+    assert_eq!(
+        schema.metadata().get("num_nodes").map(String::as_str),
+        Some("5")
+    );
+}
+
 /// Review PR #96 finding 4: a `kind` property that contradicts the typed
 /// `kind` field is rejected instead of silently overriding it.
 #[tokio::test(flavor = "multi_thread")]

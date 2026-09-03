@@ -6,22 +6,23 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use arrow::array::{Array as ArrowArray, Float32Array, Float64Array, UInt32Array};
-use arrow::datatypes::{DataType, Float64Type, Int64Type, UInt32Type};
+use arrow::array::{Array as ArrowArray, ArrayRef, Float32Array, Float64Array, UInt32Array};
+use arrow::datatypes::{DataType, Field, Float64Type, Int64Type, Schema, UInt32Type};
 use arrow::record_batch::RecordBatch;
 use log::{debug, info};
 use smartcore::linalg::basic::arrays::Array;
 use smartcore::linalg::basic::matrix::DenseMatrix;
 use sprs::CsMat;
 
-use crate::graph::{GraphEdge, GraphWriteOptions, StoredGraph};
+use crate::graph::{GraphEdge, GraphReadOptions, GraphWriteOptions, StoredGraph};
 use crate::metadata::FileInfo;
 use crate::metadata::GeneMetadata;
 use crate::traits::backend::StorageBackend;
 use crate::traits::lance::{
-    LanceStorage, graph_record_batch, stored_graph_from_batch, validate_vector_space_schema,
-    vector_space_collection_batch,
+    LanceStorage, graph_record_batch, stored_graph_from_batch_with_options,
+    validate_vector_space_schema, vector_space_collection_batch,
 };
 use crate::{StorageError, StorageResult};
 
@@ -1128,10 +1129,22 @@ impl StorageBackend for LanceStorageGraph {
     }
 
     async fn load_graph_from_path(&self, path: &Path) -> StorageResult<StoredGraph> {
-        info!("Loading graph collection from {:?} (registry-free)", path);
+        self.load_graph_from_path_with_options(path, &GraphReadOptions::default())
+            .await
+    }
+
+    async fn load_graph_from_path_with_options(
+        &self,
+        path: &Path,
+        options: &GraphReadOptions,
+    ) -> StorageResult<StoredGraph> {
+        info!(
+            "Loading graph collection from {:?} (registry-free, strict={})",
+            path, options.strict
+        );
         let uri = Self::path_to_uri(path)?;
         let batch = self.read_lance_all_batches_async(uri).await?;
-        let graph = stored_graph_from_batch(batch)?;
+        let graph = stored_graph_from_batch_with_options(batch, options)?;
         info!(
             "Loaded graph collection: {} edges, {} nodes, width {:?}, weight width {:?} (registry-free)",
             graph.edges.len(),
@@ -1142,10 +1155,50 @@ impl StorageBackend for LanceStorageGraph {
         Ok(graph)
     }
 
+    async fn load_graph_from_path_strict(&self, path: &Path) -> StorageResult<StoredGraph> {
+        self.load_graph_from_path_with_options(path, &GraphReadOptions::strict())
+            .await
+    }
+
     async fn load_scalars(&self, name: &str) -> StorageResult<Vec<f64>> {
-        let path = self.file_path(name);
-        info!("Loading scalar collection '{}' from {:?}", name, path);
-        let uri = Self::path_to_uri(&path)?;
+        self.load_scalars_from_path(&self.file_path(name)).await
+    }
+
+    async fn save_scalars_to_path(&self, path: &Path, values: &[f64]) -> StorageResult<()> {
+        if values.is_empty() {
+            return Err(StorageError::Invalid(
+                "empty scalar collections are not supported".into(),
+            ));
+        }
+        ensure_parent_dir(path).await?;
+        info!(
+            "Saving scalar collection ({} values) at {:?} (registry-free)",
+            values.len(),
+            path
+        );
+        // Dataset-level kind (RFC #81-P1): scalar artifacts are
+        // vector-space collections, mirroring the registry-level
+        // `CollectionKind::for_filetype("vector")` shim, so logical-kind
+        // readers (`load_scalars`) can enforce the kind (#106 review). The
+        // column name is the neutral default `lambda`.
+        let schema =
+            Schema::new(vec![Field::new("lambda", DataType::Float64, false)]).with_metadata(
+                std::collections::HashMap::from([("kind".to_string(), "vector-space".to_string())]),
+            );
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(Float64Array::from(values.to_vec())) as ArrayRef],
+        )
+        .map_err(|e| StorageError::Lance(e.to_string()))?;
+        let uri = Self::path_to_uri(path)?;
+        self.write_lance_batch_async(uri, batch).await?;
+        info!("Scalar collection saved successfully (registry-free)");
+        Ok(())
+    }
+
+    async fn load_scalars_from_path(&self, path: &Path) -> StorageResult<Vec<f64>> {
+        info!("Loading scalar collection from {:?} (registry-free)", path);
+        let uri = Self::path_to_uri(path)?;
         let batch = self.read_lance_all_batches_async(uri).await?;
 
         let schema = batch.schema();
@@ -1157,7 +1210,7 @@ impl StorageBackend for LanceStorageGraph {
             Some("vector-space") => {}
             other => {
                 return Err(StorageError::Invalid(format!(
-                    "scalar collection '{name}' has dataset kind {other:?}, \
+                    "scalar collection at {path:?} has dataset kind {other:?}, \
                      expected 'vector-space'"
                 )));
             }
@@ -1203,7 +1256,15 @@ impl StorageBackend for LanceStorageGraph {
                 )));
             }
         };
-        info!("Loaded {} scalar values for '{}'", values.len(), name);
+        info!("Loaded {} scalar values (registry-free)", values.len());
         Ok(values)
+    }
+
+    async fn collection_schema_from_path(&self, path: &Path) -> StorageResult<Schema> {
+        info!("Reading collection schema from {:?} (registry-free)", path);
+        let path = path.to_path_buf();
+        tokio::task::spawn_blocking(move || crate::lancefmt::read_schema(&path))
+            .await
+            .map_err(|e| StorageError::Io(format!("lancefmt read_schema task failed: {e}")))?
     }
 }
