@@ -8,7 +8,7 @@ pub mod lancefmt;
 pub mod metadata;
 pub mod traits;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests;
 
 use std::fmt;

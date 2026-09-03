@@ -9,10 +9,14 @@ use std::sync::mpsc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
+#[cfg(unix)]
+
 use crate::commit::{
     lock_file_for_metadata, try_with_file_lock, try_with_metadata_file_lock, with_commit_actor,
     with_file_lock, with_metadata_file_lock,
 };
+
+#[cfg(unix)]
 use crate::generations::write_json_atomic;
 use crate::StorageError;
 
@@ -72,6 +76,7 @@ async fn commit_actor_serializes_concurrent_read_modify_write_cycles() {
 /// The blessed cross-process convention: `{metadata-stem}.lock` next to the
 /// metadata file.
 #[test]
+#[cfg(unix)]
 fn lock_file_convention_is_stem_dot_lock() {
     assert_eq!(
         lock_file_for_metadata(Path::new("/base/ds__g1_metadata.json")),
@@ -90,6 +95,7 @@ fn lock_file_convention_is_stem_dot_lock() {
 /// concurrent cycles on the same metadata file serialize (both increments
 /// land).
 #[tokio::test(flavor = "multi_thread")]
+#[cfg(unix)]
 async fn metadata_file_lock_holds_flock_across_the_actor_cycle() {
     let base = tmp_dir("composed_lock_cycle").await;
     let md = base.join("ds__g1_metadata.json");
@@ -150,6 +156,7 @@ async fn metadata_file_lock_holds_flock_across_the_actor_cycle() {
 /// Two concurrent composed cycles on the same metadata file serialize end
 /// to end — flock first, then actor — so both increments land.
 #[tokio::test(flavor = "multi_thread")]
+#[cfg(unix)]
 async fn metadata_file_lock_serializes_concurrent_cycles() {
     let base = tmp_dir("composed_lock_concurrent").await;
     let md = base.join("ds__g1_metadata.json");
@@ -185,6 +192,7 @@ use std::path::Path;
 /// file description, exactly what another process would see) is excluded
 /// until the first releases, and the lock file is created on demand.
 #[test]
+#[cfg(unix)]
 fn file_lock_excludes_second_holder_until_released() {
     let base = tokio::runtime::Builder::new_current_thread()
         .build()
@@ -253,6 +261,7 @@ fn file_lock_excludes_second_holder_until_released() {
 /// The lock file's parent directory is created on demand, so a consumer can
 /// take the lock before creating the dataset directory itself.
 #[test]
+#[cfg(unix)]
 fn file_lock_creates_missing_parent_dirs() {
     let base = tokio::runtime::Builder::new_current_thread()
         .build()
@@ -272,6 +281,7 @@ fn file_lock_creates_missing_parent_dirs() {
 /// lock on completion (a subsequent try acquires again), and the lock file
 /// stays in place as the rendezvous point.
 #[tokio::test(flavor = "multi_thread")]
+#[cfg(unix)]
 async fn try_file_lock_runs_closure_uncontended_and_releases() {
     let base = tmp_dir("try_file_lock_uncontended").await;
     let lock = base.join("ds__g1_metadata.lock");
@@ -290,6 +300,7 @@ async fn try_file_lock_runs_closure_uncontended_and_releases() {
 /// distinctly matchable `LockWouldBlock` naming the lock file, instead of
 /// parking on the blocking pool.
 #[tokio::test(flavor = "multi_thread")]
+#[cfg(unix)]
 async fn try_file_lock_fails_fast_naming_lock_file_while_held() {
     let base = tmp_dir("try_file_lock_contended").await;
     let lock = base.join("ds__g1_metadata.lock");
@@ -340,6 +351,7 @@ async fn try_file_lock_fails_fast_naming_lock_file_while_held() {
 /// convention and fails fast, naming the derived lock file, when another
 /// holder has it; uncontended it runs the whole actor cycle.
 #[tokio::test(flavor = "multi_thread")]
+#[cfg(unix)]
 async fn try_metadata_file_lock_fails_fast_then_runs_cycle_uncontended() {
     let base = tmp_dir("try_composed_lock").await;
     let md = base.join("ds__g1_metadata.json");
