@@ -712,4 +712,62 @@ pub trait StorageBackend: Send + Sync {
     /// validity), making every `kind=vector-space` collection uniformly
     /// loadable instead of requiring the legacy fixed-key readers.
     async fn load_scalars(&self, name: &str) -> StorageResult<Vec<f64>>;
+
+    // =========
+    // #107: registry-free scalar collections
+    // =========
+
+    /// Saves a scalar collection — a single non-nullable `Float64` column
+    /// (e.g. lambdas or norms) — at an explicit `path` without touching the
+    /// metadata registry (#107): the dataset is stamped `kind=vector-space`
+    /// and parent directories are created as needed. Registry ownership
+    /// stays with the caller; no `GeneMetadata` read or write occurs. The
+    /// counterpart of [`Self::save_vectors_to_path`] for scalar-only
+    /// collections (which `save_vectors_to_path` cannot write, as its
+    /// schema validation requires a `FixedSizeList` column).
+    async fn save_scalars_to_path(&self, path: &Path, values: &[f64]) -> StorageResult<()>;
+
+    /// Loads a scalar collection from an explicit `path` (registry-free):
+    /// the path-based counterpart of [`Self::load_scalars`], with the same
+    /// kind gate. `load_scalars` delegates to this.
+    async fn load_scalars_from_path(&self, path: &Path) -> StorageResult<Vec<f64>>;
+
+    // =========
+    // #108: strict graph read mode
+    // =========
+
+    /// Loads a graph collection from an explicit `path` with read options
+    /// (#108): strict mode rejects datasets without a `num_nodes` stamp
+    /// (and, optionally, validates column names) instead of silently
+    /// resizing to `max_id + 1`. The tolerant default is the compat shim.
+    async fn load_graph_from_path_with_options(
+        &self,
+        path: &Path,
+        options: &crate::graph::GraphReadOptions,
+    ) -> StorageResult<StoredGraph>;
+
+    /// Strict variant of [`Self::load_graph_from_path`] (#108): rejects
+    /// datasets without a `num_nodes` stamp with a typed
+    /// [`StorageError::Invalid`] and validates the `src`/`dst`/`weight`
+    /// column names, so pre-collections triplet artifacts are positively
+    /// identified rather than positionally coerced.
+    async fn load_graph_from_path_strict(&self, path: &Path) -> StorageResult<StoredGraph>;
+
+    // =========
+    // #109: metadata-only schema read
+    // =========
+
+    /// Reads the dataset schema (fields + KV metadata) of a collection at
+    /// an explicit `path` without decoding any column buffers (#109): the
+    /// backend surface of [`crate::lancefmt::read_schema`], so consumers
+    /// doing kind/stamp gating don't pay a full columnar scan.
+    async fn collection_schema_from_path(&self, path: &Path) -> StorageResult<Schema>;
+
+    /// Reads the dataset schema of a named collection (registry-free,
+    /// path-resolved): the name-based counterpart of
+    /// [`Self::collection_schema_from_path`].
+    async fn collection_schema(&self, name: &str) -> StorageResult<Schema> {
+        self.collection_schema_from_path(&self.file_path(name))
+            .await
+    }
 }
