@@ -10,6 +10,12 @@
 //! (`try_with_file_lock`, `try_with_metadata_file_lock`) and the
 //! distinctly matchable `StorageError::LockWouldBlock`.
 //!
+//! #106 extends it with the registry-free collection I/O surface
+//! (`save_vectors_to_path`, `load_vectors_from_path`,
+//! `save_graph_to_path`, `load_graph_from_path`, `load_scalars`,
+//! `GraphWriteOptions::weight_type` / `WeightType`), exercised against a
+//! consumer directory whose metadata path holds a foreign commit pointer.
+//!
 //! Run with `cargo test --release --test api_public`.
 
 use std::path::PathBuf;
@@ -187,6 +193,103 @@ async fn downstream_try_lock_cycle_maps_contention_to_lock_would_block() {
         std::fs::read_to_string(&metadata_path).unwrap(),
         r#"{"count":1}"#,
         "the uncontended try cycle must publish its RMW"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #106: the registry-free collection I/O surface is reachable from
+/// downstream. A consumer whose instance metadata path holds its own
+/// commit pointer (an ArrowSpaceMetadata-style document, not a
+/// GeneMetadata registry) saves and loads graph and vector-space
+/// collections with no GeneMetadata read or write — the collections
+/// adoption acceptance, exercised from outside the crate.
+#[tokio::test]
+async fn downstream_registry_free_collection_io() {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use arrow::array::{FixedSizeListArray, Float64Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+
+    use genegraph_storage::graph::{GraphEdge, GraphWriteOptions, WeightType};
+    use genegraph_storage::lance_storage_graph::LanceStorageGraph;
+    use genegraph_storage::traits::backend::StorageBackend;
+
+    let dir = scratch_dir("collections");
+    let storage =
+        LanceStorageGraph::new(dir.to_string_lossy().to_string(), "app_owned".to_string());
+
+    // the consumer's own single commit pointer at the instance metadata
+    // path: any GeneMetadata read of it fails, so a successful cycle
+    // proves none occurred
+    let app_metadata = r#"{"commit_pointer":"app__g7","format":"arrowspace"}"#;
+    std::fs::write(storage.metadata_path(), app_metadata).unwrap();
+
+    // registry-free graph write + read: f64 weights round-trip exactly
+    // (the default width, like the sparse-matrix value column)
+    let edges = vec![
+        GraphEdge::weighted(0, 1, 0.123_456_789_012_345),
+        GraphEdge::weighted(1, 2, -0.999_999_999_999_999),
+    ];
+    let options = GraphWriteOptions {
+        weight_type: WeightType::F64,
+        ..Default::default()
+    };
+    let graph_path = storage.file_path("adj");
+    storage
+        .save_graph_to_path(&graph_path, &edges, &options)
+        .await
+        .unwrap();
+    let graph = storage.load_graph_from_path(&graph_path).await.unwrap();
+    assert_eq!(graph.weight_type, WeightType::F64);
+    assert_eq!(graph.edges, edges);
+    assert_eq!(
+        graph.edges[0].weight.unwrap().to_bits(),
+        0.123_456_789_012_345_f64.to_bits(),
+        "full-precision weights must round-trip bit-identically"
+    );
+
+    // registry-free vector-space write + read, user properties stamped
+    let child = Arc::new(Field::new("item", DataType::Float64, false));
+    let schema = Schema::new(vec![Field::new(
+        "vector",
+        DataType::FixedSizeList(child.clone(), 2),
+        false,
+    )]);
+    let list = FixedSizeListArray::new(
+        child,
+        2,
+        Arc::new(Float64Array::from(vec![0.5, 1.5, -2.5, 3.0])),
+        None,
+    );
+    let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(list) as _]).unwrap();
+    let vecs_path = storage.file_path("vecs");
+    storage
+        .save_vectors_to_path(
+            &vecs_path,
+            &batch,
+            &BTreeMap::from([("graph".to_string(), "adj".to_string())]),
+        )
+        .await
+        .unwrap();
+    let loaded = storage.load_vectors_from_path(&vecs_path).await.unwrap();
+    assert_eq!(loaded.num_rows(), 2);
+    assert_eq!(
+        loaded.schema().metadata().get("kind").map(String::as_str),
+        Some("vector-space")
+    );
+    assert_eq!(
+        loaded.schema().metadata().get("graph").map(String::as_str),
+        Some("adj")
+    );
+
+    // the consumer's metadata document is byte-identical: no write occurred
+    assert_eq!(
+        std::fs::read_to_string(storage.metadata_path()).unwrap(),
+        app_metadata,
+        "the consumer-owned metadata document must never be rewritten"
     );
 
     let _ = std::fs::remove_dir_all(&dir);

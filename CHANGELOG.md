@@ -1,5 +1,54 @@
 # Changelog
 
+## 0.53.0 (2026-09-03)
+
+Collections adoption blockers for genefold-vd Workstream B (#106,
+follow-up to the RFC #81 collection API).
+
+**Added**
+
+- Schema-declared graph weight widths (#106): `GraphWriteOptions::weight_type`
+  (`WeightType::{F64, F32}`) mirrors `NodeIdWidth`. The default `f64`
+  width matches the legacy sparse-matrix `value` column — an f64 CSR
+  (laplacian, adjacency) round-trips bit-identically through
+  `save_graph`, exactly like through `save_sparse`. The explicit `f32`
+  width halves the storage bytes for memory-bound consumers but rejects
+  weights that cannot be stored exactly (`Invalid` with guidance towards
+  `WeightType::F64`; out-of-range values surface `Overflow`) instead of
+  silently narrowing them — the #51 invariant, float edition. `GraphEdge`
+  weights are `f64` at the API boundary (losslessly upcast from `f32`
+  storage on load), the width is stamped into the dataset schema metadata
+  and the registry properties (`weight_type`), and `StoredGraph` reports
+  it. This resolves the RFC #81 open question ("Weights: Float64 only, or
+  allow Float32?") with "both, schema-declared, f64 default".
+- Registry-free collection writes and path-based readers (#106):
+  `save_vectors_to_path` / `save_graph_to_path` validate, stamp
+  dataset-level collection metadata (kind, layout facts, user properties)
+  and write the dataset at an explicit path with **no `GeneMetadata`
+  read or write** — registry ownership stays with consumers that run
+  their own metadata file (e.g. an ArrowSpaceMetadata commit pointer at
+  the instance metadata path). Counterparts
+  `load_vectors_from_path` / `load_graph_from_path` complement the
+  already registry-free name-based readers. Guarded from the external
+  consumer view in `tests/api_public.rs`.
+- Scalar collection reader `load_scalars` (#106): a single
+  `Float64|Float32` column (lambdas, norms, ...) loads as `Vec<f64>`
+  (lossless upcast), so every `kind=vector-space` collection is uniformly
+  loadable instead of requiring the legacy fixed-key readers.
+
+**Changed**
+
+- `save_vectors_with` / `save_graph_with` commit the registry entry
+  **before** writing the artifact (the `save_sparse` ordering): a failed
+  registry step no longer leaves a stray orphan artifact behind (#106,
+  spike-verified on a consumer directory whose metadata path holds a
+  foreign document).
+- **Breaking**: `GraphEdge::weighted` takes `f64` (was `f32`;
+  `f32`-origin values pass as `f64::from(w)` and keep round-tripping
+  bit-exactly through the default `f64` store); `GraphWriteOptions` and
+  `StoredGraph` gain the `weight_type` field; `StorageBackend` gains the
+  required registry-free methods above.
+
 ## 0.52.0 (2026-09-02)
 
 **Added**

@@ -626,10 +626,15 @@ pub trait StorageBackend: Send + Sync {
     async fn load_vectors(&self, name: &str) -> StorageResult<RecordBatch>;
 
     /// Saves an edge-list graph collection (RFC #81-P3) with `u32` node ids
-    /// (the default width). Edges above `u32::MAX` surface
-    /// [`StorageError::Overflow`] instead of being truncated.
+    /// (the default width) and `f64` weights (the default width, mirroring
+    /// the sparse-matrix `value` column). Ids above `u32::MAX` surface
+    /// [`StorageError::Overflow`] instead of being truncated; weights that
+    /// cannot be stored exactly at an explicitly declared
+    /// [`crate::graph::WeightType::F32`] width are rejected instead of
+    /// being silently narrowed.
     ///
-    /// The collection is either fully weighted (`weight: Float32` column) or
+    /// The collection is either fully weighted (`weight: Float64|Float32`
+    /// column, schema-declared via `GraphWriteOptions::weight_type`) or
     /// topology-only (`src`/`dst` only); mixed edges are rejected.
     async fn save_graph(
         &self,
@@ -641,8 +646,9 @@ pub trait StorageBackend: Send + Sync {
             .await
     }
 
-    /// Saves a graph collection with explicit options (node-id width,
-    /// node count, user properties for vector-space linkage, RFC #81-P4).
+    /// Saves a graph collection with explicit options (node-id and weight
+    /// widths, node count, user properties for vector-space linkage,
+    /// RFC #81-P4).
     async fn save_graph_with(
         &self,
         name: &str,
@@ -654,4 +660,51 @@ pub trait StorageBackend: Send + Sync {
     /// Loads a graph collection back as an edge list; convert to CSR at the
     /// API boundary with [`StoredGraph::to_csr`].
     async fn load_graph(&self, name: &str) -> StorageResult<StoredGraph>;
+
+    // =========
+    // REGISTRY-FREE COLLECTION I/O (#106)
+    // =========
+
+    /// Saves a vector-space collection dataset at an explicit `path`
+    /// without touching the metadata registry (#106): the batch is
+    /// validated, stamped with dataset-level collection metadata
+    /// (including user properties) and written; parent directories are
+    /// created as needed. Registry ownership stays with the caller — the
+    /// counterpart of [`Self::save_vectors_with`] for consumers that run
+    /// their own metadata registry (e.g. an ArrowSpaceMetadata commit
+    /// pointer at the instance metadata path). No `GeneMetadata` read or
+    /// write occurs.
+    async fn save_vectors_to_path(
+        &self,
+        path: &Path,
+        batch: &RecordBatch,
+        properties: &std::collections::BTreeMap<String, String>,
+    ) -> StorageResult<()>;
+
+    /// Loads a vector-space collection dataset from an explicit `path`
+    /// (registry-free): the path-based counterpart of
+    /// [`Self::load_vectors`].
+    async fn load_vectors_from_path(&self, path: &Path) -> StorageResult<RecordBatch>;
+
+    /// Saves a graph collection dataset at an explicit `path` without
+    /// touching the metadata registry (#106); see
+    /// [`Self::save_graph_with`] for the options and
+    /// [`Self::save_vectors_to_path`] for the registry-free contract.
+    async fn save_graph_to_path(
+        &self,
+        path: &Path,
+        edges: &[GraphEdge],
+        options: &GraphWriteOptions,
+    ) -> StorageResult<()>;
+
+    /// Loads a graph collection dataset from an explicit `path`
+    /// (registry-free): the path-based counterpart of [`Self::load_graph`].
+    async fn load_graph_from_path(&self, path: &Path) -> StorageResult<StoredGraph>;
+
+    /// Loads a scalar collection — a single `Float64|Float32` column, e.g.
+    /// lambdas or norms — as `Vec<f64>` (#106); `f32` values are upcast
+    /// losslessly. This makes every `kind=vector-space` collection
+    /// uniformly loadable (scalar artifacts included) instead of requiring
+    /// the legacy fixed-key readers.
+    async fn load_scalars(&self, name: &str) -> StorageResult<Vec<f64>>;
 }

@@ -7,7 +7,7 @@ Implements the **Lance format with an in-house writer/reader** (`lancefmt`, pinn
 Provided functionalities:
 * `save_metadata`, `load_metadata`: a simple wrapper for all the data in the directory
 * `save_*` / `load_*` dense matrices, sparse matrices, vectors, lambdas, indices
-* **named collections** (RFC #81): schema-driven vector spaces (`save_vectors` / `load_vectors`, any column layout with one non-null `FixedSizeList` vector column) and first-class graph storage (`save_graph` / `load_graph`, weighted or topology-only, `u32`/`u64` node ids)
+* **named collections** (RFC #81): schema-driven vector spaces (`save_vectors` / `load_vectors`, any column layout with one non-null `FixedSizeList` vector column) and first-class graph storage (`save_graph` / `load_graph`, weighted or topology-only, `u32`/`u64` node ids, `f64` weights by default with an explicit `f32` width available)
 * vector-space ↔ graph linkage (a vector space references a graph collection through its `graph` property; resolved in one call with `Catalog::describe_vector_space`)
 * **transactional generations**: atomic metadata commits (tmp + fsync + rename), `scoped_generation(n)` handles, generation listing/deletion for sweeps, reader pins
 * **catalog contract** (`src/catalog.rs`): `TableDescriptor` + `Catalog` trait mirroring the Lance Namespace / Polaris Generic Table API shape, with `LocalRegistry` over the JSON metadata registry
@@ -75,6 +75,31 @@ storage.save_graph("my_graph", &edges, &md_path).await.unwrap();
 let graph = storage.load_graph("my_graph").await.unwrap();
 let csr = graph.to_csr().unwrap(); // sprs CsMat<f64>
 ```
+
+Weights default to `f64` — the same width and exactness as the `value`
+column of the sparse-matrix artifacts, so an f64 CSR (laplacian,
+adjacency) round-trips bit-identically. Memory-bound consumers can
+declare `GraphWriteOptions { weight_type: WeightType::F32, .. }` to halve
+the storage bytes; values that cannot be stored exactly at the declared
+width are rejected instead of being silently narrowed.
+
+Consumers that run their **own** metadata registry (e.g. an
+ArrowSpaceMetadata commit pointer at the instance metadata path) use the
+registry-free collection I/O — no `GeneMetadata` read or write occurs,
+and registry ownership stays with the caller:
+
+```rust
+// dataset-level collection metadata is still stamped (kind, layout
+// facts, user properties)
+storage
+    .save_graph_to_path(&storage.file_path("adj"), &edges, &options)
+    .await
+    .unwrap();
+let graph = storage.load_graph("adj").await.unwrap(); // path-resolved
+```
+
+Scalar collections (a single `Float64` column — lambdas, norms, ...) are
+`kind=vector-space` and load uniformly through `load_scalars`.
 
 Append-style writers get immutable, atomically-committed generations:
 

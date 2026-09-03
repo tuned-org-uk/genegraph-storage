@@ -13,7 +13,7 @@ use smartcore::linalg::basic::arrays::Array2;
 use sprs::{CsMat, TriMat};
 
 use crate::catalog::{Catalog, CollectionKind, LocalRegistry, TableDescriptor};
-use crate::graph::{GraphEdge, GraphWriteOptions, NodeIdWidth, StoredGraph};
+use crate::graph::{GraphEdge, GraphWriteOptions, NodeIdWidth, StoredGraph, WeightType};
 use crate::lance_storage_graph::LanceStorageGraph;
 use crate::metadata::GeneMetadata;
 use crate::tests::tmp_dir;
@@ -268,6 +268,8 @@ async fn legacy_save_dense_works_alongside_save_vectors() {
 // ---------------------------------------------------------------------------
 
 /// Deterministic pseudo-random graph generator (no proptest dependency).
+/// Weights are full-precision f64: the default (f64) weight width stores
+/// them exactly, like sparse-matrix values (#106).
 fn generated_graph(n_nodes: u64, n_edges: usize, seed: u64, weighted: bool) -> Vec<GraphEdge> {
     let mut rng = StdRng::seed_from_u64(seed);
     (0..n_edges)
@@ -275,7 +277,7 @@ fn generated_graph(n_nodes: u64, n_edges: usize, seed: u64, weighted: bool) -> V
             let src = rng.random_range(0..n_nodes);
             let dst = rng.random_range(0..n_nodes);
             if weighted {
-                GraphEdge::weighted(src, dst, rng.random_range(-1.0..1.0))
+                GraphEdge::weighted(src, dst, rng.random::<f64>() - 0.5)
             } else {
                 GraphEdge::unweighted(src, dst)
             }
@@ -286,8 +288,7 @@ fn generated_graph(n_nodes: u64, n_edges: usize, seed: u64, weighted: bool) -> V
 fn reference_csr(edges: &[GraphEdge], n: u64) -> CsMat<f64> {
     let mut trimat = TriMat::new((n as usize, n as usize));
     for e in edges {
-        let w = e.weight.map(f64::from).unwrap_or(1.0);
-        trimat.add_triplet(e.src as usize, e.dst as usize, w);
+        trimat.add_triplet(e.src as usize, e.dst as usize, e.weight.unwrap_or(1.0));
     }
     trimat.to_csr()
 }
@@ -640,6 +641,455 @@ async fn write_paths_reject_registry_reserved_properties() {
     let md = storage.load_metadata().await.unwrap();
     assert!(!md.files.contains_key("bad_vecs"));
     assert!(!md.files.contains_key("bad_graph"));
+}
+
+// ---------------------------------------------------------------------------
+// Registry-free collection writes (#106)
+// ---------------------------------------------------------------------------
+
+/// #106: a failed registry step must not leave a stray orphan artifact
+/// behind. The consumer scenario is a directory whose metadata path holds
+/// a foreign document (an ArrowSpaceMetadata-style commit pointer), so the
+/// registry read-modify-write fails on parse; the artifact write must not
+/// have happened yet (same ordering as `save_sparse`).
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_registry_step_leaves_no_orphan_artifact() {
+    let base = tmp_dir("orphan_artifact").await;
+    let storage =
+        LanceStorageGraph::new(base.to_string_lossy().to_string(), "app_owned".to_string());
+    let md_path = storage.metadata_path();
+
+    // the consumer's own metadata document: any GeneMetadata read fails
+    // (the registry/app-metadata split, #106)
+    tokio::fs::write(&md_path, r#"{"commit_pointer":"app__g7"}"#)
+        .await
+        .unwrap();
+
+    let batch = f64_vector_batch(&[0, 1], &[vec![0.5, 1.5], vec![-2.5, 3.0]]);
+    let err = storage
+        .save_vectors_with("vecs", &batch, &BTreeMap::new(), &md_path)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, crate::StorageError::Serde(_)), "got {err:?}");
+    assert!(
+        !storage.file_path("vecs").exists(),
+        "failed registry step left an orphan vector-space artifact behind"
+    );
+
+    let edges = vec![GraphEdge::weighted(0, 1, 0.5)];
+    let err = storage
+        .save_graph("adj", &edges, &md_path)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, crate::StorageError::Serde(_)), "got {err:?}");
+    assert!(
+        !storage.file_path("adj").exists(),
+        "failed registry step left an orphan graph artifact behind"
+    );
+}
+
+/// The #106 acceptance: a consumer whose metadata path holds its own
+/// metadata document (an ArrowSpaceMetadata-style commit pointer, not a
+/// GeneMetadata registry) saves and loads collections with no GeneMetadata
+/// read or write occurring. Any GeneMetadata read of the foreign document
+/// would fail, so a successful cycle proves no read; a byte-identical file
+/// afterwards proves no write.
+#[tokio::test(flavor = "multi_thread")]
+async fn registry_free_collection_writes_never_touch_gene_metadata() {
+    let base = tmp_dir("registry_free").await;
+    let storage =
+        LanceStorageGraph::new(base.to_string_lossy().to_string(), "app_owned".to_string());
+
+    // the consumer's own single commit pointer at the instance metadata path
+    let app_metadata = r#"{"commit_pointer":"app__g7","format":"arrowspace"}"#;
+    tokio::fs::write(storage.metadata_path(), app_metadata)
+        .await
+        .unwrap();
+
+    // registry-free writes still stamp dataset-level collection metadata
+    // and leave registry ownership with the consumer
+    let mut props = BTreeMap::new();
+    props.insert("graph".to_string(), "adj".to_string());
+    let batch = f64_vector_batch(&[0, 1], &[vec![0.5, 1.5], vec![-2.5, 3.0]]);
+    storage
+        .save_vectors_to_path(&storage.file_path("vecs"), &batch, &props)
+        .await
+        .expect("save_vectors_to_path");
+
+    let edges = vec![
+        GraphEdge::weighted(0, 1, 0.123_456_789_012_345),
+        GraphEdge::weighted(1, 2, -0.999_999_999_999_999),
+    ];
+    let options = GraphWriteOptions {
+        weight_type: WeightType::F64,
+        ..Default::default()
+    };
+    storage
+        .save_graph_to_path(&storage.file_path("adj"), &edges, &options)
+        .await
+        .expect("save_graph_to_path");
+
+    // loads: the name-based readers (registry-free, path-resolved) and the
+    // path-based readers round-trip exact values
+    let loaded_vecs = storage.load_vectors("vecs").await.expect("load_vectors");
+    assert_eq!(loaded_vecs.num_rows(), 2);
+    assert_eq!(
+        loaded_vecs
+            .schema()
+            .metadata()
+            .get("kind")
+            .map(String::as_str),
+        Some("vector-space")
+    );
+    assert_eq!(
+        loaded_vecs
+            .schema()
+            .metadata()
+            .get("graph")
+            .map(String::as_str),
+        Some("adj"),
+        "user properties survive as dataset metadata"
+    );
+    let values = loaded_vecs
+        .column(1)
+        .as_any()
+        .downcast_ref::<FixedSizeListArray>()
+        .unwrap()
+        .values()
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    assert_eq!(values.value(0), 0.5);
+    assert_eq!(values.value(3), 3.0);
+
+    let loaded_adj = storage.load_graph("adj").await.expect("load_graph");
+    assert_eq!(loaded_adj.weight_type, WeightType::F64);
+    assert_eq!(loaded_adj.edges, edges);
+    assert_eq!(loaded_adj.num_nodes, 3);
+    let again = storage
+        .load_graph_from_path(&storage.file_path("adj"))
+        .await
+        .expect("load_graph_from_path");
+    assert_eq!(again.edges, edges);
+    let vecs_again = storage
+        .load_vectors_from_path(&storage.file_path("vecs"))
+        .await
+        .expect("load_vectors_from_path");
+    assert_eq!(vecs_again.num_rows(), 2);
+
+    // the consumer's metadata document is byte-identical: no write occurred,
+    // and (being unreadable as GeneMetadata) no read occurred either
+    let after = tokio::fs::read_to_string(storage.metadata_path())
+        .await
+        .unwrap();
+    assert_eq!(after, app_metadata);
+}
+
+// ---------------------------------------------------------------------------
+// P3: schema-declared weight widths (#106)
+// ---------------------------------------------------------------------------
+
+/// f64-declared weights round-trip bit-identically, including values an
+/// f32 store corrupts (the measured genefold blocker: 100% of entries
+/// changed, max abs diff 4.3e-7 on a real 65x65 laplacian).
+#[tokio::test(flavor = "multi_thread")]
+async fn graph_f64_weights_roundtrip_bit_exact() {
+    let (_base, storage) = seeded_storage("graph_f64_weights").await;
+    let md_path = storage.metadata_path();
+
+    let weights = [
+        0.0,
+        -0.0,
+        0.123_456_789_012_345,
+        -0.999_999_999_999_999,
+        f64::MIN_POSITIVE,
+        1.0e-300,
+        -2.5e-17,
+        0.5, // f32-exact control value
+    ];
+    let n: u64 = 65;
+    let edges: Vec<GraphEdge> = weights
+        .iter()
+        .enumerate()
+        .map(|(i, w)| GraphEdge::weighted(i as u64 % n, (i as u64 + 7) % n, *w))
+        .collect();
+    let options = GraphWriteOptions {
+        weight_type: WeightType::F64,
+        num_nodes: Some(n),
+        ..Default::default()
+    };
+    storage
+        .save_graph_with("laplacian_f64", &edges, &options, &md_path)
+        .await
+        .expect("save_graph_with f64 weights");
+
+    let graph = storage
+        .load_graph("laplacian_f64")
+        .await
+        .expect("load_graph");
+    assert_eq!(graph.weight_type, WeightType::F64);
+    assert!(graph.weighted);
+    assert_eq!(graph.num_nodes, n);
+    assert_eq!(graph.edges.len(), edges.len());
+    for (got, want) in graph.edges.iter().zip(edges.iter()) {
+        assert_eq!(got.src, want.src);
+        assert_eq!(got.dst, want.dst);
+        assert_eq!(
+            got.weight.unwrap().to_bits(),
+            want.weight.unwrap().to_bits(),
+            "f64 weight bits mismatch for {}",
+            want.weight.unwrap()
+        );
+    }
+
+    // CSR conversion is exact at every stored coordinate (#106 acceptance)
+    let csr = graph.to_csr().unwrap();
+    assert_eq!(csr.rows(), n as usize);
+    for (v, (r, c)) in csr.iter() {
+        let want = edges
+            .iter()
+            .find(|e| e.src == r as u64 && e.dst == c as u64)
+            .unwrap()
+            .weight
+            .unwrap();
+        assert_eq!(v.to_bits(), want.to_bits(), "csr value at ({r},{c})");
+    }
+
+    // the weight width is stamped at both the dataset and registry level
+    let stored = crate::lancefmt::scan_all(&storage.file_path("laplacian_f64")).unwrap();
+    assert_eq!(
+        stored.schema().field(2).data_type(),
+        &DataType::Float64,
+        "weight column is Float64 at the declared width"
+    );
+    assert_eq!(
+        stored
+            .schema()
+            .metadata()
+            .get("weight_type")
+            .map(String::as_str),
+        Some("f64")
+    );
+    let md = storage.load_metadata().await.unwrap();
+    assert_eq!(
+        md.files["laplacian_f64"]
+            .properties
+            .get("weight_type")
+            .map(String::as_str),
+        Some("f64")
+    );
+}
+
+/// A generated laplacian-shaped graph (65 nodes, full-precision f64
+/// weights, edge count crossing the lancefmt chunk boundaries) round-trips
+/// exactly with `WeightType::F64`.
+#[tokio::test(flavor = "multi_thread")]
+async fn graph_f64_weights_generated_roundtrip() {
+    let (_base, storage) = seeded_storage("graph_f64_generated").await;
+    let md_path = storage.metadata_path();
+
+    let n = 65u64;
+    let mut rng = StdRng::seed_from_u64(106);
+    let edges: Vec<GraphEdge> = (0..1500)
+        .map(|_| {
+            let src = rng.random_range(0..n);
+            let dst = rng.random_range(0..n);
+            // full double precision: essentially no value is f32-exact
+            GraphEdge::weighted(src, dst, rng.random::<f64>() - 0.5)
+        })
+        .collect();
+    let options = GraphWriteOptions {
+        weight_type: WeightType::F64,
+        num_nodes: Some(n),
+        ..Default::default()
+    };
+    storage
+        .save_graph_with("laplacian_gen", &edges, &options, &md_path)
+        .await
+        .expect("save_graph_with");
+
+    let graph = storage
+        .load_graph("laplacian_gen")
+        .await
+        .expect("load_graph");
+    assert_eq!(graph.weight_type, WeightType::F64);
+    assert_graph_round_trip(&graph, &edges, n, true);
+}
+
+/// The default weight width is `f64` — the same width and exactness as
+/// the `value` column of the legacy sparse-matrix artifacts genefold-vd
+/// stores: full-precision weights save via plain `save_graph` with no
+/// declarations and round-trip bit-identically (#106).
+#[tokio::test(flavor = "multi_thread")]
+async fn graph_default_weights_are_f64_like_sparse_values() {
+    let (_base, storage) = seeded_storage("graph_default_f64").await;
+    let md_path = storage.metadata_path();
+
+    let edges = vec![
+        GraphEdge::weighted(0, 1, 0.123_456_789_012_345),
+        GraphEdge::weighted(1, 2, -0.999_999_999_999_999),
+        GraphEdge::weighted(2, 0, f64::MIN_POSITIVE),
+    ];
+    storage
+        .save_graph("laplacian", &edges, &md_path)
+        .await
+        .expect("default save of full-precision weights");
+
+    let graph = storage.load_graph("laplacian").await.expect("load_graph");
+    assert_eq!(graph.weight_type, WeightType::F64);
+    for (got, want) in graph.edges.iter().zip(edges.iter()) {
+        assert_eq!(
+            got.weight.unwrap().to_bits(),
+            want.weight.unwrap().to_bits()
+        );
+    }
+    let stored = crate::lancefmt::scan_all(&storage.file_path("laplacian")).unwrap();
+    assert_eq!(
+        stored.schema().field(2).data_type(),
+        &DataType::Float64,
+        "the default weight column is Float64, like the sparse value column"
+    );
+    assert_eq!(
+        stored
+            .schema()
+            .metadata()
+            .get("weight_type")
+            .map(String::as_str),
+        Some("f64")
+    );
+}
+
+/// An explicitly declared `f32` weight width halves the storage bytes but
+/// never narrows silently: inexact f64 weights are rejected with guidance
+/// (the #51 invariant, float edition), out-of-range values surface
+/// Overflow, and f32-representable weights round-trip bit-exactly.
+#[tokio::test(flavor = "multi_thread")]
+async fn graph_explicit_f32_rejects_inexact_f64_weights() {
+    let (_base, storage) = seeded_storage("graph_f32_guard").await;
+    let md_path = storage.metadata_path();
+
+    let f32_options = GraphWriteOptions {
+        weight_type: WeightType::F32,
+        ..Default::default()
+    };
+
+    // inexact narrowing: rejected with guidance towards the f64 width
+    let inexact = vec![GraphEdge::weighted(0, 1, 0.123_456_789_012_345)];
+    let err = storage
+        .save_graph_with("inexact", &inexact, &f32_options, &md_path)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, crate::StorageError::Invalid(_)),
+        "got {err:?}"
+    );
+    assert!(
+        err.to_string().contains("WeightType::F64"),
+        "the error must point at the f64 width: {err}"
+    );
+
+    // out-of-range values surface Overflow, never silent truncation (#51)
+    let overflow = vec![GraphEdge::weighted(0, 1, 1.0e40)];
+    let err = storage
+        .save_graph_with("overflow", &overflow, &f32_options, &md_path)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, crate::StorageError::Overflow(_)),
+        "got {err:?}"
+    );
+
+    // f32-representable weights store as Float32 and round-trip bit-exactly
+    let exact = vec![
+        GraphEdge::weighted(0, 1, f64::from(0.5f32)),
+        GraphEdge::weighted(1, 2, f64::from(-0.25f32)),
+    ];
+    storage
+        .save_graph_with("exact", &exact, &f32_options, &md_path)
+        .await
+        .expect("f32-exact save at the declared width");
+    let graph = storage.load_graph("exact").await.expect("load_graph");
+    assert_eq!(graph.weight_type, WeightType::F32);
+    for (got, want) in graph.edges.iter().zip(exact.iter()) {
+        assert_eq!(
+            got.weight.unwrap().to_bits(),
+            want.weight.unwrap().to_bits()
+        );
+    }
+    let stored = crate::lancefmt::scan_all(&storage.file_path("exact")).unwrap();
+    assert_eq!(stored.schema().field(2).data_type(), &DataType::Float32);
+    assert_eq!(
+        stored
+            .schema()
+            .metadata()
+            .get("weight_type")
+            .map(String::as_str),
+        Some("f32")
+    );
+
+    // topology-only collections carry no weight column regardless of the
+    // declared width; the loaded graph reports the declared width
+    let topo_f32 = vec![GraphEdge::unweighted(0, 1)];
+    storage
+        .save_graph_with("topo_f32", &topo_f32, &f32_options, &md_path)
+        .await
+        .expect("topology-only with F32 options");
+    let graph = storage.load_graph("topo_f32").await.unwrap();
+    assert!(!graph.weighted);
+    assert!(graph.edges.iter().all(|e| e.weight.is_none()));
+    assert_eq!(graph.weight_type, WeightType::F32);
+}
+
+// ---------------------------------------------------------------------------
+// Scalar collections (#106): kind=VectorSpace is uniformly loadable
+// ---------------------------------------------------------------------------
+
+/// `CollectionKind::for_filetype("vector")` maps scalar artifacts to
+/// VectorSpace; `load_scalars` makes that kind uniformly loadable instead
+/// of requiring the legacy fixed-key readers.
+#[tokio::test(flavor = "multi_thread")]
+async fn scalar_collections_load_via_load_scalars() {
+    let (_base, storage) = seeded_storage("scalar_collections").await;
+    let md_path = storage.metadata_path();
+
+    // genefold's lambdas: a single Float64 column, registered as
+    // kind=VectorSpace through the legacy "vector" filetype shim
+    let lambdas: Vec<f64> = vec![0.0, 1.5, -2.25, f64::MIN_POSITIVE, 1.0e-300, 0.1];
+    storage
+        .save_lambdas(&lambdas, &md_path)
+        .await
+        .expect("save_lambdas");
+
+    let md = storage.load_metadata().await.unwrap();
+    assert_eq!(md.files["lambdas"].kind, Some(CollectionKind::VectorSpace));
+
+    // the collections reader round-trips the exact values
+    let loaded = storage.load_scalars("lambdas").await.expect("load_scalars");
+    assert_eq!(loaded.len(), lambdas.len());
+    for (got, want) in loaded.iter().zip(lambdas.iter()) {
+        assert_eq!(got.to_bits(), want.to_bits());
+    }
+
+    // non-scalar collections are rejected: vector spaces go through
+    // load_vectors, graphs through load_graph
+    let batch = f64_vector_batch(&[0, 1], &[vec![1.0, 2.0], vec![3.0, 4.0]]);
+    storage
+        .save_vectors("vecs", &batch, &md_path)
+        .await
+        .unwrap();
+    let err = storage.load_scalars("vecs").await.unwrap_err();
+    assert!(
+        matches!(err, crate::StorageError::Invalid(_)),
+        "got {err:?}"
+    );
+
+    let edges = vec![GraphEdge::weighted(0, 1, 0.5)];
+    storage.save_graph("g", &edges, &md_path).await.unwrap();
+    let err = storage.load_scalars("g").await.unwrap_err();
+    assert!(
+        matches!(err, crate::StorageError::Invalid(_)),
+        "got {err:?}"
+    );
 }
 
 /// Review PR #96 finding 4: a `kind` property that contradicts the typed
