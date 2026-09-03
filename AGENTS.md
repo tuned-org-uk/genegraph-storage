@@ -29,3 +29,9 @@ Key invariants to preserve when editing:
 ## Build & test
 
 - Run cargo test always with the `--release` flag (e.g. `cargo test --release --lib`).
+
+## Writing style
+
+- Use ASD-STE100 Simplified Technical English in all prose: short sentences, one idea each, active voice, imperative for instructions, approved terminology, no idioms.
+- Keep code comments concise: state the contract or the reason, never the narrative. Docs/CHANGELOG entries follow the same rule.
+- Make issue bodies detailed: context, design, evidence, acceptance criteria — an issue is the durable record; a comment is not.
