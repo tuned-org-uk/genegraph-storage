@@ -3,10 +3,14 @@
 //! The canonical on-disk layout is an edge-list Lance dataset:
 //! `src: UInt32|UInt64`, `dst: UInt32|UInt64` and an optional
 //! `weight: Float32|Float64` column (all non-null). Node-id and weight
-//! widths are schema-chosen (`u32`/`f32` defaults, `u64`/`f64` opt-ins,
-//! #106) and declare the storage limits explicitly rather than narrowing
-//! silently (consistent with #51). `CsMat` CSR conversion stays at the
-//! API boundary ([`StoredGraph::to_csr`]); sprs never reaches the format
+//! widths are schema-chosen — `u32` node-id and `f64` weight defaults,
+//! `u64`/`f32` opt-ins (#106) — and declare the storage limits
+//! explicitly rather than narrowing silently (consistent with #51).
+//! Weights are persisted faithfully — the storage layer makes no domain
+//! assumptions, so normalization transforms belong to the producer; the
+//! opt-in [`GraphWriteOptions::weight_range`] asserts compliance with a
+//! declared interval instead. `CsMat` CSR conversion stays at the API
+//! boundary ([`StoredGraph::to_csr`]); sprs never reaches the format
 //! layer.
 
 use std::collections::BTreeMap;
@@ -66,7 +70,11 @@ pub enum WeightType {
     /// `Float32` weights (opt-in): half the storage bytes for
     /// memory-bound consumers. Weights that cannot be represented exactly
     /// at this width are rejected on save instead of being silently
-    /// narrowed.
+    /// narrowed; finite values beyond the f32 range surface
+    /// [`StorageError::Overflow`] (#51). Infinities narrow bit-exactly;
+    /// NaN is preserved as NaN (classification semantics only — the
+    /// payload is not guaranteed bit-exact, unlike the
+    /// [`WeightType::F64`] width).
     F32,
 }
 
@@ -100,12 +108,15 @@ impl WeightType {
 /// A directed edge with an optional weight (RFC #81-P3).
 ///
 /// `weight` is `f64` at the API boundary (the widest width, like node ids
-/// are `u64`); the storage width is schema-declared via
-/// [`GraphWriteOptions::weight_type`] — `Float64` by default, mirroring
-/// the `value` column of the legacy sparse-matrix artifacts — and weights
-/// that cannot be stored exactly at a declared `Float32` width are
-/// rejected on save, never silently narrowed. A collection is either
-/// fully weighted or topology-only; mixed edges are rejected.
+/// are `u64`) and is persisted faithfully: the storage layer makes no
+/// domain assumptions, so normalization transforms belong to the producer
+/// (declare [`GraphWriteOptions::weight_range`] for an opt-in bounds
+/// assertion on already-normalized values). The storage width is
+/// schema-declared via [`GraphWriteOptions::weight_type`] — `Float64` by
+/// default, mirroring the `value` column of the legacy sparse-matrix
+/// artifacts — and weights that cannot be stored exactly at a declared
+/// `Float32` width are rejected, never silently narrowed. A collection is
+/// either fully weighted or topology-only; mixed edges are rejected.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GraphEdge {
     pub src: u64,
@@ -144,6 +155,14 @@ pub struct GraphWriteOptions {
     /// bytes but rejects values that cannot be stored exactly instead of
     /// silently narrowing them.
     pub weight_type: WeightType,
+    /// Opt-in weight-range compliance check (#106): when `Some((low,
+    /// high))`, every weight must already lie in the closed interval — a
+    /// bounds assertion that catches a forgotten producer transform,
+    /// never a transform the storage layer performs (normalization
+    /// belongs upstream; values are persisted faithfully). NaN lies in
+    /// no interval and is rejected; an inverted interval is a rejected
+    /// configuration.
+    pub weight_range: Option<(f64, f64)>,
     /// Explicit node count (e.g. to keep isolated vertices). Must be at
     /// least `max(src, dst) + 1` over all edges; defaults to exactly that.
     pub num_nodes: Option<u64>,
@@ -157,6 +176,7 @@ impl Default for GraphWriteOptions {
         Self {
             node_id_width: NodeIdWidth::U32,
             weight_type: WeightType::F64,
+            weight_range: None,
             num_nodes: None,
             properties: BTreeMap::new(),
         }

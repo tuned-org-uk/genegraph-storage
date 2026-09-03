@@ -966,8 +966,15 @@ impl StorageBackend for LanceStorageGraph {
             name, rows, dim, path
         );
         let uri = Self::path_to_uri(&path)?;
-        // Registry first, artifact second (the `save_sparse` ordering): a
-        // failed registry step must not leave an orphan artifact behind (#106).
+        // Artifact first, registry publish second: the registry update
+        // (through the commit actor) is the single commit point, so a
+        // live entry only exists once the artifact is durable at its
+        // final location (#106 review). A failed artifact write leaves
+        // no registry entry; a failed publish leaves the artifact as
+        // unreferenced residue that a later sweep reclaims — never a
+        // live entry pointing at a missing artifact. Crash recovery for
+        // the residue case is a sweep/gc, not a compensating rewrite.
+        self.write_lance_batch_async(uri, batch).await?;
         crate::commit::with_commit_actor(&self.metadata_path(), || async {
             let mut md = self.load_metadata().await?;
             let mut info = FileInfo::new(
@@ -982,7 +989,6 @@ impl StorageBackend for LanceStorageGraph {
             self.save_metadata(&md).await
         })
         .await?;
-        self.write_lance_batch_async(uri, batch).await?;
         info!("Vector-space collection '{}' saved successfully", name);
         Ok(())
     }
@@ -1018,8 +1024,14 @@ impl StorageBackend for LanceStorageGraph {
             path
         );
         let uri = Self::path_to_uri(&path)?;
-        // Registry first, artifact second (the `save_sparse` ordering): a
-        // failed registry step must not leave an orphan artifact behind (#106).
+        // Artifact first, registry publish second: the registry update
+        // (through the commit actor) is the single commit point, so a
+        // live entry only exists once the artifact is durable at its
+        // final location (#106 review). A failed artifact write leaves
+        // no registry entry; a failed publish leaves the artifact as
+        // unreferenced residue that a later sweep reclaims — never a
+        // live entry pointing at a missing artifact.
+        self.write_lance_batch_async(uri, batch).await?;
         crate::commit::with_commit_actor(&self.metadata_path(), || async {
             let mut md = self.load_metadata().await?;
             let mut info = FileInfo::new(
@@ -1044,7 +1056,6 @@ impl StorageBackend for LanceStorageGraph {
             self.save_metadata(&md).await
         })
         .await?;
-        self.write_lance_batch_async(uri, batch).await?;
         info!("Graph collection '{}' saved successfully", name);
         Ok(())
     }
@@ -1138,6 +1149,19 @@ impl StorageBackend for LanceStorageGraph {
         let batch = self.read_lance_all_batches_async(uri).await?;
 
         let schema = batch.schema();
+        // Logical kind gate (#106 review): physical shape determines
+        // decodability, but the stamped dataset kind determines whether
+        // the collection is semantically a scalar vector-space
+        // collection. Missing or mismatched kinds are rejected.
+        match schema.metadata().get("kind").map(String::as_str) {
+            Some("vector-space") => {}
+            other => {
+                return Err(StorageError::Invalid(format!(
+                    "scalar collection '{name}' has dataset kind {other:?}, \
+                     expected 'vector-space'"
+                )));
+            }
+        }
         if schema.fields().len() != 1 {
             return Err(StorageError::Invalid(format!(
                 "scalar collection expects exactly one column, found {}",

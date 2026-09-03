@@ -628,8 +628,11 @@ pub trait StorageBackend: Send + Sync {
     /// Saves an edge-list graph collection (RFC #81-P3) with `u32` node ids
     /// (the default width) and `f64` weights (the default width, mirroring
     /// the sparse-matrix `value` column). Ids above `u32::MAX` surface
-    /// [`StorageError::Overflow`] instead of being truncated; weights that
-    /// cannot be stored exactly at an explicitly declared
+    /// [`StorageError::Overflow`] instead of being truncated. Weights are
+    /// persisted faithfully (normalization transforms belong to the
+    /// producer); the opt-in `GraphWriteOptions::weight_range` asserts
+    /// compliance with a declared closed interval, and weights that cannot
+    /// be stored exactly at an explicitly declared
     /// [`crate::graph::WeightType::F32`] width are rejected instead of
     /// being silently narrowed.
     ///
@@ -703,8 +706,10 @@ pub trait StorageBackend: Send + Sync {
 
     /// Loads a scalar collection — a single `Float64|Float32` column, e.g.
     /// lambdas or norms — as `Vec<f64>` (#106); `f32` values are upcast
-    /// losslessly. This makes every `kind=vector-space` collection
-    /// uniformly loadable (scalar artifacts included) instead of requiring
-    /// the legacy fixed-key readers.
+    /// losslessly. The stamped dataset kind must be `vector-space`
+    /// (missing or mismatched kinds are rejected: physical shape
+    /// determines decodability, the logical kind determines semantic
+    /// validity), making every `kind=vector-space` collection uniformly
+    /// loadable instead of requiring the legacy fixed-key readers.
     async fn load_scalars(&self, name: &str) -> StorageResult<Vec<f64>>;
 }

@@ -77,11 +77,26 @@ let csr = graph.to_csr().unwrap(); // sprs CsMat<f64>
 ```
 
 Weights default to `f64` — the same width and exactness as the `value`
-column of the sparse-matrix artifacts, so an f64 CSR (laplacian,
-adjacency) round-trips bit-identically. Memory-bound consumers can
-declare `GraphWriteOptions { weight_type: WeightType::F32, .. }` to halve
-the storage bytes; values that cannot be stored exactly at the declared
-width are rejected instead of being silently narrowed.
+column of the sparse-matrix artifacts — and are persisted faithfully:
+the storage layer makes no domain assumptions, so normalization
+transforms (`x/(1+x)`, `1 - exp(-x)`, `atan(x)/(π/2)` — never
+dataset-wide min-max, which is incompatible with immutable generations)
+belong to the producer. Producers that want a guard against a forgotten
+transform can declare
+`GraphWriteOptions { weight_range: Some((0.0, 1.0)), .. }` — an opt-in
+bounds assertion on the already-computed values. Memory-bound consumers
+can declare `weight_type: WeightType::F32` to halve the storage bytes;
+values that cannot be stored exactly at the declared width are rejected
+instead of being silently narrowed (values beyond the f32 range surface
+`Overflow`).
+
+Failure semantics of the registry-coupled collection writes: the artifact
+is written first and the registry entry is published only afterwards (the
+registry is the single commit point), so a live entry never points at a
+missing artifact. If the publish itself fails — or the process dies before
+it — the artifact remains as unreferenced residue that a later sweep
+reclaims; crash recovery for interrupted saves is an orphan sweep, never
+a compensating registry rewrite.
 
 Consumers that run their **own** metadata registry (e.g. an
 ArrowSpaceMetadata commit pointer at the instance metadata path) use the

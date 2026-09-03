@@ -647,13 +647,71 @@ async fn write_paths_reject_registry_reserved_properties() {
 // Registry-free collection writes (#106)
 // ---------------------------------------------------------------------------
 
-/// #106: a failed registry step must not leave a stray orphan artifact
-/// behind. The consumer scenario is a directory whose metadata path holds
-/// a foreign document (an ArrowSpaceMetadata-style commit pointer), so the
-/// registry read-modify-write fails on parse; the artifact write must not
-/// have happened yet (same ordering as `save_sparse`).
+/// #106 review: the registry publish is the single commit point — a live
+/// registry entry must never exist without its durable artifact. When the
+/// artifact write itself fails, no registry entry may remain and the
+/// registry file must be untouched. (The registry-first ordering shipped
+/// in 0.53.0 violated this: discovery treated the collection as live
+/// while the dataset was never written.)
 #[tokio::test(flavor = "multi_thread")]
-async fn failed_registry_step_leaves_no_orphan_artifact() {
+async fn failed_artifact_write_leaves_no_live_registry_entry() {
+    let (_base, storage) = seeded_storage("artifact_write_fail").await;
+    let md_path = storage.metadata_path();
+    let before = tokio::fs::read(&md_path).await.unwrap();
+
+    // force the artifact write to fail: a regular file occupies the
+    // dataset directory location, so the lancefmt writer cannot create it
+    let collide = storage.file_path("vecs");
+    tokio::fs::write(&collide, b"not a dataset").await.unwrap();
+
+    let batch = f64_vector_batch(&[0, 1], &[vec![0.5, 1.5], vec![-2.5, 3.0]]);
+    let err = storage
+        .save_vectors_with("vecs", &batch, &BTreeMap::new(), &md_path)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, crate::StorageError::Io(_)),
+        "expected the forced artifact-write failure, got {err:?}"
+    );
+    assert_eq!(
+        tokio::fs::read(&md_path).await.unwrap(),
+        before,
+        "the registry file must be untouched when the artifact write fails"
+    );
+    let md = storage.load_metadata().await.unwrap();
+    assert!(
+        !md.files.contains_key("vecs"),
+        "a live registry entry must not point at a missing artifact"
+    );
+
+    // same contract for graph collections
+    let collide = storage.file_path("adj");
+    tokio::fs::write(&collide, b"not a dataset").await.unwrap();
+    let edges = vec![GraphEdge::weighted(0, 1, 0.5)];
+    let err = storage
+        .save_graph("adj", &edges, &md_path)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, crate::StorageError::Io(_)),
+        "expected the forced artifact-write failure, got {err:?}"
+    );
+    let md = storage.load_metadata().await.unwrap();
+    assert!(
+        !md.files.contains_key("adj"),
+        "a live registry entry must not point at a missing artifact"
+    );
+}
+
+/// #106 review: when the registry publish fails (here: the metadata path
+/// holds the consumer's own document, so the read-modify-write cannot
+/// parse it), the artifact was already written and remains as
+/// *unreferenced* residue — recoverable garbage a later sweep reclaims.
+/// That is the acceptable side of the failure split: nothing is logically
+/// committed (the registry document is byte-identical), so discovery
+/// never treats the residue as a live collection.
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_registry_publish_leaves_only_unreferenced_residue() {
     let base = tmp_dir("orphan_artifact").await;
     let storage =
         LanceStorageGraph::new(base.to_string_lossy().to_string(), "app_owned".to_string());
@@ -661,9 +719,8 @@ async fn failed_registry_step_leaves_no_orphan_artifact() {
 
     // the consumer's own metadata document: any GeneMetadata read fails
     // (the registry/app-metadata split, #106)
-    tokio::fs::write(&md_path, r#"{"commit_pointer":"app__g7"}"#)
-        .await
-        .unwrap();
+    let app_metadata = r#"{"commit_pointer":"app__g7"}"#;
+    tokio::fs::write(&md_path, app_metadata).await.unwrap();
 
     let batch = f64_vector_batch(&[0, 1], &[vec![0.5, 1.5], vec![-2.5, 3.0]]);
     let err = storage
@@ -671,21 +728,16 @@ async fn failed_registry_step_leaves_no_orphan_artifact() {
         .await
         .unwrap_err();
     assert!(matches!(err, crate::StorageError::Serde(_)), "got {err:?}");
-    assert!(
-        !storage.file_path("vecs").exists(),
-        "failed registry step left an orphan vector-space artifact behind"
+
+    // nothing is logically committed: the consumer's document is untouched
+    assert_eq!(
+        tokio::fs::read_to_string(&md_path).await.unwrap(),
+        app_metadata
     );
 
-    let edges = vec![GraphEdge::weighted(0, 1, 0.5)];
-    let err = storage
-        .save_graph("adj", &edges, &md_path)
-        .await
-        .unwrap_err();
-    assert!(matches!(err, crate::StorageError::Serde(_)), "got {err:?}");
-    assert!(
-        !storage.file_path("adj").exists(),
-        "failed registry step left an orphan graph artifact behind"
-    );
+    // the artifact exists as unreferenced residue: crash recovery is a
+    // later sweep/gc, never a live entry pointing at missing data
+    assert!(storage.file_path("vecs").exists());
 }
 
 /// The #106 acceptance: a consumer whose metadata path holds its own
@@ -805,7 +857,9 @@ async fn graph_f64_weights_roundtrip_bit_exact() {
         f64::MIN_POSITIVE,
         1.0e-300,
         -2.5e-17,
-        0.5, // f32-exact control value
+        0.5,  // f32-exact control value
+        1.0,  // ordinary endpoint value
+        -1.0, // ordinary endpoint value
     ];
     let n: u64 = 65;
     let edges: Vec<GraphEdge> = weights
@@ -988,7 +1042,8 @@ async fn graph_explicit_f32_rejects_inexact_f64_weights() {
         "the error must point at the f64 width: {err}"
     );
 
-    // out-of-range values surface Overflow, never silent truncation (#51)
+    // out-of-f32-range finite values surface Overflow, never silent
+    // truncation (#51)
     let overflow = vec![GraphEdge::weighted(0, 1, 1.0e40)];
     let err = storage
         .save_graph_with("overflow", &overflow, &f32_options, &md_path)
@@ -1038,6 +1093,140 @@ async fn graph_explicit_f32_rejects_inexact_f64_weights() {
     assert!(!graph.weighted);
     assert!(graph.edges.iter().all(|e| e.weight.is_none()));
     assert_eq!(graph.weight_type, WeightType::F32);
+
+    // non-finite weights are persisted faithfully at the f32 width:
+    // infinities narrow bit-exactly; NaN is preserved as NaN
+    // (classification semantics only — the payload is not guaranteed
+    // bit-exact, unlike the f64 width)
+    let nonfinite = vec![
+        GraphEdge::weighted(0, 1, f64::INFINITY),
+        GraphEdge::weighted(1, 2, f64::NEG_INFINITY),
+        GraphEdge::weighted(2, 0, f64::NAN),
+    ];
+    storage
+        .save_graph_with("nonfinite", &nonfinite, &f32_options, &md_path)
+        .await
+        .expect("non-finite weights are persisted faithfully");
+    let graph = storage.load_graph("nonfinite").await.unwrap();
+    assert_eq!(
+        graph.edges[0].weight.unwrap().to_bits(),
+        f64::INFINITY.to_bits()
+    );
+    assert_eq!(
+        graph.edges[1].weight.unwrap().to_bits(),
+        f64::NEG_INFINITY.to_bits()
+    );
+    assert!(graph.edges[2].weight.unwrap().is_nan());
+}
+
+/// Layering contract (#106): the storage layer persists weights
+/// faithfully — no domain assumptions, no normalization. Values outside
+/// any convention (including non-finite ones) save and round-trip
+/// bit-identically at the default f64 width; normalization transforms
+/// belong to the producer (genefold-vd).
+#[tokio::test(flavor = "multi_thread")]
+async fn graph_weights_persist_faithfully_without_a_range_check() {
+    let (_base, storage) = seeded_storage("graph_faithful").await;
+    let md_path = storage.metadata_path();
+
+    let weights = [
+        2.5,
+        -7.25,
+        1.0e40,
+        -1.0e40,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NAN,
+    ];
+    let edges: Vec<GraphEdge> = weights
+        .iter()
+        .enumerate()
+        .map(|(i, w)| GraphEdge::weighted(i as u64, (i + 1) as u64, *w))
+        .collect();
+    storage
+        .save_graph("faithful", &edges, &md_path)
+        .await
+        .expect("no weight range is enforced by default");
+
+    let graph = storage.load_graph("faithful").await.expect("load_graph");
+    assert_eq!(graph.weight_type, WeightType::F64);
+    for (got, want) in graph.edges.iter().zip(edges.iter()) {
+        assert_eq!(got.src, want.src);
+        assert_eq!(got.dst, want.dst);
+        let w = want.weight.unwrap();
+        if w.is_nan() {
+            assert!(got.weight.unwrap().is_nan());
+        } else {
+            assert_eq!(got.weight.unwrap().to_bits(), w.to_bits());
+        }
+    }
+}
+
+/// The opt-in compliance check (#106): `weight_range` asserts that every
+/// weight already lies in the producer's declared closed interval — it
+/// catches a forgotten upstream transform but never transforms values
+/// itself. Endpoints are inclusive, NaN lies in no interval, and an
+/// inverted interval is a rejected configuration.
+#[tokio::test(flavor = "multi_thread")]
+async fn graph_weight_range_is_an_opt_in_compliance_check() {
+    let (_base, storage) = seeded_storage("graph_weight_range").await;
+    let md_path = storage.metadata_path();
+
+    let ranged = GraphWriteOptions {
+        weight_range: Some((0.0, 1.0)),
+        ..Default::default()
+    };
+
+    // in-interval weights (endpoints included) pass the assertion
+    let ok = vec![
+        GraphEdge::weighted(0, 1, 0.0),
+        GraphEdge::weighted(1, 2, 1.0),
+        GraphEdge::weighted(2, 0, 0.123_456_789_012_345),
+    ];
+    storage
+        .save_graph_with("normalized", &ok, &ranged, &md_path)
+        .await
+        .expect("in-interval weights pass the opt-in check");
+
+    // violations — including NaN, which is in no interval — are rejected
+    for (i, bad) in [-0.5, 1.5, f64::NAN, f64::INFINITY].iter().enumerate() {
+        let edges = vec![GraphEdge::weighted(0, 1, *bad)];
+        let err = storage
+            .save_graph_with(&format!("bad_{i}"), &edges, &ranged, &md_path)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::StorageError::Invalid(_)),
+            "expected Invalid for weight {bad}, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("[0.0, 1.0]"),
+            "the error must name the declared interval: {err}"
+        );
+    }
+
+    // an inverted interval is a rejected configuration
+    let inverted = GraphWriteOptions {
+        weight_range: Some((1.0, 0.0)),
+        ..Default::default()
+    };
+    let edges = vec![GraphEdge::weighted(0, 1, 0.5)];
+    let err = storage
+        .save_graph_with("inverted", &edges, &inverted, &md_path)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, crate::StorageError::Invalid(_)),
+        "got {err:?}"
+    );
+
+    // topology-only collections have no weights to assert: a declared
+    // range is vacuous, not an error
+    let topo = vec![GraphEdge::unweighted(0, 1)];
+    storage
+        .save_graph_with("topo_ranged", &topo, &ranged, &md_path)
+        .await
+        .expect("no weights, nothing to assert");
 }
 
 // ---------------------------------------------------------------------------
@@ -1089,6 +1278,28 @@ async fn scalar_collections_load_via_load_scalars() {
     assert!(
         matches!(err, crate::StorageError::Invalid(_)),
         "got {err:?}"
+    );
+
+    // the logical kind is enforced, not just the physical shape (#106
+    // review): a single Float64 column that is not a stamped vector-space
+    // collection (a foreign one-column artifact) is rejected
+    let bare = {
+        let schema = Schema::new(vec![Field::new("value", DataType::Float64, false)]);
+        RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(Float64Array::from(vec![1.0, 2.0])) as _],
+        )
+        .unwrap()
+    };
+    crate::lancefmt::write_dataset(&bare, &storage.file_path("foreign")).unwrap();
+    let err = storage.load_scalars("foreign").await.unwrap_err();
+    assert!(
+        matches!(err, crate::StorageError::Invalid(_)),
+        "got {err:?}"
+    );
+    assert!(
+        err.to_string().contains("kind"),
+        "the rejection must name the kind mismatch: {err}"
     );
 }
 

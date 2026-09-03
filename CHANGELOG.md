@@ -1,5 +1,62 @@
 # Changelog
 
+## 0.60.0 (2026-09-03)
+
+First catalog-complete release line (#106): the catalog contract
+(#75 M-C1) becomes end-to-end adoptable — catalog-owning consumers
+(genefold-vd Workstream B) can save and load collections with no
+GeneMetadata I/O through the registry-free collection writers, graph
+weights are schema-declared (`f64` default) with an opt-in compliance
+range, and scalar collections are uniformly loadable. Version jumps
+from 0.53.x to mark the milestone.
+
+**Fixed**
+
+- Restored artifact-first ordering in `save_vectors_with` /
+  `save_graph_with`: the registry publish (through the commit actor) is
+  the single commit point, so a live registry entry only exists once the
+  artifact is durable at its final location. The 0.53.0 ordering
+  (registry before artifact) could commit entries pointing at artifacts
+  whose write then failed — worse than the unreferenced residue left by a
+  failed publish, which discovery never treats as live and which a later
+  sweep reclaims. Regression-guarded by a test that forces the artifact
+  write to fail and asserts the registry file is untouched with no live
+  entry; the residue case (failed publish) is pinned as the documented
+  crash-recovery contract (orphan sweep, never a compensating rewrite).
+- `load_scalars` enforces the logical collection kind (#106 review): the
+  dataset must be stamped `kind = vector-space`; missing or mismatched
+  kinds are rejected (physical shape determines decodability, the
+  logical kind determines semantic validity). Legacy scalar writers
+  (`save_primitive_column`: lambdas, norms, vectors, indices, centroid
+  maps, cluster assignments) now stamp the dataset-level kind, matching
+  the registry-level `for_filetype("vector")` shim.
+
+**Changed**
+
+- Graph weight ranges are an opt-in compliance check, not a
+  storage-layer assumption (#106): `GraphWriteOptions::weight_range:
+  Option<(f64, f64)>` asserts that every weight already lies in the
+  declared closed interval (e.g. `Some((0.0, 1.0))` for producers that
+  normalize upstream) and rejects violations — NaN lies in no interval —
+  with `Invalid`; inverted intervals are rejected configurations. With
+  no range declared the crate persists weights faithfully:
+  data-independent normalization transforms (`x/(1+x)`, `1-exp(-x)`,
+  `atan(x)/(π/2)`) belong to the producer (tracked in
+  Genefold/genefold-vd#51), and
+  dataset-wide min-max normalization is incompatible with immutable
+  generations anyway. The f32 width keeps its #51 narrowing guard:
+  finite values beyond the f32 range surface `Overflow`, inexact
+  narrowings `Invalid`, infinities narrow bit-exactly and NaN is
+  preserved as NaN (classification semantics; full bit-exactness
+  requires the f64 width).
+
+**Docs**
+
+- Corrected the `graph.rs` module-level width defaults (`f64` weights,
+  not `f32`); README documents the faithful-persistence contract, the
+  opt-in `weight_range` check and the failure semantics (single commit
+  point, orphan sweep for residue).
+
 ## 0.53.0 (2026-09-03)
 
 Collections adoption blockers for genefold-vd Workstream B (#106,

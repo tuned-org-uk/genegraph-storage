@@ -191,28 +191,57 @@ pub(crate) fn graph_record_batch(
         Some(n) => n,
         None => max_id + 1,
     };
-    // Weight-width exactness — the #51 invariant, float edition (#106):
-    // an explicitly declared f32 store must hold every weight exactly,
-    // because a silent f64 -> f32 -> f64 narrowing corrupts
-    // full-precision laplacians (measured: 100% of entries change, max
-    // abs diff 4.3e-7). The default f64 width never narrows.
-    if weighted && options.weight_type == WeightType::F32 {
-        for e in edges {
-            let w = e.weight.unwrap();
-            let narrowed = w as f32;
-            if w.is_finite() && !narrowed.is_finite() {
-                return Err(StorageError::Overflow(format!(
-                    "weight {w} exceeds the f32 range; save with WeightType::F64"
-                )));
+    // Weight handling (#106):
+    // - Layering: the crate persists weights faithfully — no domain
+    //   assumptions, no normalization. Producer transforms
+    //   (x/(1+x), 1-exp(-x), ...) happen upstream; `weight_range` is
+    //   only an opt-in bounds assertion on already-computed values
+    //   (it catches a forgotten transform). NaN lies in no interval;
+    //   an inverted interval is a rejected configuration.
+    if let Some((lo, hi)) = options.weight_range
+        && !matches!(
+            lo.partial_cmp(&hi),
+            Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+        )
+    {
+        return Err(StorageError::Invalid(format!(
+            "weight_range ({lo:?}, {hi:?}) is not a valid interval: expected low <= high"
+        )));
+    }
+    if weighted {
+        if let Some((lo, hi)) = options.weight_range {
+            for e in edges {
+                let w = e.weight.unwrap();
+                if !(lo..=hi).contains(&w) {
+                    return Err(StorageError::Invalid(format!(
+                        "graph weight {w} is outside the declared weight_range [{lo:?}, {hi:?}]"
+                    )));
+                }
             }
-            let exact =
-                f64::from(narrowed).to_bits() == w.to_bits() || (w.is_nan() && narrowed.is_nan());
-            if !exact {
-                return Err(StorageError::Invalid(format!(
-                    "weight {w} is not exactly representable as f32 and would be \
-                     silently narrowed; save with WeightType::F64 or pre-narrow the \
-                     value with `as f32`"
-                )));
+        }
+        // f32 narrowing guard — the #51 invariant, float edition: a
+        // declared f32 store must hold every weight exactly, because a
+        // silent f64 -> f32 -> f64 narrowing corrupts full-precision
+        // values (measured on a real laplacian: 100% of entries change,
+        // max abs diff 4.3e-7). The default f64 width never narrows.
+        if options.weight_type == WeightType::F32 {
+            for e in edges {
+                let w = e.weight.unwrap();
+                let narrowed = w as f32;
+                if w.is_finite() && !narrowed.is_finite() {
+                    return Err(StorageError::Overflow(format!(
+                        "weight {w} exceeds the f32 range; save with WeightType::F64"
+                    )));
+                }
+                let exact = f64::from(narrowed).to_bits() == w.to_bits()
+                    || (w.is_nan() && narrowed.is_nan());
+                if !exact {
+                    return Err(StorageError::Invalid(format!(
+                        "weight {w} is not exactly representable as f32 and would be \
+                         silently narrowed; save with WeightType::F64 or pre-narrow the \
+                         value with `as f32`"
+                    )));
+                }
             }
         }
     }
@@ -452,7 +481,13 @@ pub trait LanceStorage {
         let len = values.len();
         info!("Saving {} values for {} (field {})", len, key, field_name);
 
-        let schema = Schema::new(vec![Field::new(field_name, T::DATA_TYPE, false)]);
+        // Dataset-level kind (RFC #81-P1): scalar artifacts are
+        // vector-space collections, mirroring the registry-level
+        // `CollectionKind::for_filetype("vector")` shim, so logical-kind
+        // readers (`load_scalars`) can enforce the kind (#106 review).
+        let schema = Schema::new(vec![Field::new(field_name, T::DATA_TYPE, false)]).with_metadata(
+            std::collections::HashMap::from([("kind".to_string(), "vector-space".to_string())]),
+        );
         let batch = RecordBatch::try_new(
             Arc::new(schema),
             vec![Arc::new(PrimitiveArray::<T>::from_iter_values(values)) as ArrayRef],
