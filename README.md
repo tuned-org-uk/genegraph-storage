@@ -20,7 +20,7 @@ A storage layer for:
 ## Usage
 
 ```bash
-cargo add genegraph_storage
+cargo add genegraph_storage@0.61.0
 ```
 
 Simple example (kept in sync with the compile-checked doc-test on `LanceStorageGraph`):
