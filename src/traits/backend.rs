@@ -749,4 +749,43 @@ pub trait StorageBackend: Send + Sync {
         self.collection_schema_from_path(&self.file_path(name))
             .await
     }
+
+    // =========
+    // #115: dataset verification
+    // =========
+
+    /// Verifies the stamped dataset schema of a collection at `path`
+    /// against `expected` (#115): reads the schema footer via
+    /// [`crate::lancefmt::read_schema`] — no column buffers are decoded —
+    /// and cross-checks the facts (`kind`, `rows`/`cols`, `num_nodes`,
+    /// weight width). Mismatches surface as typed errors naming the fact.
+    ///
+    /// Provided (#117-2 policy): derivable from the lancefmt primitive, so
+    /// no implementor burden. Expectations derive from the registry via
+    /// [`crate::lancefmt::verify::DatasetFacts::from_file_info`] or
+    /// `from_descriptor`.
+    async fn verify_collection_from_path(
+        &self,
+        path: &Path,
+        expected: &crate::lancefmt::verify::DatasetFacts,
+    ) -> StorageResult<()> {
+        let path = path.to_path_buf();
+        let expected = expected.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::lancefmt::verify_dataset_schema(&path, &expected)
+        })
+        .await
+        .map_err(|e| StorageError::Io(format!("verify task failed: {e}")))?
+    }
+
+    /// Name-based counterpart of [`Self::verify_collection_from_path`],
+    /// resolving through [`Self::file_path`].
+    async fn verify_collection(
+        &self,
+        name: &str,
+        expected: &crate::lancefmt::verify::DatasetFacts,
+    ) -> StorageResult<()> {
+        self.verify_collection_from_path(&self.file_path(name), expected)
+            .await
+    }
 }

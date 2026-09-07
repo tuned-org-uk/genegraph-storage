@@ -9,6 +9,7 @@ mod test_lance_layer;
 mod test_lancefmt_impl;
 mod test_metadata;
 mod test_parquet_io;
+mod test_verify;
 
 use std::fs;
 use std::path::PathBuf;

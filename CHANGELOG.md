@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.64.0 (2026-09-07)
+
+Adds the dataset verification inspection primitive (#115, #104 Phase 2):
+a consumer `verify` cross-checks a dataset's stamped schema against its
+registry descriptor without decoding any column buffer. Modeled on the
+downstream verify recipe (Genefold/genefold-vd#58), which cross-checks
+loaded shapes; this primitive is the schema-level counterpart.
+
+**Added**
+
+- `lancefmt::verify::DatasetFacts` (#115): the fact set of a dataset
+  (`kind`, `rows`/`cols`, `nnz`, `num_nodes`, `weight_type`,
+  `node_id_width`, `weighted`). `None` means "do not assert".
+  - `from_schema` extracts what a dataset stamps (schema footer only).
+  - `from_file_info` / `from_descriptor` derive the expectation from a
+    registry entry, following what each writer stamps: sparse artifacts
+    carry the shape stamps; RFC-#81 collections carry `kind` (graphs
+    carry the graph facts); dense datasets stamp nothing.
+- `lancefmt::verify_dataset_schema` (#115): reads the dataset schema
+  footer and cross-checks it against `DatasetFacts`. Count mismatches
+  surface as `StorageError::DimensionMismatch`, type/semantic mismatches
+  as `StorageError::Invalid`; every error names the fact. The first
+  mismatch wins.
+- `StorageBackend::verify_collection_from_path` and
+  `verify_collection` (#115): provided backend surface (async wrapper
+  over the lancefmt primitive on the blocking pool). No implementor
+  burden, per the #117-2 extension policy.
+
+**Changed**
+
+- The expectation grammar follows the real writer contracts, corrected
+  during TDD: dense artifacts stamp nothing (the registry shape is a
+  computed fact, not a verifiable stamp), sparse artifacts stamp
+  `rows`/`cols`/`nnz`, RFC-#81 collections stamp `kind`, graphs stamp
+  the graph facts. The per-filetype derivation prevents over-assertion
+  of registry-computed facts.
+
+Refs: #115, #104, Genefold/genefold-vd#58.
+
 ## 0.63.0 (2026-09-07)
 
 Acts on the #117 review. The core trait loses its ML-pipeline vocabulary,

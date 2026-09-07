@@ -33,7 +33,9 @@
 pub mod pb;
 mod reader;
 mod schema;
+pub mod verify;
 mod writer;
 
 pub use reader::{read_schema, scan_all};
+pub use verify::{DatasetFacts, verify_dataset_schema};
 pub use writer::write_dataset;
