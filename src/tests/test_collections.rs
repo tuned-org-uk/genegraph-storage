@@ -8,7 +8,7 @@ use arrow::array::{FixedSizeListArray, Float32Array, Float64Array, UInt32Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use smartcore::linalg::basic::arrays::Array2;
 use sprs::{CsMat, TriMat};
 

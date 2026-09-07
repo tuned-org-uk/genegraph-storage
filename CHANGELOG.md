@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.64.1 (2026-09-07)
+
+Aligns the test RNG stack with the tree: smartcore 0.6.14 already
+requires `rand ^0.10.1`, so the dev-dependencies pin the same major.
+
+**Changed**
+
+- `rand` 0.9.2 -> 0.10.2 and `rand_distr` 0.5.1 -> 0.6.0 (dev-deps).
+  The 0.9 stack (`rand 0.9.5`, `rand_chacha`, `rand_core 0.9.5`) leaves
+  the tree; one `rand 0.10.2` remains, matching smartcore's requirement
+  and genefold-vd's pins. rand 0.10 moved the convenience methods
+  (`random`, `random_range`) from `Rng` to the blanket `RngExt`; the two
+  affected test imports follow.
+
 ## 0.64.0 (2026-09-07)
 
 Adds the dataset verification inspection primitive (#115, #104 Phase 2):

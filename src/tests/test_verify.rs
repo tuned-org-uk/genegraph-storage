@@ -8,7 +8,7 @@
 //! seed 3407.
 
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use smartcore::linalg::basic::arrays::Array2;
 use smartcore::linalg::basic::matrix::DenseMatrix;
 use sprs::TriMat;
