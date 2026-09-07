@@ -57,6 +57,7 @@ fn rt<F: std::future::Future>(fut: F) -> F::Output {
 
 fn storage_for(dir: &Path) -> LanceStorageGraph {
     LanceStorageGraph::new(dir.to_string_lossy().to_string(), "pq_test".to_string())
+        .expect("valid instance name")
 }
 
 /// Round-trip through the vector layout (`vector: FixedSizeList<Float64>`),

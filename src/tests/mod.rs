@@ -4,6 +4,7 @@ mod test_collections;
 mod test_commit;
 mod test_data;
 mod test_generations;
+mod test_init;
 mod test_lance_layer;
 mod test_lancefmt_impl;
 mod test_metadata;

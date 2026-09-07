@@ -4,6 +4,7 @@ use crate::metadata::FileInfo;
 use crate::metadata::GeneMetadata;
 use crate::tests::tmp_dir;
 use crate::traits::backend::StorageBackend;
+use crate::traits::clustering::ClusteringArtifacts;
 use crate::traits::metadata::Metadata;
 
 use log::debug;
@@ -32,7 +33,8 @@ async fn init_test_builder(
     let storage = LanceStorageGraph::new(
         base.to_string_lossy().to_string(),
         instance_name.to_string(),
-    );
+    )
+    .expect("valid instance name");
 
     let data =
         DenseMatrix::<f64>::from_iterator(dense.iter().flatten().copied(), nitems, nfeatures, 0);
@@ -281,9 +283,7 @@ async fn save_sparse_rejects_disconnected_nnz_zero_matrix_before_writes() {
         "a rejected nnz=0 save must not register metadata (partial directory)"
     );
     // ... and no artifact file may be left behind.
-    let artifact = storage
-        .base_path()
-        .join(format!("{name}_adjacency.lance"));
+    let artifact = storage.base_path().join(format!("{name}_adjacency.lance"));
     assert!(
         !artifact.exists(),
         "a rejected nnz=0 save must not leave an artifact at {artifact:?}"
@@ -431,9 +431,11 @@ async fn test_concurrent_storage_instances() {
     let name = "concurrent";
 
     let storage1 =
-        LanceStorageGraph::new(base.to_string_lossy().to_string(), "instance1".to_string());
+        LanceStorageGraph::new(base.to_string_lossy().to_string(), "instance1".to_string())
+            .expect("valid instance name");
     let storage2 =
-        LanceStorageGraph::new(base.to_string_lossy().to_string(), "instance2".to_string());
+        LanceStorageGraph::new(base.to_string_lossy().to_string(), "instance2".to_string())
+            .expect("valid instance name");
 
     let data1 = vec![1.0, 2.0, 3.0, 4.0];
     let data2 = vec![5.0, 6.0, 7.0, 8.0];
@@ -486,7 +488,8 @@ async fn test_lance_storage_spawn() {
     let name_id = "test_spawn_storage";
 
     // Step 1: Create and seed initial storage with metadata
-    let storage = LanceStorageGraph::new(base_path.clone(), name_id.to_string());
+    let storage = LanceStorageGraph::new(base_path.clone(), name_id.to_string())
+        .expect("valid instance name");
 
     GeneMetadata::seed_metadata(
         name_id, 100, // nitems
@@ -614,7 +617,8 @@ async fn test_lance_storage_spawn_metadata_consistency() {
     let base_path = temp_dir.as_path().to_str().unwrap().to_string();
     let name_id = "consistency_test";
 
-    let storage = LanceStorageGraph::new(base_path.clone(), name_id.to_string());
+    let storage = LanceStorageGraph::new(base_path.clone(), name_id.to_string())
+        .expect("valid instance name");
 
     let mut metadata = GeneMetadata::seed_metadata(name_id, 200, 75, &storage)
         .await
@@ -771,7 +775,8 @@ async fn test_from_sparse_batch_dimension_mismatch_returns_error() {
     crate::tests::init();
     let name_id = "sparse_dim_mismatch";
     let base = tmp_dir(name_id).await;
-    let storage = LanceStorageGraph::new(base.to_string_lossy().to_string(), name_id.to_string());
+    let storage = LanceStorageGraph::new(base.to_string_lossy().to_string(), name_id.to_string())
+        .expect("valid instance name");
 
     // Batch schema metadata claims a 5x5 matrix...
     let mut schema_metadata = HashMap::new();

@@ -58,16 +58,22 @@ use crate::{StorageError, StorageResult};
 ///   - `save_lambdas`, `load_lambdas`
 ///   - `save_vector`, `load_vector`
 ///   - `save_index`, `load_index`
-///   - `save_centroid_map`, `load_centroid_map`
-///   - `save_item_norms`, `load_item_norms`
-///   - `save_cluster_assignments`, `load_cluster_assignments`
 ///
-/// - Clustering structure:
-///   - `save_subcentroids`, `load_subcentroids`
-///   - `save_subcentroid_lambdas`, `load_subcentroid_lambdas`
+/// Clustering artifacts (centroid maps, subcentroids, item norms, cluster
+/// assignments) live on the [`crate::traits::clustering::ClusteringArtifacts`]
+/// sub-trait (#117): the base backend stays domain-neutral, and general-purpose
+/// implementors do not stub ML-pipeline vocabulary.
 ///
 /// Implementations are free to choose the on-disk layout as long as they honor
 /// these logical keys and round-trip semantics.
+///
+/// ## Extension policy (#117-2)
+///
+/// The core trait carries only domain-neutral, generic columnar surface.
+/// Consumer-specific vocabulary (clustering pipelines, ML pipelines) belongs
+/// on extension sub-traits, so adding surface there never breaks external
+/// `StorageBackend` implementors. Core-trait additions must provide a default
+/// implementation whenever one can be derived from existing methods.
 pub trait StorageBackend: Send + Sync {
     /// Base directory of the instance
     fn get_base(&self) -> String;
@@ -547,40 +553,6 @@ pub trait StorageBackend: Send + Sync {
     /// save a generic f64 sequence
     async fn save_vector(&self, key: &str, vector: &[f64], md_path: &Path) -> StorageResult<()>;
 
-    /// Save centroid_map (vector of usize mapping items to centroids)
-    async fn save_centroid_map(&self, map: &[usize], md_path: &Path) -> StorageResult<()>;
-
-    /// Load centroid_map
-    async fn load_centroid_map(&self) -> StorageResult<Vec<usize>>;
-    /// Save subcentroid_lambdas (tau values for subcentroids)
-    async fn save_subcentroid_lambdas(&self, lambdas: &[f64], md_path: &Path) -> StorageResult<()>;
-    /// Load subcentroid_lambdas
-    async fn load_subcentroid_lambdas(&self) -> StorageResult<Vec<f64>>;
-    /// Save subcentroids (dense matrix)
-    async fn save_subcentroids(
-        &self,
-        subcentroids: &DenseMatrix<f64>,
-        md_path: &Path,
-    ) -> StorageResult<()>;
-    /// Load subcentroids
-    async fn load_subcentroids(&self) -> StorageResult<Vec<Vec<f64>>>;
-
-    /// Save item norms (precomputed L2 norms for fast distance computation)
-    async fn save_item_norms(&self, item_norms: &[f64], md_path: &Path) -> StorageResult<()>;
-
-    /// Load item norms
-    async fn load_item_norms(&self) -> StorageResult<Vec<f64>>;
-
-    /// Save cluster assignments (Vec<Option<usize>>)
-    async fn save_cluster_assignments(
-        &self,
-        assignments: &[Option<usize>],
-        md_path: &Path,
-    ) -> StorageResult<()>;
-
-    /// Load cluster assignments
-    async fn load_cluster_assignments(&self) -> StorageResult<Vec<Option<usize>>>;
-
     /// Load index or generic usize vector from storage.
     #[allow(dead_code)]
     async fn load_index(&self, key: &str) -> StorageResult<Vec<usize>>;
@@ -751,7 +723,14 @@ pub trait StorageBackend: Send + Sync {
     /// [`StorageError::Invalid`] and validates the `src`/`dst`/`weight`
     /// column names, so pre-collections triplet artifacts are positively
     /// identified rather than positionally coerced.
-    async fn load_graph_from_path_strict(&self, path: &Path) -> StorageResult<StoredGraph>;
+    ///
+    /// Provided default (#117-2): derivable from
+    /// [`Self::load_graph_from_path_with_options`], so implementors only
+    /// need the options-based method.
+    async fn load_graph_from_path_strict(&self, path: &Path) -> StorageResult<StoredGraph> {
+        self.load_graph_from_path_with_options(path, &crate::graph::GraphReadOptions::strict())
+            .await
+    }
 
     // =========
     // #109: metadata-only schema read

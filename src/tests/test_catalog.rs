@@ -292,7 +292,8 @@ async fn catalog_describe_vector_space_links_graph() {
 async fn catalog_locations_match_storage_layout() {
     let base = tmp_dir("catalog_m_c1_storage").await;
     let name_id = "catalog_storage";
-    let storage = LanceStorageGraph::new(base.to_string_lossy().to_string(), name_id.to_string());
+    let storage = LanceStorageGraph::new(base.to_string_lossy().to_string(), name_id.to_string())
+        .expect("valid instance name");
     let metadata = GeneMetadata::seed_metadata(name_id, 10, 5, &storage)
         .await
         .expect("seed");

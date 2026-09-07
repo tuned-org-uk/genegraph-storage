@@ -22,7 +22,8 @@ use crate::traits::metadata::Metadata;
 
 async fn seeded_storage(name: &str) -> (PathBuf, LanceStorageGraph) {
     let base = tmp_dir(name).await;
-    let storage = LanceStorageGraph::new(base.to_string_lossy().to_string(), name.to_string());
+    let storage = LanceStorageGraph::new(base.to_string_lossy().to_string(), name.to_string())
+        .expect("valid instance name");
     GeneMetadata::seed_metadata(name, 4, 4, &storage)
         .await
         .expect("seed metadata");
@@ -714,7 +715,8 @@ async fn failed_artifact_write_leaves_no_live_registry_entry() {
 async fn failed_registry_publish_leaves_only_unreferenced_residue() {
     let base = tmp_dir("orphan_artifact").await;
     let storage =
-        LanceStorageGraph::new(base.to_string_lossy().to_string(), "app_owned".to_string());
+        LanceStorageGraph::new(base.to_string_lossy().to_string(), "app_owned".to_string())
+            .expect("valid instance name");
     let md_path = storage.metadata_path();
 
     // the consumer's own metadata document: any GeneMetadata read fails
@@ -750,7 +752,8 @@ async fn failed_registry_publish_leaves_only_unreferenced_residue() {
 async fn registry_free_collection_writes_never_touch_gene_metadata() {
     let base = tmp_dir("registry_free").await;
     let storage =
-        LanceStorageGraph::new(base.to_string_lossy().to_string(), "app_owned".to_string());
+        LanceStorageGraph::new(base.to_string_lossy().to_string(), "app_owned".to_string())
+            .expect("valid instance name");
 
     // the consumer's own single commit pointer at the instance metadata path
     let app_metadata = r#"{"commit_pointer":"app__g7","format":"arrowspace"}"#;
@@ -1316,7 +1319,8 @@ async fn scalar_collections_load_via_load_scalars() {
 async fn registry_free_scalar_collections_roundtrip() {
     let base = tmp_dir("registry_free_scalars").await;
     let storage =
-        LanceStorageGraph::new(base.to_string_lossy().to_string(), "app_owned".to_string());
+        LanceStorageGraph::new(base.to_string_lossy().to_string(), "app_owned".to_string())
+            .expect("valid instance name");
 
     // the consumer's own single commit pointer at the instance metadata path
     let app_metadata = r#"{"commit_pointer":"app__g7","format":"arrowspace"}"#;
@@ -1367,7 +1371,8 @@ async fn registry_free_scalar_collections_roundtrip() {
 async fn registry_free_scalars_reject_empty_and_foreign() {
     let base = tmp_dir("registry_free_scalars_invalid").await;
     let storage =
-        LanceStorageGraph::new(base.to_string_lossy().to_string(), "app_owned".to_string());
+        LanceStorageGraph::new(base.to_string_lossy().to_string(), "app_owned".to_string())
+            .expect("valid instance name");
 
     // empty values are rejected
     let err = storage

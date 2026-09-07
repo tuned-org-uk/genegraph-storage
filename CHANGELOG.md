@@ -1,5 +1,62 @@
 # Changelog
 
+## 0.63.0 (2026-09-07)
+
+Acts on the #117 review. The core trait loses its ML-pipeline vocabulary,
+one naming grammar replaces five `format!` copies, and the dense file
+I/O dispatchers split into per-format helpers. Fixes the Windows CI
+failures of the flock-dependent downstream canary.
+
+**Added**
+
+- `ClusteringArtifacts` sub-trait (`traits::clustering`, #117-1): the ten
+  clustering artifact methods (`save_centroid_map`, `save_subcentroids`,
+  `save_item_norms`, `save_cluster_assignments`, `save_subcentroid_lambdas`
+  and their loaders) move off `StorageBackend`. General-purpose implementors
+  no longer stub ML-pipeline vocabulary. `LanceStorageGraph` implements the
+  sub-trait; clustering callers must import it.
+- `generations::artifact_file_name` / `artifact_file_path` /
+  `metadata_file_name` / `metadata_file_path` (#117-3): the single naming
+  grammar for artifact datasets and metadata registries. `file_path`,
+  `metadata_path`, the `FileInfo` stamps and the catalog fallback build
+  from it, so the on-disk name and the registered name cannot drift.
+- `generations::validate_logical_name` (#117-3): rejects instance names
+  carrying the reserved `__g<n>` suffix. `LanceStorageGraph::new` enforces
+  it; `scoped_generation` and `spawn` keep minting and accepting
+  generation-qualified names through the internal constructor.
+- `StorageBackend` trait docs state the extension policy (#117-2):
+  consumer-specific vocabulary belongs on extension sub-traits; core-trait
+  additions must provide defaults when derivable.
+
+**Changed**
+
+- **Breaking**: `LanceStorageGraph::new` returns
+  `StorageResult<LanceStorageGraph>` (#117-3). The reserved-suffix rule is
+  enforced early and typed, matching the fail-fast convention (#102).
+  Callers add `.expect(...)` or propagate.
+- **Breaking**: `StorageBackend` implementors that implemented the
+  clustering methods move them to a `ClusteringArtifacts` implementation.
+  The core trait shrinks by ten methods.
+- `load_graph_from_path_strict` becomes a provided method (#117-2): its
+  body was already the strict options call, so implementors only need
+  `load_graph_from_path_with_options`.
+- `init()` defaults the log filter to `info` (#117-5), matching its
+  documented contract. Debug output requires `RUST_LOG=debug`.
+- `load_dense_from_file` / `save_dense_to_file` dispatch per extension
+  (#117-4); the lance and parquet branches live in module-private helpers
+  (`load_dense_lance`, `read_parquet_batches`, `dense_matrix_from_parquet`,
+  `save_dense_lance`, `save_dense_parquet`, `checked_dense_batch`).
+
+**Fixed**
+
+- The two api_public tests that depend on a foreign flock holder
+  (`downstream_metadata_cycle_runs_under_both_locks`,
+  `downstream_try_lock_cycle_maps_contention_to_lock_would_block`) are
+  `#[cfg(unix)]`, like the crate-internal flock tests (8272ee5). Windows
+  CI no longer panics on the POSIX-only `with_file_lock` convention.
+
+Refs: #117.
+
 ## 0.62.0 (2026-09-07)
 
 Removes the unmaintained `paste` proc-macro from the dependency tree

@@ -9,8 +9,9 @@ use std::fs;
 use std::path::Path;
 
 use crate::generations::{
-    GenerationInfo, generation_name, list_artifact_generations, list_generations, logical_name,
-    parse_generation, write_json_atomic,
+    GenerationInfo, artifact_file_name, artifact_file_path, generation_name,
+    list_artifact_generations, list_generations, logical_name, metadata_file_name,
+    metadata_file_path, parse_generation, validate_logical_name, write_json_atomic,
 };
 use crate::lance_storage_graph::LanceStorageGraph;
 use crate::traits::backend::StorageBackend;
@@ -33,6 +34,73 @@ fn test_generation_naming_roundtrip() {
     // double suffix strips the last generation only
     assert_eq!(logical_name("ds__g1__g2"), "ds__g1");
     assert_eq!(parse_generation("ds__g1__g2"), Some(2));
+}
+
+/// #117-3: one naming grammar for artifact and metadata file names —
+/// every producer (paths, registered FileInfo names) builds from the same
+/// functions so the on-disk name and the registered name cannot drift.
+#[test]
+fn test_artifact_and_metadata_name_builders() {
+    assert_eq!(artifact_file_name("ds", "raw_input"), "ds_raw_input.lance");
+    assert_eq!(
+        artifact_file_name("ds__g3", "laplacian"),
+        "ds__g3_laplacian.lance"
+    );
+    assert_eq!(metadata_file_name("ds"), "ds_metadata.json");
+    assert_eq!(metadata_file_name("ds__g3"), "ds__g3_metadata.json");
+
+    let base = std::path::Path::new("/tmp/store");
+    assert_eq!(
+        artifact_file_path(base, "ds", "k1"),
+        base.join("ds_k1.lance")
+    );
+    assert_eq!(
+        metadata_file_path(base, "ds"),
+        base.join("ds_metadata.json")
+    );
+}
+
+/// #117-3: `__g{digits}` suffixes are reserved for generation handles.
+/// A user-minted logical instance with a reserved suffix would collide
+/// with generation discovery and sweep, so it is rejected early and typed.
+#[test]
+fn test_validate_logical_name_rejects_reserved_suffix() {
+    assert!(validate_logical_name("ds").is_ok());
+    assert!(validate_logical_name("ds_ab12").is_ok());
+    assert!(
+        validate_logical_name("ds__g1x").is_ok(),
+        "non-digit suffix is not reserved"
+    );
+
+    let err = validate_logical_name("ds__g3").unwrap_err();
+    assert!(
+        matches!(err, crate::StorageError::Invalid(_)),
+        "expected Invalid, got {err:?}"
+    );
+    assert!(validate_logical_name("ds__g0").is_err());
+    assert!(
+        validate_logical_name("ds__g1__g2").is_err(),
+        "trailing suffix is reserved"
+    );
+}
+
+/// #117-3: the user-facing constructor enforces the reserved-suffix rule;
+/// scoped generation handles and stored name_id re-spawns are unaffected.
+#[test]
+fn test_new_rejects_reserved_suffix_but_scoped_generation_mints_it() {
+    let err = LanceStorageGraph::new("/tmp/x".to_string(), "ds__g3".to_string()).unwrap_err();
+    assert!(
+        matches!(err, crate::StorageError::Invalid(_)),
+        "expected Invalid, got {err:?}"
+    );
+
+    let base = LanceStorageGraph::new("/tmp/x".to_string(), "ds".to_string()).unwrap();
+    let handle = base.scoped_generation(3);
+    assert_eq!(
+        handle.get_name(),
+        "ds__g3",
+        "scoped_generation still mints reserved names"
+    );
 }
 
 /// Atomic publish: the file always holds a complete document, overwrites
@@ -85,7 +153,10 @@ fn fsync_dir_succeeds_on_real_directory() {
 #[tokio::test(flavor = "multi_thread")]
 async fn write_json_atomic_publishes_into_fresh_parent_dir() {
     let dir = tmp_dir("write_json_atomic_fresh_parent").await;
-    let path = dir.join("nested").join("deeper").join("ds__g1_metadata.json");
+    let path = dir
+        .join("nested")
+        .join("deeper")
+        .join("ds__g1_metadata.json");
 
     write_json_atomic(&path, r#"{"v": 1}"#).expect("publish into fresh parent dirs must succeed");
     assert_eq!(fs::read_to_string(&path).unwrap(), r#"{"v": 1}"#);
@@ -200,6 +271,7 @@ async fn test_delete_generation_is_prefix_exact() {
 async fn test_scoped_generation_routes_artifact_paths() {
     let dir = tmp_dir("test_scoped_generation_routes_artifact_paths").await;
     let storage = LanceStorageGraph::new(dir.to_string_lossy().to_string(), "ds".to_string())
+        .expect("valid instance name")
         .scoped_generation(3);
 
     assert_eq!(storage.get_name(), "ds__g3");
@@ -223,6 +295,7 @@ async fn test_scoped_generation_routes_artifact_paths() {
 async fn test_scoped_generation_zero_is_the_build_generation() {
     let dir = tmp_dir("test_scoped_generation_zero_is_the_build_generation").await;
     let storage = LanceStorageGraph::new(dir.to_string_lossy().to_string(), "ds".to_string())
+        .expect("valid instance name")
         .scoped_generation(0);
 
     assert_eq!(

@@ -233,7 +233,9 @@ impl Catalog for LocalRegistry {
                 .base_location
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| format!("{}_{}.lance", self.metadata.name_id, table.name)),
+                .unwrap_or_else(|| {
+                    crate::generations::artifact_file_name(&self.metadata.name_id, &table.name)
+                }),
             prop("filetype").as_deref().unwrap_or("vector"),
             (parse("rows")?.unwrap_or(0), parse("cols")?.unwrap_or(0)),
             parse("nnz")?,

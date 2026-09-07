@@ -221,7 +221,7 @@ impl Metadata for GeneMetadata {
         size_bytes: Option<u64>,
     ) -> StorageResult<FileInfo> {
         FileInfo::new(
-            format!("{}_{}.lance", self.name_id, key),
+            crate::generations::artifact_file_name(&self.name_id, key),
             filetype,
             (data_shape.0, data_shape.1),
             nnz,

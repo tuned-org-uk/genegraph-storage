@@ -81,7 +81,8 @@ async fn ensure_parent_dir(path: &Path) -> StorageResult<()> {
 /// let storage = LanceStorageGraph::new(
 ///     base.to_string_lossy().to_string(),
 ///     "doc_example".to_string(),
-/// );
+/// )
+/// .expect("valid instance name");
 ///
 /// // some 2D data
 /// let dense: Vec<Vec<f64>> = vec![vec![0.1, 0.4], vec![0.5, 0.2], vec![0.03, 0.8]];
@@ -123,7 +124,20 @@ impl LanceStorageGraph {
     ///
     /// * `base` - Base directory path for all storage files
     /// * `name` - Name prefix for this storage instance
-    pub fn new(base: String, name: String) -> Self {
+    ///
+    /// The name must not carry the reserved generation suffix `__g<n>`
+    /// (#117-3): only [`Self::scoped_generation`] mints generation-qualified
+    /// names, otherwise generation discovery and sweep would treat the
+    /// instance as a generation of another logical dataset.
+    pub fn new(base: String, name: String) -> StorageResult<Self> {
+        crate::generations::validate_logical_name(&name)?;
+        Ok(Self::from_parts(base, name))
+    }
+
+    /// Unvalidated constructor for vetted names: stored `name_id`s read
+    /// back through [`Self::spawn`], generation handles from
+    /// [`Self::scoped_generation`], and internal temporary handles.
+    fn from_parts(base: String, name: String) -> Self {
         info!("Creating LanceStorage at base={}, name={}", base, name);
         Self { base, name }
     }
@@ -145,7 +159,7 @@ impl LanceStorageGraph {
         let metadata = GeneMetadata::read(md_path.unwrap()).await?;
 
         // Construct the LanceStorage using the metadata-provided nameid
-        let storage = Self::new(base_path.clone(), metadata.name_id.clone());
+        let storage = Self::from_parts(base_path.clone(), metadata.name_id.clone());
         Ok((storage, metadata))
     }
 
@@ -156,7 +170,7 @@ impl LanceStorageGraph {
     /// recoverable via [`crate::generations::logical_name`].
     pub fn scoped_generation(&self, generation: u64) -> Self {
         let logical = crate::generations::logical_name(&self.name);
-        Self::new(
+        Self::from_parts(
             self.base.clone(),
             crate::generations::generation_name(logical, generation),
         )
@@ -164,6 +178,254 @@ impl LanceStorageGraph {
 }
 
 impl LanceStorage for LanceStorageGraph {}
+
+// =========
+// Dense file I/O helpers (#117-4): one function per format branch so each
+// can be read and tested in isolation. The dispatchers above stay thin.
+// =========
+
+/// Parent directory of `path`, UTF-8 validated.
+fn parent_dir_of(path: &Path) -> StorageResult<String> {
+    path.parent()
+        .ok_or_else(|| StorageError::Invalid(format!("Path has no parent: {:?}", path)))?
+        .to_str()
+        .map(str::to_string)
+        .ok_or_else(|| StorageError::Invalid(format!("Non-UTF8 parent path for {:?}", path)))
+}
+
+/// Lance branch of `load_dense_from_file`: read the dataset directory
+/// through a temporary backend rooted at the file's parent.
+async fn load_dense_lance(path: &Path) -> StorageResult<DenseMatrix<f64>> {
+    use crate::traits::backend::StorageBackend;
+    use crate::traits::lance::LanceStorage;
+
+    let parent = parent_dir_of(path)?;
+    let tmp_storage = LanceStorageGraph::from_parts(parent, String::from("tmp_storage"));
+
+    let uri = LanceStorageGraph::path_to_uri(path)?;
+    let batch = tmp_storage.read_lance_all_batches_async(uri).await?;
+    let matrix = tmp_storage.from_dense_record_batch(&batch)?;
+    info!(
+        "Loaded dense matrix from Lance: {} x {}",
+        matrix.shape().0,
+        matrix.shape().1
+    );
+    Ok(matrix)
+}
+
+/// Parquet branch of `load_dense_from_file`, reader half.
+///
+/// Parquet readers require a synchronous `Read` impl; run the blocking
+/// open/read/concat on the dedicated blocking pool so the async executor
+/// thread is not stalled (issue #52).
+async fn read_parquet_batches(path: &Path) -> StorageResult<RecordBatch> {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let owned_path = path.to_path_buf();
+    let combined = tokio::task::spawn_blocking(move || -> StorageResult<RecordBatch> {
+        let file = std::fs::File::open(&owned_path)
+            .map_err(|e| StorageError::Io(format!("Failed to open parquet file: {}", e)))?;
+
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| {
+            StorageError::Parquet(format!("Failed to create parquet reader: {}", e))
+        })?;
+        let reader = builder
+            .build()
+            .map_err(|e| StorageError::Parquet(format!("Failed to build parquet reader: {}", e)))?;
+
+        let batches: Vec<RecordBatch> = reader
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| StorageError::Parquet(format!("Failed to read parquet batch: {}", e)))?;
+
+        if batches.is_empty() {
+            return Err(StorageError::Invalid(format!(
+                "Empty parquet dataset at {:?}",
+                owned_path
+            )));
+        }
+
+        let schema = batches[0].schema();
+        arrow::compute::concat_batches(&schema, &batches).map_err(|e| {
+            StorageError::Parquet(format!("Failed to concatenate parquet batches: {}", e))
+        })
+    })
+    .await
+    .map_err(|e| StorageError::Io(format!("Parquet reader task failed: {}", e)))??;
+    Ok(combined)
+}
+
+/// Parquet branch of `load_dense_from_file`, layout half.
+///
+/// Supported layouts: `vector: FixedSizeList<Float64>` (decodes like the
+/// Lance path) and the legacy wide layout with `Float64` columns named
+/// `col_0..col_N`; anything else is rejected with `StorageError::Invalid`.
+fn dense_matrix_from_parquet(
+    path: &Path,
+    combined: &RecordBatch,
+) -> StorageResult<DenseMatrix<f64>> {
+    use crate::traits::backend::StorageBackend;
+
+    let schema = combined.schema();
+    let fields = schema.fields();
+    let is_vector = fields.len() == 1
+        && matches!(
+            fields[0].data_type(),
+            DataType::FixedSizeList(inner, _)
+                if matches!(inner.data_type(), DataType::Float64)
+        );
+
+    let is_wide_col = !is_vector
+        && !fields.is_empty()
+        && fields
+            .iter()
+            .all(|f| matches!(f.data_type(), DataType::Float64))
+        && fields.iter().any(|f| f.name().starts_with("col_"));
+
+    let matrix = if is_vector {
+        // New format already: vector column (FixedSizeList<Float64>)
+        // Reuse the same decoding as Lance.
+        let parent = parent_dir_of(path)?;
+        let tmp_storage = LanceStorageGraph::from_parts(parent, String::from("tmp_storage"));
+        tmp_storage.from_dense_record_batch(combined)?
+    } else if is_wide_col {
+        // Old wide columnar: columns like col_0, col_1, ... as Float64
+        let n_rows = combined.num_rows();
+        let n_cols = combined.num_columns();
+        if n_rows == 0 || n_cols == 0 {
+            return Err(StorageError::Invalid(format!(
+                "Cannot load empty wide-column parquet at {:?}",
+                path
+            )));
+        }
+
+        let mut data = Vec::with_capacity(n_rows * n_cols);
+        for col_idx in 0..n_cols {
+            let col = combined.column(col_idx);
+            let arr = col.as_any().downcast_ref::<Float64Array>().ok_or_else(|| {
+                StorageError::Invalid(format!(
+                    "Wide-column parquet expects Float64, got {:?} in column {}",
+                    col.data_type(),
+                    col_idx
+                ))
+            })?;
+            // Build column-major storage: all rows for col 0, then col 1, ...
+            for row_idx in 0..n_rows {
+                data.push(arr.value(row_idx));
+            }
+        }
+
+        DenseMatrix::new(n_rows, n_cols, data, true)
+            .map_err(|e| StorageError::Invalid(e.to_string()))?
+    } else {
+        return Err(StorageError::Invalid(format!(
+            "Unsupported Parquet schema at {:?}: expected FixedSizeList<Float64> \
+             or wide Float64 columns named col_*",
+            path
+        )));
+    };
+
+    info!(
+        "Loaded dense matrix from Parquet: {} x {}",
+        matrix.shape().0,
+        matrix.shape().1
+    );
+    Ok(matrix)
+}
+
+/// Builds the vector-layout RecordBatch for `data` and verifies the row
+/// count survived the conversion.
+fn checked_dense_batch(
+    storage: &LanceStorageGraph,
+    data: &DenseMatrix<f64>,
+) -> StorageResult<RecordBatch> {
+    use crate::traits::backend::StorageBackend;
+
+    let batch = storage.to_dense_record_batch(data)?;
+    let (n_rows, _) = data.shape();
+    if batch.num_rows() != n_rows {
+        return Err(StorageError::Invalid(format!(
+            "RecordBatch has {} rows but matrix has {} rows",
+            batch.num_rows(),
+            n_rows
+        )));
+    }
+    Ok(batch)
+}
+
+/// Lance branch of `save_dense_to_file`.
+async fn save_dense_lance(
+    parent_dir: String,
+    data: &DenseMatrix<f64>,
+    path: &Path,
+) -> StorageResult<()> {
+    use crate::traits::backend::StorageBackend;
+    use crate::traits::lance::LanceStorage;
+
+    let tmp_storage = LanceStorageGraph::from_parts(parent_dir, String::from("tmp_storage"));
+    let batch = checked_dense_batch(&tmp_storage, data)?;
+    debug!(
+        "Created RecordBatch with {} rows for Lance",
+        batch.num_rows()
+    );
+
+    let uri = LanceStorageGraph::path_to_uri(path)?;
+    tmp_storage.write_lance_batch_async(uri, batch).await?;
+    let (n_rows, n_cols) = data.shape();
+    info!("Saved dense matrix to Lance: {} x {}", n_rows, n_cols);
+    Ok(())
+}
+
+/// Parquet branch of `save_dense_to_file`.
+///
+/// The parquet writer is synchronous: run it on the blocking pool so the
+/// async executor thread is not stalled (see #52 for the matching read
+/// path).
+async fn save_dense_parquet(
+    parent_dir: String,
+    data: &DenseMatrix<f64>,
+    path: &Path,
+) -> StorageResult<()> {
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
+    use std::fs::File;
+
+    let tmp_storage = LanceStorageGraph::from_parts(parent_dir, String::from("tmp_storage"));
+    let batch = checked_dense_batch(&tmp_storage, data)?;
+    debug!(
+        "Created RecordBatch with {} rows for Parquet",
+        batch.num_rows()
+    );
+
+    let owned_path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> StorageResult<()> {
+        let file = File::create(&owned_path)
+            .map_err(|e| StorageError::Io(format!("Failed to create parquet file: {}", e)))?;
+
+        let props = WriterProperties::builder()
+            .set_compression(parquet::basic::Compression::SNAPPY)
+            .build();
+
+        let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props)).map_err(|e| {
+            StorageError::Parquet(format!("Failed to create parquet writer: {}", e))
+        })?;
+
+        writer
+            .write(&batch)
+            .map_err(|e| StorageError::Parquet(format!("Failed to write batch: {}", e)))?;
+
+        writer
+            .close()
+            .map_err(|e| StorageError::Parquet(format!("Failed to close writer: {}", e)))?;
+
+        Ok(())
+    })
+    .await
+    .map_err(|e| StorageError::Io(format!("parquet writer task failed: {}", e)))??;
+
+    let (n_rows, n_cols) = data.shape();
+    info!("Saved dense matrix to Parquet: {} x {}", n_rows, n_cols);
+    Ok(())
+}
 
 impl StorageBackend for LanceStorageGraph {
     fn get_base(&self) -> String {
@@ -179,8 +441,7 @@ impl StorageBackend for LanceStorageGraph {
     }
 
     fn metadata_path(&self) -> PathBuf {
-        self.base_path()
-            .join(format!("{}_metadata.json", self.name))
+        crate::generations::metadata_file_path(&self.base_path(), &self.name)
     }
 
     /// Converts the base path for the store to a `file://` URI for Lance.
@@ -236,7 +497,7 @@ impl StorageBackend for LanceStorageGraph {
                 md = md.add_file(
                     key,
                     FileInfo::new(
-                        format!("{}_{}.lance", self.get_name(), key),
+                        crate::generations::artifact_file_name(self.get_name().as_str(), key),
                         "dense",
                         matrix.shape(),
                         None,
@@ -280,6 +541,7 @@ impl StorageBackend for LanceStorageGraph {
     /// Load initial data using columnar format from a file path.
     ///
     /// Async test helper that avoids any internal blocking runtimes.
+    /// Format dispatch only (#117-4): each branch lives in its own helper.
     async fn load_dense_from_file(&self, path: &Path) -> StorageResult<DenseMatrix<f64>> {
         info!("Loading dense matrix from file (async): {:?}", path);
 
@@ -296,163 +558,10 @@ impl StorageBackend for LanceStorageGraph {
             .ok_or_else(|| StorageError::Invalid(format!("Invalid file path: {:?}", path)))?;
 
         match extension {
-            "lance" => {
-                // Use a temporary LanceStorage rooted at the file's parent dir,
-                // same pattern as save_dense_to_file_async.
-                let parent = path
-                    .parent()
-                    .ok_or_else(|| {
-                        StorageError::Invalid(format!("Path has no parent: {:?}", path))
-                    })?
-                    .to_str()
-                    .ok_or_else(|| {
-                        StorageError::Invalid(format!("Non-UTF8 parent path for {:?}", path))
-                    })?
-                    .to_string();
-
-                let tmp_storage = Self::new(parent, String::from("tmp_storage"));
-
-                // Reuse the async Lance reader logic.
-                let uri = Self::path_to_uri(path)?;
-                let batch = tmp_storage.read_lance_all_batches_async(uri).await?;
-                let matrix = tmp_storage.from_dense_record_batch(&batch)?;
-                info!(
-                    "Loaded dense matrix from Lance: {} x {}",
-                    matrix.shape().0,
-                    matrix.shape().1
-                );
-                Ok(matrix)
-            }
+            "lance" => load_dense_lance(path).await,
             "parquet" => {
-                use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-
-                // Parquet readers require a synchronous `Read` impl; run the
-                // blocking open/read/concat on the dedicated blocking pool so
-                // the async executor thread is not stalled (issue #52).
-                let owned_path = path.to_path_buf();
-                let combined =
-                    tokio::task::spawn_blocking(move || -> StorageResult<RecordBatch> {
-                        let file = std::fs::File::open(&owned_path).map_err(|e| {
-                            StorageError::Io(format!("Failed to open parquet file: {}", e))
-                        })?;
-
-                        let builder =
-                            ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| {
-                                StorageError::Parquet(format!(
-                                    "Failed to create parquet reader: {}",
-                                    e
-                                ))
-                            })?;
-                        let reader = builder.build().map_err(|e| {
-                            StorageError::Parquet(format!("Failed to build parquet reader: {}", e))
-                        })?;
-
-                        let batches: Vec<RecordBatch> =
-                            reader.collect::<Result<Vec<_>, _>>().map_err(|e| {
-                                StorageError::Parquet(format!(
-                                    "Failed to read parquet batch: {}",
-                                    e
-                                ))
-                            })?;
-
-                        if batches.is_empty() {
-                            return Err(StorageError::Invalid(format!(
-                                "Empty parquet dataset at {:?}",
-                                owned_path
-                            )));
-                        }
-
-                        let schema = batches[0].schema();
-                        arrow::compute::concat_batches(&schema, &batches).map_err(|e| {
-                            StorageError::Parquet(format!(
-                                "Failed to concatenate parquet batches: {}",
-                                e
-                            ))
-                        })
-                    })
-                    .await
-                    .map_err(|e| {
-                        StorageError::Io(format!("Parquet reader task failed: {}", e))
-                    })??;
-
-                // 2. Detect layout: vector (FixedSizeList) vs old wide columnar (col_* Float64)
-                let schema = combined.schema();
-                let fields = schema.fields();
-                let is_vector = fields.len() == 1
-                    && matches!(
-                        fields[0].data_type(),
-                        DataType::FixedSizeList(inner, _)
-                            if matches!(inner.data_type(), DataType::Float64)
-                    );
-
-                let is_wide_col = !is_vector
-                    && !fields.is_empty()
-                    && fields
-                        .iter()
-                        .all(|f| matches!(f.data_type(), DataType::Float64))
-                    && fields.iter().any(|f| f.name().starts_with("col_"));
-
-                // 3. Build DenseMatrix from the RecordBatch
-                let matrix = if is_vector {
-                    // New format already: vector column (FixedSizeList<Float64>)
-                    // Reuse the same decoding as Lance.
-                    let parent = path
-                        .parent()
-                        .ok_or_else(|| {
-                            StorageError::Invalid(format!("Path has no parent: {:?}", path))
-                        })?
-                        .to_str()
-                        .ok_or_else(|| {
-                            StorageError::Invalid(format!("Non-UTF8 parent path for {:?}", path))
-                        })?
-                        .to_string();
-
-                    let tmp_storage = Self::new(parent, String::from("tmp_storage"));
-                    tmp_storage.from_dense_record_batch(&combined)?
-                } else if is_wide_col {
-                    // Old wide columnar: columns like col_0, col_1, ... as Float64
-                    let n_rows = combined.num_rows();
-                    let n_cols = combined.num_columns();
-                    if n_rows == 0 || n_cols == 0 {
-                        return Err(StorageError::Invalid(format!(
-                            "Cannot load empty wide-column parquet at {:?}",
-                            path
-                        )));
-                    }
-
-                    let mut data = Vec::with_capacity(n_rows * n_cols);
-                    for col_idx in 0..n_cols {
-                        let col = combined.column(col_idx);
-                        let arr = col.as_any().downcast_ref::<Float64Array>().ok_or_else(|| {
-                            StorageError::Invalid(format!(
-                                "Wide-column parquet expects Float64, got {:?} in column {}",
-                                col.data_type(),
-                                col_idx
-                            ))
-                        })?;
-                        // Build column-major storage: all rows for col 0, then col 1, ...
-                        for row_idx in 0..n_rows {
-                            data.push(arr.value(row_idx));
-                        }
-                    }
-
-                    DenseMatrix::new(n_rows, n_cols, data, true)
-                        .map_err(|e| StorageError::Invalid(e.to_string()))?
-                } else {
-                    return Err(StorageError::Invalid(format!(
-                        "Unsupported Parquet schema at {:?}: expected FixedSizeList<Float64> \
-                         or wide Float64 columns named col_*",
-                        path
-                    )));
-                };
-
-                info!(
-                    "Loaded dense matrix from Parquet: {} x {}",
-                    matrix.shape().0,
-                    matrix.shape().1
-                );
-
-                Ok(matrix)
+                let combined = read_parquet_batches(path).await?;
+                dense_matrix_from_parquet(path, &combined)
             }
             _ => Err(StorageError::Invalid(format!(
                 "Unsupported file format: {}. Only .lance and .parquet are supported",
@@ -462,8 +571,7 @@ impl StorageBackend for LanceStorageGraph {
     }
 
     fn file_path(&self, key: &str) -> PathBuf {
-        self.base_path()
-            .join(format!("{}_{}.lance", self.name, key))
+        crate::generations::artifact_file_path(&self.base_path(), &self.name, key)
     }
 
     // =========
@@ -507,7 +615,7 @@ impl StorageBackend for LanceStorageGraph {
                 metadata = metadata.add_file(
                     key,
                     FileInfo::new(
-                        format!("{}_{}.lance", self.get_name(), key),
+                        crate::generations::artifact_file_name(self.get_name().as_str(), key),
                         filetype.as_str(),
                         (matrix.rows(), matrix.cols()),
                         Some(matrix.nnz()),
@@ -651,9 +759,6 @@ impl StorageBackend for LanceStorageGraph {
             .ok_or_else(|| StorageError::Invalid(format!("non-UTF8 parent path for {:?}", path)))?
             .to_string();
 
-        // Temporary storage, only used to build the record batch / write lance.
-        let tmp_storage = Self::new(parent_str, String::from("tmp_storage"));
-
         let extension = path
             .extension()
             .and_then(|e| e.to_str())
@@ -663,287 +768,13 @@ impl StorageBackend for LanceStorageGraph {
         info!("Saving matrix: {} rows x {} cols", n_rows, n_cols);
 
         match extension {
-            "lance" => {
-                let batch = tmp_storage.to_dense_record_batch(data)?;
-                debug!(
-                    "Created RecordBatch with {} rows for Lance",
-                    batch.num_rows()
-                );
-
-                // Verify all rows are in the batch
-                if batch.num_rows() != n_rows {
-                    return Err(StorageError::Invalid(format!(
-                        "RecordBatch has {} rows but matrix has {} rows",
-                        batch.num_rows(),
-                        n_rows
-                    )));
-                }
-
-                let uri = Self::path_to_uri(path)?;
-                tmp_storage.write_lance_batch_async(uri, batch).await?;
-                info!("Saved dense matrix to Lance: {} x {}", n_rows, n_cols);
-                Ok(())
-            }
-            "parquet" => {
-                use parquet::arrow::ArrowWriter;
-                use parquet::file::properties::WriterProperties;
-                use std::fs::File;
-
-                let batch = tmp_storage.to_dense_record_batch(data)?;
-                debug!(
-                    "Created RecordBatch with {} rows for Parquet",
-                    batch.num_rows()
-                );
-
-                if batch.num_rows() != n_rows {
-                    return Err(StorageError::Invalid(format!(
-                        "RecordBatch has {} rows but matrix has {} rows",
-                        batch.num_rows(),
-                        n_rows
-                    )));
-                }
-
-                // The parquet writer is synchronous: run it on the blocking
-                // pool so the async executor thread is not stalled (see #52
-                // for the matching read path).
-                let owned_path = path.to_path_buf();
-                tokio::task::spawn_blocking(move || -> StorageResult<()> {
-                    let file = File::create(&owned_path).map_err(|e| {
-                        StorageError::Io(format!("Failed to create parquet file: {}", e))
-                    })?;
-
-                    let props = WriterProperties::builder()
-                        .set_compression(parquet::basic::Compression::SNAPPY)
-                        .build();
-
-                    let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props))
-                        .map_err(|e| {
-                            StorageError::Parquet(format!("Failed to create parquet writer: {}", e))
-                        })?;
-
-                    writer.write(&batch).map_err(|e| {
-                        StorageError::Parquet(format!("Failed to write batch: {}", e))
-                    })?;
-
-                    writer.close().map_err(|e| {
-                        StorageError::Parquet(format!("Failed to close writer: {}", e))
-                    })?;
-
-                    Ok(())
-                })
-                .await
-                .map_err(|e| StorageError::Io(format!("parquet writer task failed: {}", e)))??;
-
-                info!("Saved dense matrix to Parquet: {} x {}", n_rows, n_cols);
-                Ok(())
-            }
+            "lance" => save_dense_lance(parent_str, data, path).await,
+            "parquet" => save_dense_parquet(parent_str, data, path).await,
             _ => Err(StorageError::Invalid(format!(
                 "Unsupported file format: {}. Only .lance and .parquet are supported",
                 extension
             ))),
         }
-    }
-
-    /// Save centroid_map (item-to-centroid assignments)
-    async fn save_centroid_map(&self, map: &[usize], md_path: &Path) -> StorageResult<()> {
-        info!("Saving {} centroid map entries", map.len());
-        // Checked cast: usize values above u32::MAX must not be silently
-        // truncated (issue #51).
-        let values = checked_u32_values(map, "centroid map")?;
-        self.save_primitive_column::<UInt32Type>("centroid_map", "centroid_id", values, md_path)
-            .await
-    }
-
-    /// Load centroid_map
-    async fn load_centroid_map(&self) -> StorageResult<Vec<usize>> {
-        let path = self.file_path("centroid_map");
-        info!("Loading centroid map from {:?}", path);
-
-        let uri = Self::path_to_uri(&path)?;
-        let batch = self.read_lance_all_batches_async(uri).await?;
-        let arr = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<UInt32Array>()
-            .ok_or_else(|| StorageError::Invalid("centroid_id column type mismatch".into()))?;
-
-        let map: Vec<usize> = (0..arr.len()).map(|i| arr.value(i) as usize).collect();
-        info!("Loaded {} centroid map entries", map.len());
-        Ok(map)
-    }
-
-    /// Save subcentroid_lambdas (tau values for subcentroids)
-    async fn save_subcentroid_lambdas(&self, lambdas: &[f64], md_path: &Path) -> StorageResult<()> {
-        info!("Saving {} subcentroid lambda values", lambdas.len());
-        self.save_primitive_column::<Float64Type>(
-            "subcentroid_lambdas",
-            "subcentroid_lambda",
-            lambdas.to_vec(),
-            md_path,
-        )
-        .await
-    }
-
-    /// Load subcentroid_lambdas
-    async fn load_subcentroid_lambdas(&self) -> StorageResult<Vec<f64>> {
-        let path = self.file_path("subcentroid_lambdas");
-        info!("Loading subcentroid lambda values from {:?}", path);
-
-        let uri = Self::path_to_uri(&path)?;
-        let batch = self.read_lance_all_batches_async(uri).await?;
-        let arr = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .ok_or_else(|| {
-                StorageError::Invalid("subcentroid_lambda column type mismatch".into())
-            })?;
-
-        let lambdas: Vec<f64> = (0..arr.len()).map(|i| arr.value(i)).collect();
-        info!("Loaded {} subcentroid lambda values", lambdas.len());
-        Ok(lambdas)
-    }
-
-    /// Save subcentroids (dense matrix)
-    async fn save_subcentroids(
-        &self,
-        subcentroids: &DenseMatrix<f64>,
-        md_path: &Path,
-    ) -> StorageResult<()> {
-        self.validate_initialized(md_path)?;
-        let key = "sub_centroids";
-        let path = self.file_path(key);
-        let (n_rows, n_cols) = subcentroids.shape();
-        info!(
-            "Saving subcentroids matrix {} x {} at {:?}",
-            n_rows, n_cols, path
-        );
-
-        let batch = self.to_dense_record_batch(subcentroids)?;
-        {
-            crate::commit::with_commit_actor(&self.metadata_path(), || async {
-                let mut metadata = self.load_metadata().await?;
-                metadata = metadata.add_file(
-                    key,
-                    FileInfo::new(
-                        format!("{}_{}.lance", self.get_name(), key),
-                        "vector",
-                        subcentroids.shape(),
-                        None,
-                        None,
-                    )?,
-                );
-                self.save_metadata(&metadata).await
-            })
-            .await?;
-
-            let uri = Self::path_to_uri(&path)?;
-            self.write_lance_batch_async(uri, batch).await?;
-        }
-        debug!("Subcentroids matrix saved successfully");
-        Ok(())
-    }
-
-    /// Load subcentroids as Vec<Vec<f64>>
-    async fn load_subcentroids(&self) -> StorageResult<Vec<Vec<f64>>> {
-        let path = self.file_path("sub_centroids");
-        info!("Loading sub_centroids from {:?}", path);
-
-        let uri = Self::path_to_uri(&path)?;
-        let batch = self.read_lance_all_batches_async(uri).await?;
-        let matrix = self.from_dense_record_batch(&batch)?;
-
-        // Convert DenseMatrix to Vec<Vec<f64>>
-        let (n_rows, n_cols) = matrix.shape();
-        let mut result = Vec::with_capacity(n_rows);
-
-        for row_idx in 0..n_rows {
-            let row: Vec<f64> = (0..n_cols)
-                .map(|col_idx| *matrix.get((row_idx, col_idx)))
-                .collect();
-            result.push(row);
-        }
-
-        info!(
-            "Loaded sub_centroids: {} x {} as Vec<Vec<f64>>",
-            n_rows, n_cols
-        );
-        Ok(result)
-    }
-
-    /// Save item norms vector
-    async fn save_item_norms(&self, item_norms: &[f64], md_path: &Path) -> StorageResult<()> {
-        info!("Saving {} item norm values", item_norms.len());
-        self.save_primitive_column::<Float64Type>(
-            "item_norms",
-            "norm",
-            item_norms.to_vec(),
-            md_path,
-        )
-        .await
-    }
-
-    /// Load item norms vector
-    async fn load_item_norms(&self) -> StorageResult<Vec<f64>> {
-        let path = self.file_path("item_norms");
-        info!("Loading item norms from {:?}", path);
-
-        let uri = Self::path_to_uri(&path)?;
-        let batch = self.read_lance_all_batches_async(uri).await?;
-        let arr = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .ok_or_else(|| StorageError::Invalid("norm column type mismatch".into()))?;
-
-        let norms: Vec<f64> = (0..arr.len()).map(|i| arr.value(i)).collect();
-        info!("Loaded {} item norm values", norms.len());
-        Ok(norms)
-    }
-
-    async fn save_cluster_assignments(
-        &self,
-        assignments: &[Option<usize>],
-        md_path: &Path,
-    ) -> StorageResult<()> {
-        info!("Saving {} cluster assignments", assignments.len());
-
-        // Convert Option<usize> to i64 (-1 for None)
-        let values: Vec<i64> = assignments
-            .iter()
-            .map(|opt| opt.map(|v| v as i64).unwrap_or(-1))
-            .collect();
-
-        self.save_primitive_column::<Int64Type>(
-            "cluster_assignments",
-            "cluster_id",
-            values,
-            md_path,
-        )
-        .await
-    }
-
-    async fn load_cluster_assignments(&self) -> StorageResult<Vec<Option<usize>>> {
-        use arrow::array::Int64Array;
-        let path = self.file_path("cluster_assignments");
-        info!("Loading cluster assignments from {:?}", path);
-
-        let uri = Self::path_to_uri(&path)?;
-        let batch = self.read_lance_all_batches_async(uri).await?;
-        let arr = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .ok_or_else(|| StorageError::Invalid("cluster_id column type mismatch".into()))?;
-
-        let assignments: Vec<Option<usize>> = (0..arr.len())
-            .map(|i| {
-                let v = arr.value(i);
-                if v < 0 { None } else { Some(v as usize) }
-            })
-            .collect();
-        info!("Loaded {} cluster assignments", assignments.len());
-        Ok(assignments)
     }
 
     // =========
@@ -979,7 +810,7 @@ impl StorageBackend for LanceStorageGraph {
         crate::commit::with_commit_actor(&self.metadata_path(), || async {
             let mut md = self.load_metadata().await?;
             let mut info = FileInfo::new(
-                format!("{}_{}.lance", self.get_name(), name),
+                crate::generations::artifact_file_name(self.get_name().as_str(), name),
                 "vectors",
                 (rows, dim as usize),
                 None,
@@ -1036,7 +867,7 @@ impl StorageBackend for LanceStorageGraph {
         crate::commit::with_commit_actor(&self.metadata_path(), || async {
             let mut md = self.load_metadata().await?;
             let mut info = FileInfo::new(
-                format!("{}_{}.lance", self.get_name(), name),
+                crate::generations::artifact_file_name(self.get_name().as_str(), name),
                 "graph",
                 (num_nodes_usize, num_nodes_usize),
                 Some(edges.len()),
@@ -1155,11 +986,6 @@ impl StorageBackend for LanceStorageGraph {
         Ok(graph)
     }
 
-    async fn load_graph_from_path_strict(&self, path: &Path) -> StorageResult<StoredGraph> {
-        self.load_graph_from_path_with_options(path, &GraphReadOptions::strict())
-            .await
-    }
-
     async fn load_scalars(&self, name: &str) -> StorageResult<Vec<f64>> {
         self.load_scalars_from_path(&self.file_path(name)).await
     }
@@ -1266,5 +1092,209 @@ impl StorageBackend for LanceStorageGraph {
         tokio::task::spawn_blocking(move || crate::lancefmt::read_schema(&path))
             .await
             .map_err(|e| StorageError::Io(format!("lancefmt read_schema task failed: {e}")))?
+    }
+}
+
+impl crate::traits::clustering::ClusteringArtifacts for LanceStorageGraph {
+    /// Save centroid_map (item-to-centroid assignments)
+    async fn save_centroid_map(&self, map: &[usize], md_path: &Path) -> StorageResult<()> {
+        info!("Saving {} centroid map entries", map.len());
+        // Checked cast: usize values above u32::MAX must not be silently
+        // truncated (issue #51).
+        let values = checked_u32_values(map, "centroid map")?;
+        self.save_primitive_column::<UInt32Type>("centroid_map", "centroid_id", values, md_path)
+            .await
+    }
+
+    /// Load centroid_map
+    async fn load_centroid_map(&self) -> StorageResult<Vec<usize>> {
+        let path = self.file_path("centroid_map");
+        info!("Loading centroid map from {:?}", path);
+
+        let uri = Self::path_to_uri(&path)?;
+        let batch = self.read_lance_all_batches_async(uri).await?;
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .ok_or_else(|| StorageError::Invalid("centroid_id column type mismatch".into()))?;
+
+        let map: Vec<usize> = (0..arr.len()).map(|i| arr.value(i) as usize).collect();
+        info!("Loaded {} centroid map entries", map.len());
+        Ok(map)
+    }
+
+    /// Save subcentroid_lambdas (tau values for subcentroids)
+    async fn save_subcentroid_lambdas(&self, lambdas: &[f64], md_path: &Path) -> StorageResult<()> {
+        info!("Saving {} subcentroid lambda values", lambdas.len());
+        self.save_primitive_column::<Float64Type>(
+            "subcentroid_lambdas",
+            "subcentroid_lambda",
+            lambdas.to_vec(),
+            md_path,
+        )
+        .await
+    }
+
+    /// Load subcentroid_lambdas
+    async fn load_subcentroid_lambdas(&self) -> StorageResult<Vec<f64>> {
+        let path = self.file_path("subcentroid_lambdas");
+        info!("Loading subcentroid lambda values from {:?}", path);
+
+        let uri = Self::path_to_uri(&path)?;
+        let batch = self.read_lance_all_batches_async(uri).await?;
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .ok_or_else(|| {
+                StorageError::Invalid("subcentroid_lambda column type mismatch".into())
+            })?;
+
+        let lambdas: Vec<f64> = (0..arr.len()).map(|i| arr.value(i)).collect();
+        info!("Loaded {} subcentroid lambda values", lambdas.len());
+        Ok(lambdas)
+    }
+
+    /// Save subcentroids (dense matrix)
+    async fn save_subcentroids(
+        &self,
+        subcentroids: &DenseMatrix<f64>,
+        md_path: &Path,
+    ) -> StorageResult<()> {
+        self.validate_initialized(md_path)?;
+        let key = "sub_centroids";
+        let path = self.file_path(key);
+        let (n_rows, n_cols) = subcentroids.shape();
+        info!(
+            "Saving subcentroids matrix {} x {} at {:?}",
+            n_rows, n_cols, path
+        );
+
+        let batch = self.to_dense_record_batch(subcentroids)?;
+        {
+            crate::commit::with_commit_actor(&self.metadata_path(), || async {
+                let mut metadata = self.load_metadata().await?;
+                metadata = metadata.add_file(
+                    key,
+                    FileInfo::new(
+                        crate::generations::artifact_file_name(self.get_name().as_str(), key),
+                        "vector",
+                        subcentroids.shape(),
+                        None,
+                        None,
+                    )?,
+                );
+                self.save_metadata(&metadata).await
+            })
+            .await?;
+
+            let uri = Self::path_to_uri(&path)?;
+            self.write_lance_batch_async(uri, batch).await?;
+        }
+        debug!("Subcentroids matrix saved successfully");
+        Ok(())
+    }
+
+    /// Load subcentroids as Vec<Vec<f64>>
+    async fn load_subcentroids(&self) -> StorageResult<Vec<Vec<f64>>> {
+        let path = self.file_path("sub_centroids");
+        info!("Loading sub_centroids from {:?}", path);
+
+        let uri = Self::path_to_uri(&path)?;
+        let batch = self.read_lance_all_batches_async(uri).await?;
+        let matrix = self.from_dense_record_batch(&batch)?;
+
+        // Convert DenseMatrix to Vec<Vec<f64>>
+        let (n_rows, n_cols) = matrix.shape();
+        let mut result = Vec::with_capacity(n_rows);
+
+        for row_idx in 0..n_rows {
+            let row: Vec<f64> = (0..n_cols)
+                .map(|col_idx| *matrix.get((row_idx, col_idx)))
+                .collect();
+            result.push(row);
+        }
+
+        info!(
+            "Loaded sub_centroids: {} x {} as Vec<Vec<f64>>",
+            n_rows, n_cols
+        );
+        Ok(result)
+    }
+
+    /// Save item norms vector
+    async fn save_item_norms(&self, item_norms: &[f64], md_path: &Path) -> StorageResult<()> {
+        info!("Saving {} item norm values", item_norms.len());
+        self.save_primitive_column::<Float64Type>(
+            "item_norms",
+            "norm",
+            item_norms.to_vec(),
+            md_path,
+        )
+        .await
+    }
+
+    /// Load item norms vector
+    async fn load_item_norms(&self) -> StorageResult<Vec<f64>> {
+        let path = self.file_path("item_norms");
+        info!("Loading item norms from {:?}", path);
+
+        let uri = Self::path_to_uri(&path)?;
+        let batch = self.read_lance_all_batches_async(uri).await?;
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .ok_or_else(|| StorageError::Invalid("norm column type mismatch".into()))?;
+
+        let norms: Vec<f64> = (0..arr.len()).map(|i| arr.value(i)).collect();
+        info!("Loaded {} item norm values", norms.len());
+        Ok(norms)
+    }
+
+    async fn save_cluster_assignments(
+        &self,
+        assignments: &[Option<usize>],
+        md_path: &Path,
+    ) -> StorageResult<()> {
+        info!("Saving {} cluster assignments", assignments.len());
+
+        // Convert Option<usize> to i64 (-1 for None)
+        let values: Vec<i64> = assignments
+            .iter()
+            .map(|opt| opt.map(|v| v as i64).unwrap_or(-1))
+            .collect();
+
+        self.save_primitive_column::<Int64Type>(
+            "cluster_assignments",
+            "cluster_id",
+            values,
+            md_path,
+        )
+        .await
+    }
+
+    async fn load_cluster_assignments(&self) -> StorageResult<Vec<Option<usize>>> {
+        use arrow::array::Int64Array;
+        let path = self.file_path("cluster_assignments");
+        info!("Loading cluster assignments from {:?}", path);
+
+        let uri = Self::path_to_uri(&path)?;
+        let batch = self.read_lance_all_batches_async(uri).await?;
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| StorageError::Invalid("cluster_id column type mismatch".into()))?;
+
+        let assignments: Vec<Option<usize>> = (0..arr.len())
+            .map(|i| {
+                let v = arr.value(i);
+                if v < 0 { None } else { Some(v as usize) }
+            })
+            .collect();
+        info!("Loaded {} cluster assignments", assignments.len());
+        Ok(assignments)
     }
 }

@@ -16,7 +16,8 @@ async fn test_metadata_roundtrip_basic() {
 
     // Create storage instance
     let storage =
-        LanceStorageGraph::new(base_path.to_string_lossy().to_string(), name_id.to_string());
+        LanceStorageGraph::new(base_path.to_string_lossy().to_string(), name_id.to_string())
+            .expect("valid instance name");
 
     // Create original metadata with all fields populated
     let mut original_metadata = GeneMetadata {
@@ -100,7 +101,8 @@ async fn test_metadata_roundtrip_with_seed_metadata() {
     let base_path = tmp_dir(name_id).await;
 
     let storage =
-        LanceStorageGraph::new(base_path.to_string_lossy().to_string(), name_id.to_string());
+        LanceStorageGraph::new(base_path.to_string_lossy().to_string(), name_id.to_string())
+            .expect("valid instance name");
 
     // Use seed_metadata helper to create initial metadata
     let original_metadata = GeneMetadata::seed_metadata(
@@ -137,7 +139,8 @@ async fn test_metadata_roundtrip_empty_files() {
     let base_path = tmp_dir(name_id).await;
 
     let storage =
-        LanceStorageGraph::new(base_path.to_string_lossy().to_string(), name_id.to_string());
+        LanceStorageGraph::new(base_path.to_string_lossy().to_string(), name_id.to_string())
+            .expect("valid instance name");
 
     let original_metadata = GeneMetadata {
         name_id: name_id.to_string(),
@@ -172,7 +175,8 @@ async fn test_metadata_roundtrip_with_sparse_info() {
     let base_path = tmp_dir(name_id).await;
 
     let storage =
-        LanceStorageGraph::new(base_path.to_string_lossy().to_string(), name_id.to_string());
+        LanceStorageGraph::new(base_path.to_string_lossy().to_string(), name_id.to_string())
+            .expect("valid instance name");
 
     let mut original_metadata = GeneMetadata {
         name_id: name_id.to_string(),
@@ -243,7 +247,8 @@ async fn test_validate_initialized_mismatched_md_path_returns_error() {
     let name_id = "validate_mismatch";
     let base_path = tmp_dir(name_id).await;
     let storage =
-        LanceStorageGraph::new(base_path.to_string_lossy().to_string(), name_id.to_string());
+        LanceStorageGraph::new(base_path.to_string_lossy().to_string(), name_id.to_string())
+            .expect("valid instance name");
 
     let wrong_path = base_path.join("other_instance_metadata.json");
     let result = storage.validate_initialized(&wrong_path);
@@ -273,7 +278,8 @@ async fn test_validate_initialized_matching_path_without_metadata_returns_invali
     let name_id = "validate_missing";
     let base_path = tmp_dir(name_id).await;
     let storage =
-        LanceStorageGraph::new(base_path.to_string_lossy().to_string(), name_id.to_string());
+        LanceStorageGraph::new(base_path.to_string_lossy().to_string(), name_id.to_string())
+            .expect("valid instance name");
 
     let result = storage.validate_initialized(&storage.metadata_path());
     assert!(
@@ -370,7 +376,8 @@ mod inherent_only {
         let storage = LanceStorageGraph::new(
             base.join("no_trait").to_string_lossy().to_string(),
             "no_trait_import".to_string(),
-        );
+        )
+        .expect("valid instance name");
         let md = GeneMetadata::new("no_trait_import")
             .with_base(storage.base_path())
             .with_dimensions(10, 5);

@@ -58,6 +58,45 @@ pub fn parse_generation(name: &str) -> Option<u64> {
     suffix.parse().ok()
 }
 
+/// Reject instance names carrying the reserved generation suffix
+/// (`__g{digits}`). Only [`generation_name`] may mint such names; a
+/// user-created logical instance with a reserved suffix would collide with
+/// the generation discovery and sweep machinery (#117-3).
+pub fn validate_logical_name(name: &str) -> StorageResult<()> {
+    if parse_generation(name).is_some() {
+        return Err(StorageError::Invalid(format!(
+            "instance name `{name}` carries the reserved generation suffix \
+             `{GENERATION_SEP}<n>`; generation handles are minted only via \
+             scoped_generation"
+        )));
+    }
+    Ok(())
+}
+
+/// File name of a per-instance artifact dataset: `{instance}_{key}.lance`.
+///
+/// Single source of the on-disk naming convention (#117-3): every producer
+/// (paths, registered `FileInfo` names) builds it here so the two roles
+/// cannot drift apart.
+pub fn artifact_file_name(instance: &str, key: &str) -> String {
+    format!("{instance}_{key}.lance")
+}
+
+/// File name of the per-instance metadata registry: `{instance}_metadata.json`.
+pub fn metadata_file_name(instance: &str) -> String {
+    format!("{instance}_metadata.json")
+}
+
+/// Full artifact dataset path: `{base}/{instance}_{key}.lance`.
+pub fn artifact_file_path(base: &Path, instance: &str, key: &str) -> PathBuf {
+    base.join(artifact_file_name(instance, key))
+}
+
+/// Full metadata registry path: `{base}/{instance}_metadata.json`.
+pub fn metadata_file_path(base: &Path, instance: &str) -> PathBuf {
+    base.join(metadata_file_name(instance))
+}
+
 /// A committed generation: its number and the metadata file that pins it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GenerationInfo {

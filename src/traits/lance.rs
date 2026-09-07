@@ -535,7 +535,7 @@ pub trait LanceStorage {
             metadata = metadata.add_file(
                 key,
                 FileInfo::new(
-                    format!("{}_{}.lance", self.get_name(), key),
+                    crate::generations::artifact_file_name(self.get_name().as_str(), key),
                     "vector",
                     (len, 1),
                     None,

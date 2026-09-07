@@ -70,7 +70,11 @@ impl fmt::Display for StorageError {
             }
             StorageError::Overflow(msg) => write!(f, "Overflow error: {}", msg),
             StorageError::LockWouldBlock { path } => {
-                write!(f, "Lock would block: {} is held by another holder", path.display())
+                write!(
+                    f,
+                    "Lock would block: {} is held by another holder",
+                    path.display()
+                )
             }
         }
     }
@@ -88,7 +92,7 @@ static INIT: Once = Once::new();
 pub fn init() {
     INIT.call_once(|| {
         // Read RUST_LOG env variable, default to "info" if not set
-        let env = env_logger::Env::default().default_filter_or("debug");
+        let env = env_logger::Env::default().default_filter_or("info");
 
         // don't panic if called multiple times across binaries
         let _ = env_logger::Builder::from_env(env).try_init();
