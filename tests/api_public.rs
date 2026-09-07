@@ -20,12 +20,21 @@
 
 use std::path::PathBuf;
 
-use genegraph_storage::commit::{
-    lock_file_for_metadata, try_with_file_lock, try_with_metadata_file_lock, with_commit_actor,
-    with_file_lock, with_metadata_file_lock,
-};
-use genegraph_storage::generations::write_json_atomic;
+use genegraph_storage::commit::with_commit_actor;
+
+// The cross-process flock recipes are a POSIX arbitration convention;
+// `with_file_lock` surfaces `UnsupportedFormat` on other platforms, so the
+// tests that depend on a foreign flock holder compile on Unix only (see
+// the matching gating of the crate-internal tests, 8272ee5).
+#[cfg(unix)]
 use genegraph_storage::StorageError;
+#[cfg(unix)]
+use genegraph_storage::commit::{
+    lock_file_for_metadata, try_with_file_lock, try_with_metadata_file_lock, with_file_lock,
+    with_metadata_file_lock,
+};
+#[cfg(unix)]
+use genegraph_storage::generations::write_json_atomic;
 
 fn scratch_dir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -43,15 +52,17 @@ fn scratch_dir(tag: &str) -> PathBuf {
 /// locks are held: the flock is taken around the awaited commit-actor
 /// cycle, and a foreign process-shaped flock holder is excluded until the
 /// cycle completes.
+///
+/// Unix-only: the foreign holder needs cross-process flock arbitration,
+/// which `with_file_lock` supports on POSIX platforms only.
+#[cfg(unix)]
 #[tokio::test]
 async fn downstream_metadata_cycle_runs_under_both_locks() {
     let dir = scratch_dir("composed");
     let metadata_path = dir.join("ds__g1_metadata.json");
     write_json_atomic(&metadata_path, r#"{"count":0}"#).unwrap();
     assert_eq!(
-        lock_file_for_metadata(&metadata_path)
-            .file_name()
-            .unwrap(),
+        lock_file_for_metadata(&metadata_path).file_name().unwrap(),
         "ds__g1_metadata.lock"
     );
 
@@ -75,7 +86,9 @@ async fn downstream_metadata_cycle_runs_under_both_locks() {
                 .unwrap()
             })
     });
-    held_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+    held_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
 
     // The composed cycle waits for the foreign holder, then runs its RMW
     // (read → increment → atomic publish) under flock + commit actor.
@@ -131,6 +144,10 @@ async fn in_process_actor_cycle_is_publicly_callable() {
 /// surface contention as the distinctly matchable `LockWouldBlock` naming
 /// the lock file — the shape a multi-process CLI maps onto its own exit
 /// codes without waiting.
+///
+/// Unix-only: the foreign holder needs cross-process flock arbitration,
+/// which `with_file_lock` supports on POSIX platforms only.
+#[cfg(unix)]
 #[tokio::test]
 async fn downstream_try_lock_cycle_maps_contention_to_lock_would_block() {
     let dir = scratch_dir("try");
@@ -157,7 +174,9 @@ async fn downstream_try_lock_cycle_maps_contention_to_lock_would_block() {
                 .unwrap()
             })
     });
-    held_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+    held_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
 
     // Both try forms fail fast, naming the lock file.
     let raw_err = try_with_file_lock(&lock_path, || Ok::<(), StorageError>(()))
@@ -219,7 +238,8 @@ async fn downstream_registry_free_collection_io() {
 
     let dir = scratch_dir("collections");
     let storage =
-        LanceStorageGraph::new(dir.to_string_lossy().to_string(), "app_owned".to_string());
+        LanceStorageGraph::new(dir.to_string_lossy().to_string(), "app_owned".to_string())
+            .expect("valid instance name");
 
     // the consumer's own single commit pointer at the instance metadata
     // path: any GeneMetadata read of it fails, so a successful cycle
