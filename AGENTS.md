@@ -24,11 +24,25 @@ Key invariants to preserve when editing:
 
 ## Shell tools
 
-- Do not use perl for file editing/transformations. Use python3 (via `uv` if present), sed, awk and bash commands instead.
+- Do not use perl: use `python3` (`uv` if present), `sed`, `awk` and
+  plain bash commands instead.
 
-## Build & test
+## Build & verify
 
-- Run cargo test always with the `--release` flag (e.g. `cargo test --release --lib`).
+- `cargo test --release` — full suite; always run tests with the
+  `--release` flag (debug builds of the lance stack are slow); ledgered
+  pre-existing failures live in #23, do not silently skip; run full
+  suite only at the end; most of the time run a subset of test cases.
+- `cargo clippy --all-targets -- -D warnings` — must be clean before every commit.
+- `cargo fmt` — run before committing.
+
+## Testing rules
+
+- TDD strict: failing test first, including reproduction tests for every bug fix.
+- Random seed **3407** for NEW tests; legacy fixtures keep 42/9999/123.
+- Test dirs: `crate::tests::tmp_dir()` returns `tempfile::TempDir` — hold the guard
+  for the whole test; never let it drop while a DB handle points inside.
+- Tests are DAMP over DRY: each test reads as a standalone specification.
 
 ## Writing style
 
