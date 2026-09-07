@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.62.0 (2026-09-07)
+
+Removes the unmaintained `paste` proc-macro from the dependency tree
+(#121). The crate never used `paste` directly. It arrived transitively
+through `parquet` 58.x and `lance-bitpacking` 11.0.0.
+
+**Changed**
+
+- `arrow` and `parquet` move from `^58` to `^59`. arrow-rs dropped the
+  `paste` dependency in 59.0.0. The 59.0.0 breaking changes (removed
+  deprecations, Thrift metadata internals) do not touch the API surface
+  this crate uses.
+- `lance-bitpacking` is replaced by `fastlanes` 0.7.2. `fastlanes` is
+  the maintained upstream crate that `lance-bitpacking` forked. It uses
+  the `pastey` crate, the maintained successor of `paste`. The
+  `BitPacking::unchecked_unpack` signature and the 1024-value FastLanes
+  block layout are identical, so `src/lancefmt/reader.rs` changes only
+  its import. Decode output is byte-identical; the golden-fixture
+  conformance suite (official Lance files) verifies this.
+
+**Fixed**
+
+- Removed a stray blank line after `#[cfg(unix)]` in
+  `src/tests/test_commit.rs`. The pre-existing failure broke
+  `cargo clippy --all-targets -- -D warnings` on `main`.
+
+Refs: #121.
+
 ## 0.61.0 (2026-09-03)
 
 Completes the registry-free collections API (#107) and makes the

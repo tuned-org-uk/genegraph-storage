@@ -10,7 +10,6 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 #[cfg(unix)]
-
 use crate::commit::{
     lock_file_for_metadata, try_with_file_lock, try_with_metadata_file_lock, with_commit_actor,
     with_file_lock, with_metadata_file_lock,

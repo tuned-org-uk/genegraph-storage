@@ -257,7 +257,7 @@ fn decode_chunk(
                 // (constant chunk) has an empty block and is handled above
                 // the unpack via the `block_words == 0` short-circuit.
                 unsafe {
-                    use lance_bitpacking::BitPacking;
+                    use fastlanes::BitPacking;
                     <u32 as BitPacking>::unchecked_unpack(width, &words[..block_words], &mut out);
                 }
                 let n = values_in_chunk as usize;
@@ -299,7 +299,7 @@ fn decode_chunk(
                 // SAFETY: `out` has exactly the FL block size for u64 and
                 // `words` holds one full block of packed words.
                 unsafe {
-                    use lance_bitpacking::BitPacking;
+                    use fastlanes::BitPacking;
                     <u64 as BitPacking>::unchecked_unpack(width, &words[..block_words], &mut out);
                 }
                 let n = values_in_chunk as usize;
@@ -343,7 +343,7 @@ fn decode_chunk(
                 // SAFETY: `out` has exactly the FL block size for u64 and
                 // `words` holds one full block of packed words.
                 unsafe {
-                    use lance_bitpacking::BitPacking;
+                    use fastlanes::BitPacking;
                     <u64 as BitPacking>::unchecked_unpack(width, &words[..block_words], &mut out);
                 }
                 let n = values_in_chunk as usize;
@@ -379,7 +379,7 @@ fn decode_chunk(
                 // SAFETY: `out` has exactly the FL block size for u8 and
                 // `packed` starts with one full block of packed bytes.
                 unsafe {
-                    use lance_bitpacking::BitPacking;
+                    use fastlanes::BitPacking;
                     <u8 as BitPacking>::unchecked_unpack(width, &packed[..block_bytes], &mut out);
                 }
                 let n = values_in_chunk as usize;
