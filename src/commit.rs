@@ -169,10 +169,7 @@ fn dataset_lock_for(dataset_dir: &Path) -> Arc<StdMutex<()>> {
 /// sides are serialized against each other. Cross-process arbitration is a
 /// separate concern — wrap the cycle in [`with_file_lock`] (see the module
 /// docs for the recipe).
-pub async fn with_commit_actor<T, F, Fut>(
-    metadata_path: &Path,
-    commit: F,
-) -> StorageResult<T>
+pub async fn with_commit_actor<T, F, Fut>(metadata_path: &Path, commit: F) -> StorageResult<T>
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = StorageResult<T>>,
@@ -408,10 +405,7 @@ impl FileLock {
 /// lock-management thread, an explicit timeout/cancellation strategy
 /// (bounded wait before acquisition), or a storage system with
 /// transactional coordination over unbounded `flock` waits here.
-pub async fn with_metadata_file_lock<T, F, Fut>(
-    metadata_path: &Path,
-    cycle: F,
-) -> StorageResult<T>
+pub async fn with_metadata_file_lock<T, F, Fut>(metadata_path: &Path, cycle: F) -> StorageResult<T>
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = StorageResult<T>>,

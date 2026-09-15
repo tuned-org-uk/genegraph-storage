@@ -5,8 +5,8 @@
 //! registry paths use, plus a blessed cross-process arbitration convention.
 
 use std::path::PathBuf;
-use std::sync::mpsc;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::mpsc;
 use std::time::Duration;
 
 #[cfg(unix)]
@@ -15,9 +15,9 @@ use crate::commit::{
     with_file_lock, with_metadata_file_lock,
 };
 
+use crate::StorageError;
 #[cfg(unix)]
 use crate::generations::write_json_atomic;
-use crate::StorageError;
 
 use super::tmp_dir;
 
@@ -41,7 +41,11 @@ async fn commit_actor_serializes_concurrent_read_modify_write_cycles() {
     let md_a_ref = md_a.clone();
     let seen_a_for_a = seen_a.clone();
     let a = with_commit_actor(&md_a_ref, move || async move {
-        let n: u8 = std::fs::read_to_string(&md_a).unwrap().trim().parse().unwrap();
+        let n: u8 = std::fs::read_to_string(&md_a)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
         seen_a_for_a.store(n + 1, Ordering::SeqCst);
         write_json_atomic(&md_a, &(n + 1).to_string()).unwrap();
         Ok(())
@@ -50,7 +54,11 @@ async fn commit_actor_serializes_concurrent_read_modify_write_cycles() {
     let md_b_ref = md_b.clone();
     let seen_b_for_b = seen_b.clone();
     let b = with_commit_actor(&md_b_ref, move || async move {
-        let n: u8 = std::fs::read_to_string(&md_b).unwrap().trim().parse().unwrap();
+        let n: u8 = std::fs::read_to_string(&md_b)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
         seen_b_for_b.store(n + 11, Ordering::SeqCst);
         write_json_atomic(&md_b, &(n + 1).to_string()).unwrap();
         Ok(())
@@ -68,8 +76,15 @@ async fn commit_actor_serializes_concurrent_read_modify_write_cycles() {
         (a_seen, b_seen) == (1, 12) || (a_seen, b_seen) == (2, 11),
         "cycles must observe strictly ordered states, got a={a_seen}, b={b_seen}"
     );
-    let final_count: u8 = std::fs::read_to_string(&md).unwrap().trim().parse().unwrap();
-    assert_eq!(final_count, 2, "concurrent RMW cycles must not lose updates");
+    let final_count: u8 = std::fs::read_to_string(&md)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        final_count, 2,
+        "concurrent RMW cycles must not lose updates"
+    );
 }
 
 /// The blessed cross-process convention: `{metadata-stem}.lock` next to the
@@ -110,7 +125,11 @@ async fn metadata_file_lock_holds_flock_across_the_actor_cycle() {
         with_metadata_file_lock(&md_a_ref, move || async move {
             entered_tx.send(()).unwrap();
             release_rx.recv().unwrap();
-            let n: u8 = std::fs::read_to_string(&md_a).unwrap().trim().parse().unwrap();
+            let n: u8 = std::fs::read_to_string(&md_a)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
             write_json_atomic(&md_a, &(n + 1).to_string()).unwrap();
             Ok(())
         })
@@ -137,7 +156,9 @@ async fn metadata_file_lock_holds_flock_across_the_actor_cycle() {
             })
     });
     assert!(
-        entered_b_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+        entered_b_rx
+            .recv_timeout(Duration::from_millis(300))
+            .is_err(),
         "the flock must be held across the awaited cycle"
     );
 
@@ -178,8 +199,15 @@ async fn metadata_file_lock_serializes_concurrent_cycles() {
     let (ra, rb) = tokio::join!(run(md.clone()), run(md.clone()));
     let _ = (ra, rb);
 
-    let final_count: u8 = std::fs::read_to_string(&md).unwrap().trim().parse().unwrap();
-    assert_eq!(final_count, 2, "concurrent composed cycles must not lose updates");
+    let final_count: u8 = std::fs::read_to_string(&md)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        final_count, 2,
+        "concurrent composed cycles must not lose updates"
+    );
 
     let _ = std::fs::remove_dir_all(&base);
 }
@@ -285,11 +313,18 @@ async fn try_file_lock_runs_closure_uncontended_and_releases() {
     let base = tmp_dir("try_file_lock_uncontended").await;
     let lock = base.join("ds__g1_metadata.lock");
 
-    let out = try_with_file_lock(&lock, || Ok::<_, StorageError>("ran")).await.unwrap();
+    let out = try_with_file_lock(&lock, || Ok::<_, StorageError>("ran"))
+        .await
+        .unwrap();
     assert_eq!(out, "ran", "closure output must pass through");
 
-    try_with_file_lock(&lock, || Ok::<_, StorageError>(())).await.unwrap();
-    assert!(lock.is_file(), "lock file is the rendezvous point, left in place");
+    try_with_file_lock(&lock, || Ok::<_, StorageError>(()))
+        .await
+        .unwrap();
+    assert!(
+        lock.is_file(),
+        "lock file is the rendezvous point, left in place"
+    );
 
     let _ = std::fs::remove_dir_all(&base);
 }
@@ -326,7 +361,9 @@ async fn try_file_lock_fails_fast_naming_lock_file_while_held() {
         .expect("holder must acquire the lock");
 
     let started = std::time::Instant::now();
-    let err = try_with_file_lock(&lock, || Ok::<_, StorageError>(())).await.unwrap_err();
+    let err = try_with_file_lock(&lock, || Ok::<_, StorageError>(()))
+        .await
+        .unwrap_err();
     assert!(
         started.elapsed() < Duration::from_secs(2),
         "try variant must fail fast, not wait for the holder"
@@ -341,7 +378,9 @@ async fn try_file_lock_fails_fast_naming_lock_file_while_held() {
     // After the holder releases, the try succeeds — the guard was RAII.
     release_tx.send(()).unwrap();
     holder.join().unwrap();
-    try_with_file_lock(&lock, || Ok::<_, StorageError>(())).await.unwrap();
+    try_with_file_lock(&lock, || Ok::<_, StorageError>(()))
+        .await
+        .unwrap();
 
     let _ = std::fs::remove_dir_all(&base);
 }
@@ -379,7 +418,9 @@ async fn try_metadata_file_lock_fails_fast_then_runs_cycle_uncontended() {
         .recv_timeout(Duration::from_secs(5))
         .expect("holder must acquire the derived lock file");
 
-    let err = try_with_metadata_file_lock(&md, || async { Ok(()) }).await.unwrap_err();
+    let err = try_with_metadata_file_lock(&md, || async { Ok(()) })
+        .await
+        .unwrap_err();
     match err {
         StorageError::LockWouldBlock { path } => {
             assert_eq!(path, lock, "must name the derived lock file");
@@ -392,13 +433,21 @@ async fn try_metadata_file_lock_fails_fast_then_runs_cycle_uncontended() {
     holder.join().unwrap();
     let md_cycle = md.clone();
     try_with_metadata_file_lock(&md, move || async move {
-        let n: u8 = std::fs::read_to_string(&md_cycle).unwrap().trim().parse().unwrap();
+        let n: u8 = std::fs::read_to_string(&md_cycle)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
         write_json_atomic(&md_cycle, &(n + 1).to_string()).unwrap();
         Ok(())
     })
     .await
     .unwrap();
-    let count: u8 = std::fs::read_to_string(&md).unwrap().trim().parse().unwrap();
+    let count: u8 = std::fs::read_to_string(&md)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
     assert_eq!(count, 1, "the uncontended try cycle must publish its RMW");
 
     let _ = std::fs::remove_dir_all(&base);

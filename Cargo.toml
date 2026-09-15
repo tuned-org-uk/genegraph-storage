@@ -1,6 +1,6 @@
 [package]
 name = "genegraph-storage"
-version = "0.64.1"
+version = "0.65.0"
 edition = "2024"
 description = "vector database: base Lance storage"
 authors = ["Lorenzo <tunedconsulting@gmail.com>"]
@@ -25,23 +25,24 @@ exclude = [
 
 [dependencies]
 smartcore = "0.6.14"
-ordered-float = "5.1.0"
-rayon = "1.11.0"
-sprs = "0.11.4"
-log = "0.4.29"
-env_logger = "0.11.9"
+ordered-float = "5.5.0"
+rayon = "1.12.0"
+sprs = "0.11.5"
+log = "0.4.34"
+env_logger = "0.11.11"
 chrono = "0.4.45"
-serde = { version = "^1.0.228", features = ["derive"] }
-serde_json = { version = "^1.0.150"}
-arrow = { version = "^59.0.0" }
-uuid = { version = "1.21.0", features = ["v4", "serde"] }
-futures = "0.3.32"
+serde = { version = "^1.0.229", features = ["derive"] }
+serde_json = { version = "^1.0.151"}
+arrow = { version = "^59.3.0" }
+uuid = { version = "1.26.1", features = ["v4", "serde"] }
+futures = "0.3.34"
 url = "2.5.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "sync"] }
-parquet = { version = "^59.0.0" }
-prost = "0.14"
-prost-types = "0.14"
+parquet = { version = "^59.3.0" }
+prost = "0.14.4"
+prost-types = "0.14.4"
 fastlanes = "0.7.2"
+zarrs = "0.23"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -50,6 +51,6 @@ libc = "0.2"
 rand = "0.10.2"
 rand_distr = "0.6.0"
 approx = "0.5.1"
-serde_json = "^1.0.150"
-arrow = { version = "^59.0.0" }
+serde_json = "^1.0.151"
+arrow = { version = "^59.3.0" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread" ] }

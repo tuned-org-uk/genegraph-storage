@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.65.0 (2026-09-15)
+
+Adds Zarr v3 ("zzarr") array support (#3, tracked as
+Genefold/arro-server-rs#3): a new `zzarr` module over the `zarrs` crate
+provides Zarr v3 array IO (open, read subsets, write, resize/append)
+and the zzarr CSR persistence used by the arro-server index store
+(`data.zarr` f32, `indices.zarr`/`indptr.zarr` i64, `meta.json` written
+atomically). Conformance is fixture-based: golden arrays written by
+Python `zarr` >= 3.0 (bytes + zstd codecs, default chunk key encoding)
+live under `tests/fixtures/zarr/` with a `uv` generator script; a `uv`
+verifier reads back Rust-written arrays.
+
+**Added**
+
+- `zzarr` module: `open`, `read_subset`, `write_array`, `resize`
+  (leading-axis append), `write_csr`, `read_csr`, `CsrMeta`.
+- Golden Python-written fixtures and `tests/fixtures/zarr/` tooling.
+
+Refs: Genefold/arro-server-rs#3, Genefold/arro-server-rs#26
+
 ## 0.64.1 (2026-09-07)
 
 Aligns the test RNG stack with the tree: smartcore 0.6.14 already
