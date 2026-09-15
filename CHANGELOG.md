@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.69.0 (2026-09-15)
+
+Enforces the genefold-vd concurrency patterns on the Zarr write paths
+(Genefold/arro-server-rs#5 review follow-up): dataset writes now compose
+the in-process mailbox with a fail-fast cross-process rendezvous flock.
+
+**Added**
+
+- `commit::try_with_dataset_file_lock`: the dataset-write analog of
+  `try_with_metadata_file_lock`. Mailbox first (same-process writers
+  queue, concurrent in-process appends all succeed), then a `LOCK_NB`
+  flock — a foreign holder surfaces `LockWouldBlock` naming the lock
+  file before any write. POSIX only; off unix, writes serialize
+  in-process only with a one-time warning (LockFileEx escape hatch:
+  tuned-org-uk/genegraph-storage#124).
+- Zarr rendezvous convention: `{root}/.arro/locks/{dataset_id}.lock`,
+  re-derived from the decoded rel path so crafted IDs cannot steer the
+  lock outside the kernel namespace. Files carry no data, stay in
+  place, and never surface in discovery.
+
+**Changed**
+
+- Creation (`save_dense`/`save_vector`/`save_index`), `append_vectors`
+  and `overwrite_vectors` run under the composed lock; creation and
+  appends to one dataset now exclude each other across processes too.
+- Mailbox keys (commit actor and dataset dir) are lexically absolute
+  (`std::path::absolute`): one mailbox per path regardless of spelling.
+- The registry shape refresh reads the shape from `zarr.json` inside
+  the commit-actor cycle, so refreshes of concurrent appends converge
+  to the on-disk truth in any completion order.
+- `save_dense_to_file` stays mailbox-only: no root-scoped rendezvous
+  exists for raw paths; cross-process callers own their locking
+  (documented).
+
+Refs: Genefold/arro-server-rs#5, Genefold/arro-server-rs#26
+
 ## 0.68.0 (2026-09-15)
 
 Review fixes for the Zarr vector write paths (Genefold/arro-server-rs#5

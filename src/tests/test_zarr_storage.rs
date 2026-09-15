@@ -10,7 +10,7 @@
 //!
 //! Run with: `cargo test --release --lib -- zarr_storage`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use smartcore::linalg::basic::arrays::{Array, Array2};
 use smartcore::linalg::basic::matrix::DenseMatrix;
@@ -1234,4 +1234,318 @@ async fn scan_rejects_malformed_chunk_shape() {
         matches!(err, crate::StorageError::UnsupportedFormat(_)),
         "{err:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// #5 concurrency: cross-process rendezvous locks (genefold-vd patterns)
+// ---------------------------------------------------------------------------
+
+/// Rendezvous lock-file path of `dataset_id` under `root`.
+fn lock_file_of(root: &Path, dataset_id: &str) -> PathBuf {
+    root.join(".arro")
+        .join("locks")
+        .join(format!("{dataset_id}.lock"))
+}
+
+/// Holds the rendezvous flock as a foreign writer would (own file
+/// description, so it excludes the kernel's flock until dropped).
+#[cfg(unix)]
+fn hold_flock(path: &Path) -> std::fs::File {
+    use std::os::unix::io::AsRawFd;
+
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .unwrap();
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    assert_eq!(rc, 0, "test must hold the rendezvous flock at {path:?}");
+    file
+}
+
+#[tokio::test]
+async fn append_leaves_a_rendezvous_lock_file_under_arro_locks() {
+    // Lock files are rendezvous points: created on demand, left in place,
+    // and owned by the kernel namespace (never written into user trees).
+    let root = tmp_dir("zarr_lock_created").await.join("main");
+    write_arange_f32(&root.join("matrix"), 50, 4, 10);
+    let storage = ZarrStorage::new(root.clone(), "main".to_string()).unwrap();
+
+    storage
+        .append_vectors("main--matrix", &filled(2, 4, 1.0))
+        .await
+        .unwrap();
+
+    let lock = lock_file_of(&root, "main--matrix");
+    assert!(
+        lock.is_file(),
+        "rendezvous lock must exist at {lock:?} after the append"
+    );
+    // The user tree stays pristine: no lock artifacts inside the array.
+    assert!(root.join("matrix").join("zarr.json").is_file());
+    assert!(!root.join("matrix").join(".lock").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn append_fails_fast_when_a_foreign_writer_holds_the_dataset_lock() {
+    let root = tmp_dir("zarr_lock_ext_append").await.join("main");
+    write_arange_f32(&root.join("matrix"), 50, 4, 10);
+    write_arange_f32(&root.join("other"), 20, 4, 4);
+    let storage = ZarrStorage::new(root.clone(), "main".to_string()).unwrap();
+
+    let held = hold_flock(&lock_file_of(&root, "main--matrix"));
+
+    let err = storage
+        .append_vectors("main--matrix", &filled(2, 4, 1.0))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, crate::StorageError::LockWouldBlock { .. }),
+        "{err:?}"
+    );
+    assert!(err.to_string().contains("main--matrix.lock"), "{err:?}");
+    // No partial write: the shape is untouched.
+    assert_eq!(
+        crate::zzarr::open(&root.join("matrix")).unwrap().shape(),
+        vec![50, 4]
+    );
+    // Per-dataset rendezvous: a different dataset proceeds.
+    storage
+        .append_vectors("main--other", &filled(2, 4, 2.0))
+        .await
+        .unwrap();
+    // Released: the same append goes through.
+    drop(held);
+    storage
+        .append_vectors("main--matrix", &filled(2, 4, 3.0))
+        .await
+        .unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn overwrite_fails_fast_when_a_foreign_writer_holds_the_dataset_lock() {
+    let root = tmp_dir("zarr_lock_ext_overwrite").await.join("main");
+    write_arange_f32(&root.join("matrix"), 50, 4, 10);
+    let storage = ZarrStorage::new(root.clone(), "main".to_string()).unwrap();
+
+    let held = hold_flock(&lock_file_of(&root, "main--matrix"));
+
+    let err = storage
+        .overwrite_vectors(
+            "main--matrix",
+            &[crate::traits::zarr::RowUpdate {
+                row_index: 0,
+                vector: vec![9.0; 4],
+            }],
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, crate::StorageError::LockWouldBlock { .. }),
+        "{err:?}"
+    );
+    assert_eq!(
+        read_rows_f32(&root.join("matrix"), 0, 1, 4),
+        vec![0.0f32, 1.0, 2.0, 3.0],
+        "no partial overwrite under contention"
+    );
+    drop(held);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn creation_fails_fast_when_a_foreign_writer_holds_the_dataset_lock() {
+    // Creation takes the same rendezvous as appends: save_dense and
+    // append_vectors exclude each other across processes.
+    let root = tmp_dir("zarr_lock_ext_create").await.join("main");
+    let storage = seeded(&root, "main", 2, 2).await;
+
+    let held = hold_flock(&lock_file_of(&root, "main--held"));
+    let err = storage
+        .save_dense("held", &filled(2, 2, 1.0), &storage.metadata_path())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, crate::StorageError::LockWouldBlock { .. }),
+        "{err:?}"
+    );
+    assert!(!root.join("held").exists(), "no partial creation");
+    drop(held);
+    storage
+        .save_dense("held", &filled(2, 2, 1.0), &storage.metadata_path())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn in_process_appends_queue_behind_a_foreign_lock_on_another_dataset() {
+    // In-process writers queue on the mailbox; only a foreign holder of
+    // THE SAME dataset's rendezvous fails fast. Three concurrent appends
+    // must all succeed (the acceptance-suite partition contract).
+    let root = tmp_dir("zarr_lock_queue").await.join("main");
+    write_arange_f32(&root.join("matrix"), 10, 4, 4);
+    let storage = ZarrStorage::new(root.clone(), "main".to_string()).unwrap();
+
+    let sizes = [3usize, 2, 5];
+    let handles: Vec<_> = sizes
+        .iter()
+        .map(|&size| {
+            let storage = storage.clone();
+            tokio::spawn(async move {
+                storage
+                    .append_vectors("main--matrix", &filled(size, 4, size as f64))
+                    .await
+                    .unwrap()
+            })
+        })
+        .collect();
+    let mut results: Vec<(usize, usize)> = Vec::new();
+    for h in handles {
+        results.push(h.await.unwrap());
+    }
+    results.sort();
+    assert_eq!(results[0].0, 10);
+    for i in 0..results.len() - 1 {
+        assert_eq!(results[i].1, results[i + 1].0, "gap between {results:?}");
+    }
+    assert_eq!(results[2].1, 20);
+}
+
+#[tokio::test]
+async fn scan_ignores_the_arro_locks_dir() {
+    // The locks dir sits inside the kernel registry namespace; discovery
+    // never surfaces it, with or without lock files present.
+    let root = tmp_dir("zarr_lock_scan").await.join("main");
+    let storage = seeded(&root, "main", 10, 4).await;
+    storage
+        .save_dense("matrix", &filled(10, 4, 0.0), &storage.metadata_path())
+        .await
+        .unwrap();
+    storage
+        .append_vectors("main--matrix", &filled(2, 4, 1.0))
+        .await
+        .unwrap();
+    assert!(lock_file_of(&root, "main--matrix").is_file());
+
+    let all = storage.list_datasets().await.unwrap();
+    assert_eq!(
+        all.iter()
+            .map(|s| s.dataset_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["main--matrix"]
+    );
+}
+
+#[tokio::test]
+async fn registry_shape_refresh_reads_the_disk_shape_not_a_caller_value() {
+    // Corrupt the registered shape; the refresh must restore the disk
+    // truth by reading the array's own metadata inside the cycle.
+    let root = tmp_dir("zarr_refresh_disk").await.join("main");
+    let storage = seeded(&root, "main", 10, 4).await;
+    storage
+        .save_dense("matrix", &filled(10, 4, 0.0), &storage.metadata_path())
+        .await
+        .unwrap();
+    {
+        let mut md = storage.load_metadata().await.unwrap();
+        let info = md.files.get_mut("matrix").unwrap();
+        info.rows = 3;
+        info.cols = 9;
+        storage.save_metadata(&md).await.unwrap();
+    }
+
+    storage.update_registered_shape("matrix").await.unwrap();
+
+    let md = storage.load_metadata().await.unwrap();
+    assert_eq!(
+        (md.files["matrix"].rows, md.files["matrix"].cols),
+        (10, 4),
+        "refresh must record the zarr.json shape"
+    );
+}
+
+#[tokio::test]
+async fn append_registry_refresh_converges_to_the_disk_shape() {
+    // Deterministic replay of the stale-registry race: the refresh must
+    // read the shape from disk inside the commit-actor cycle, so a
+    // refresh that lands after a later write still records the disk
+    // truth — not the append's own (start + m) value.
+    let root = tmp_dir("zarr_refresh_conv").await.join("main");
+    let storage = seeded(&root, "main", 10, 4).await;
+    storage
+        .save_dense("matrix", &filled(10, 4, 0.0), &storage.metadata_path())
+        .await
+        .unwrap();
+
+    // Hold the registry commit actor; signal once the guard is inside.
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let actor_held = Arc::new(AtomicBool::new(false));
+    let flag = actor_held.clone();
+    let md_path = storage.metadata_path();
+    let holder = tokio::spawn(async move {
+        crate::commit::with_commit_actor(&md_path, || async move {
+            flag.store(true, Ordering::SeqCst);
+            let _ = release_rx.await;
+            Ok::<(), crate::StorageError>(())
+        })
+        .await
+        .unwrap();
+    });
+    while !actor_held.load(Ordering::SeqCst) {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    // Append +2 rows; the data write completes, the refresh parks on the
+    // held commit actor.
+    let app = tokio::spawn({
+        let storage = storage.clone();
+        async move {
+            storage
+                .append_vectors("main--matrix", &filled(2, 4, 7.0))
+                .await
+        }
+    });
+    // Wait until the append's tail landed (rows 10..12 hold 7.0).
+    loop {
+        let tail = read_rows_f64(&root.join("matrix"), 10, 12, 4);
+        if tail == vec![7.0f64; 8] {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    // Grow the array directly (+5 rows) while the refresh is parked.
+    {
+        let dir = root.join("matrix");
+        tokio::task::spawn_blocking(move || {
+            let mut arr = crate::zzarr::open(&dir).unwrap();
+            arr.append(&[2.0f64; 20]).unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    // Release the actor; the parked refresh must now record 17 (disk).
+    release_tx.send(()).unwrap();
+    let (start, new_n) = tokio::time::timeout(std::time::Duration::from_secs(10), app)
+        .await
+        .expect("append must not deadlock")
+        .unwrap()
+        .unwrap();
+    assert_eq!((start, new_n), (10, 12));
+    holder.await.unwrap();
+
+    let md = storage.load_metadata().await.unwrap();
+    assert_eq!(
+        md.files["matrix"].rows, 17,
+        "refresh must read the disk shape, not the append's own value"
+    );
+    assert_eq!(md.files["matrix"].cols, 4);
 }

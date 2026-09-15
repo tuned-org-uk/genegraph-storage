@@ -10,6 +10,13 @@
 //! `{root}/.arro/metadata.json` (a `GeneMetadata` JSON, atomically
 //! published). Discovery is filesystem-first; the registry is the catalog
 //! view.
+//!
+//! Every dataset write (creation, append, overwrite) runs under the
+//! composed write lock of [`crate::commit::try_with_dataset_file_lock`]:
+//! the in-process mailbox queues same-process writers, and a fail-fast
+//! rendezvous flock at `{root}/.arro/locks/{dataset_id}.lock` excludes
+//! foreign processes (POSIX; see the commit module for the off-unix
+//! policy).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -576,17 +583,19 @@ fn cast_f64_to_f32(values: &[f64]) -> StorageResult<Vec<f32>> {
 }
 
 /// Sync append core: open, validate, resize, write the tail — all under
-/// the dataset's write mailbox. Python `append_vectors` port (#5): the
-/// two-phase validate/re-validate collapses into one phase because
-/// validation itself runs under the lock.
+/// the dataset's composed write lock (in-process mailbox + cross-process
+/// rendezvous flock). Python `append_vectors` port (#5): the two-phase
+/// validate/re-validate collapses into one phase because validation
+/// itself runs under the lock.
 fn append_vectors_blocking(
     path: PathBuf,
+    lock_file: PathBuf,
     dataset_id: String,
     values: Vec<f64>,
     m: usize,
     d: usize,
 ) -> StorageResult<(usize, usize)> {
-    crate::commit::with_dataset_write_lock(&path, || {
+    crate::commit::try_with_dataset_file_lock(&lock_file, &path, || {
         let mut arr = crate::zzarr::open(&path)?;
         let shape = arr.shape();
         if shape.len() != 2 {
@@ -619,13 +628,15 @@ fn append_vectors_blocking(
 }
 
 /// Sync overwrite core: validate all updates, then write row by row
-/// (Python `overwrite_vectors` port; shape unchanged, last duplicate wins).
+/// under the dataset's composed write lock (Python `overwrite_vectors`
+/// port; shape unchanged, last duplicate wins).
 fn overwrite_vectors_blocking(
     path: PathBuf,
+    lock_file: PathBuf,
     dataset_id: String,
     updates: Vec<RowUpdate>,
 ) -> StorageResult<usize> {
-    crate::commit::with_dataset_write_lock(&path, || {
+    crate::commit::try_with_dataset_file_lock(&lock_file, &path, || {
         let mut arr = crate::zzarr::open(&path)?;
         let shape = arr.shape();
         if shape.len() != 2 {
@@ -754,10 +765,12 @@ impl StorageBackend for ZarrStorage {
         info!("Saving dense {key}: {rows}x{cols} at {}", path.display());
         let values = flatten_row_major(matrix)?;
         let p = path.clone();
+        let lock = self.dataset_lock_file_for_key(key);
         blocking("dense save", move || {
-            // Creation runs under the dataset mailbox (review of #5): the
-            // exists-check + write sequence must not interleave.
-            crate::commit::with_dataset_write_lock(&p, || {
+            // Creation runs under the dataset's composed write lock
+            // (review of #5): the exists-check + write sequence must not
+            // interleave, in-process or cross-process.
+            crate::commit::try_with_dataset_file_lock(&lock, &p, || {
                 crate::zzarr::write_array(
                     &p,
                     &[rows as u64, cols as u64],
@@ -789,7 +802,9 @@ impl StorageBackend for ZarrStorage {
     }
 
     /// Writes a dense matrix as a Zarr array at an explicit path
-    /// (registry-free). Parent directories are created as needed.
+    /// (registry-free). Parent directories are created as needed. No
+    /// root-scoped rendezvous exists for raw paths: serialization is the
+    /// in-process mailbox only; cross-process callers own their locking.
     async fn save_dense_to_file(data: &DenseMatrix<f64>, path: &Path) -> StorageResult<()> {
         let (rows, cols) = data.shape();
         let values = flatten_row_major(data)?;
@@ -819,8 +834,9 @@ impl StorageBackend for ZarrStorage {
         let path = self.dataset_path(key)?;
         let values = vector.to_vec();
         let p = path.clone();
+        let lock = self.dataset_lock_file_for_key(key);
         blocking("vector save", move || {
-            crate::commit::with_dataset_write_lock(&p, || {
+            crate::commit::try_with_dataset_file_lock(&lock, &p, || {
                 crate::zzarr::write_array(&p, &[len as u64], &[len as u64], &values, true)
             })
         })
@@ -848,8 +864,9 @@ impl StorageBackend for ZarrStorage {
         let len = values.len();
         let path = self.dataset_path(key)?;
         let p = path.clone();
+        let lock = self.dataset_lock_file_for_key(key);
         blocking("index save", move || {
-            crate::commit::with_dataset_write_lock(&p, || {
+            crate::commit::try_with_dataset_file_lock(&lock, &p, || {
                 crate::zzarr::write_array(&p, &[len as u64], &[len as u64], &values, true)
             })
         })
@@ -1110,14 +1127,17 @@ impl ZarrStorageOps for ZarrStorage {
         let path = self.dataset_dir(dataset_id)?;
         let values = flatten_row_major(vecs)?;
         let id = dataset_id.to_string();
+        let lock = self.dataset_lock_file_for_id(dataset_id);
         let p = path.clone();
         let (start, new_n) = blocking("append vectors", move || {
-            append_vectors_blocking(p, id, values, m, d)
+            append_vectors_blocking(p, lock, id, values, m, d)
         })
         .await?;
         // Best-effort registry refresh (Python `register_dataset` cache
-        // update); unregistered user trees stay registry-free.
-        self.update_registered_shape(&self.rel_of(dataset_id), new_n, d)
+        // update); unregistered user trees stay registry-free. The refresh
+        // re-reads the shape from disk inside the commit-actor cycle, so
+        // refreshes of concurrent appends converge to the on-disk truth.
+        self.update_registered_shape(&self.rel_of(dataset_id))
             .await?;
         Ok((start, new_n))
     }
@@ -1134,10 +1154,11 @@ impl ZarrStorageOps for ZarrStorage {
         }
         let path = self.dataset_dir(dataset_id)?;
         let id = dataset_id.to_string();
+        let lock = self.dataset_lock_file_for_id(dataset_id);
         let owned = updates.to_vec();
         let p = path;
         blocking("overwrite vectors", move || {
-            overwrite_vectors_blocking(p, id, owned)
+            overwrite_vectors_blocking(p, lock, id, owned)
         })
         .await
     }
@@ -1150,6 +1171,44 @@ impl ZarrStorage {
         rel
     }
 
+    /// Rendezvous lock file of a validated dataset ID, re-derived from
+    /// the decoded rel path so a crafted ID can never steer the lock path
+    /// outside the kernel namespace: `{root}/.arro/locks/{canonical}.lock`.
+    fn dataset_lock_file_for_id(&self, dataset_id: &str) -> PathBuf {
+        let rel = self.rel_of(dataset_id);
+        let canonical = make_dataset_id(&self.label, &rel);
+        self.root
+            .join(REGISTRY_DIR)
+            .join("locks")
+            .join(format!("{canonical}.lock"))
+    }
+
+    /// Rendezvous lock file of a save key (same convention, same cycle:
+    /// creation and appends to one dataset exclude each other).
+    fn dataset_lock_file_for_key(&self, key: &str) -> PathBuf {
+        let canonical = make_dataset_id(&self.label, key);
+        self.root
+            .join(REGISTRY_DIR)
+            .join("locks")
+            .join(format!("{canonical}.lock"))
+    }
+
+    /// Registered shape `(rows, cols)` read from the array's own
+    /// `zarr.json` — 1-D arrays register as `(len, 1)`; other ranks are
+    /// left untouched (best-effort refresh covers 1-D/2-D artifacts).
+    async fn disk_shape(&self, key: &str) -> StorageResult<Option<(usize, usize)>> {
+        let path = self.dataset_path(key)?;
+        blocking("shape read", move || {
+            let meta = read_node_meta(&path)?;
+            Ok(match meta.shape.as_slice() {
+                [n] => Some((*n as usize, 1)),
+                [rows, cols] => Some((*rows as usize, *cols as usize)),
+                _ => None,
+            })
+        })
+        .await
+    }
+
     /// Updates the registered shape of `key` in the kernel registry
     /// (Python `register_dataset` cache update). Best-effort in BOTH
     /// directions: unseeded roots and unregistered keys are left alone,
@@ -1158,16 +1217,12 @@ impl ZarrStorage {
     /// a retrying client append twice (#5 review). Unregistered keys are
     /// not republished.
     ///
-    /// Staleness tolerance: the refresh runs outside the dataset mailbox,
-    /// so under concurrent appends the last committer wins and the
-    /// registered shape may trail the disk shape until the next refresh.
-    /// The filesystem scan is the discovery truth.
-    async fn update_registered_shape(
-        &self,
-        key: &str,
-        rows: usize,
-        cols: usize,
-    ) -> StorageResult<()> {
+    /// The shape is read from disk INSIDE the commit-actor cycle: the
+    /// refresh runs outside the dataset mailbox, so refreshes of
+    /// concurrent appends may land in any order, and reading the disk
+    /// truth makes every order converge (the filesystem scan remains the
+    /// discovery truth regardless).
+    pub(crate) async fn update_registered_shape(&self, key: &str) -> StorageResult<()> {
         if !self.registry_path().is_file() {
             return Ok(());
         }
@@ -1178,6 +1233,9 @@ impl ZarrStorage {
                 Err(_) => return Ok(false),
             };
             let Some(info) = md.files.get_mut(&key) else {
+                return Ok(false);
+            };
+            let Some((rows, cols)) = self.disk_shape(&key).await? else {
                 return Ok(false);
             };
             info.rows = rows;

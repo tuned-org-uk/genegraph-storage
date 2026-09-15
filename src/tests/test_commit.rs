@@ -4,6 +4,7 @@
 //! the `save_*` registry paths) must reach the same serialization the internal
 //! registry paths use, plus a blessed cross-process arbitration convention.
 
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc;
@@ -20,6 +21,26 @@ use crate::StorageError;
 use crate::generations::write_json_atomic;
 
 use super::tmp_dir;
+
+/// Mailbox keys are lexically absolute: one directory keys to one mailbox
+/// regardless of path spelling (`.` and empty components collapse; `..`
+/// stays literal — no filesystem access). Different spellings of one
+/// dataset must not mint two mailboxes.
+#[test]
+fn lock_keys_collapse_path_spellings() {
+    let a = crate::commit::lock_key(Path::new("/tmp/x/./m"));
+    let b = crate::commit::lock_key(Path::new("/tmp/x//m"));
+    let c = crate::commit::lock_key(Path::new("/tmp/x/m"));
+    assert_eq!(a, b, "`//` must collapse");
+    assert_eq!(a, c, "`./` must collapse");
+    // Relative paths key against the cwd, so both spellings agree.
+    let r1 = crate::commit::lock_key(Path::new("x/m"));
+    let r2 = crate::commit::lock_key(&std::env::current_dir().unwrap().join("x/m"));
+    assert_eq!(r1, r2);
+    // `..` stays literal: no filesystem access, no resolution.
+    let up = crate::commit::lock_key(Path::new("/tmp/x/sub/../m"));
+    assert_ne!(up, c);
+}
 
 /// Two concurrent metadata read-modify-write cycles on the same path (the
 /// shape every downstream consumer's own registry write takes) are
@@ -211,8 +232,6 @@ async fn metadata_file_lock_serializes_concurrent_cycles() {
 
     let _ = std::fs::remove_dir_all(&base);
 }
-
-use std::path::Path;
 
 /// #100: the advisory file lock is a real cross-process arbitration
 /// primitive — a second holder (here: a second thread, its own flock open

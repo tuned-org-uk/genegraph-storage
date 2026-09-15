@@ -1,6 +1,6 @@
 [package]
 name = "genegraph-storage"
-version = "0.68.0"
+version = "0.69.0"
 edition = "2024"
 description = "vector database: base Lance storage"
 authors = ["Lorenzo <tunedconsulting@gmail.com>"]
@@ -53,4 +53,4 @@ rand_distr = "0.6.0"
 approx = "0.5.1"
 serde_json = "^1.0.151"
 arrow = { version = "^59.3.0" }
-tokio = { version = "1", features = ["macros", "rt-multi-thread" ] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

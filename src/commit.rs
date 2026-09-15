@@ -146,18 +146,28 @@ pub(crate) fn weak_lookup<T>(
     arc
 }
 
+/// Mailbox key of a path: lexically absolute, so one directory keys to
+/// one mailbox regardless of path spelling (`x/./m`, `x//m`). Purely
+/// lexical ([`std::path::absolute`]): no filesystem access, so
+/// not-yet-created directories key correctly; `..` stays literal.
+pub(crate) fn lock_key(path: &Path) -> String {
+    std::path::absolute(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// One commit-actor mailbox per metadata path.
 fn lock_for(metadata_path: &Path) -> Arc<Mutex<()>> {
-    let key = metadata_path.to_string_lossy().to_string();
+    let key = lock_key(metadata_path);
     weak_lookup(&COMMIT_LOCKS, key, Arc::new(Mutex::new(())))
 }
 
-/// One dataset-write mailbox per dataset directory. Keyed by the raw path
-/// string (not canonicalized); the mailbox is in-process only — cross-process
-/// writers need a flock (see `with_metadata_file_lock` for the metadata
-/// recipe). Correct for the one-server arro-server model (#5 review).
+/// One dataset-write mailbox per dataset directory. The mailbox is
+/// in-process only — cross-process exclusion is the flock leg of
+/// [`try_with_dataset_file_lock`].
 fn dataset_lock_for(dataset_dir: &Path) -> Arc<StdMutex<()>> {
-    let key = dataset_dir.to_string_lossy().to_string();
+    let key = lock_key(dataset_dir);
     weak_lookup(&DATASET_LOCKS, key, Arc::new(StdMutex::new(())))
 }
 
@@ -452,7 +462,8 @@ where
 
 /// Runs `write` under the dataset's write mailbox. `write` must be a
 /// non-async closure: the whole dataset write — version allocation through
-/// commit-point publish — happens under the lock.
+/// commit-point publish — happens under the lock. In-process only; use
+/// [`try_with_dataset_file_lock`] when cross-process exclusion is required.
 pub(crate) fn with_dataset_write_lock<T>(
     dataset_dir: &Path,
     write: impl FnOnce() -> StorageResult<T>,
@@ -462,6 +473,62 @@ pub(crate) fn with_dataset_write_lock<T>(
         .lock()
         .map_err(|_| StorageError::InvalidState("dataset write lock poisoned".into()))?;
     write()
+}
+
+/// Runs `write` under the dataset's composed write lock — the write-path
+/// analog of [`try_with_metadata_file_lock`], in two legs:
+///
+/// 1. **In-process mailbox first** (`with_dataset_write_lock`): writers
+///    within this process queue behind each other, so concurrent
+///    in-process appends serialize and all succeed.
+/// 2. **Cross-process flock second**: a fail-fast `LOCK_NB` acquisition of
+///    `lock_path`; a foreign holder surfaces
+///    [`StorageError::LockWouldBlock`] naming the lock file before any
+///    write happens.
+///
+/// The mailbox-first order is what keeps in-process queueing intact: a
+/// same-process writer never contends on the flock against its own
+/// mailbox siblings (an `flock` taken by a different file description in
+/// this process excludes like a foreign one), so only a writer from
+/// *another* process can observe contention.
+///
+/// `lock_path` is the rendezvous convention of the caller (e.g. the Zarr
+/// backend's `{root}/.arro/locks/{dataset_id}.lock`); the file is created
+/// on demand, carries no data, and is left in place after release.
+///
+/// Sync: call from blocking context (the dataset write itself is blocking
+/// I/O). Off unix there is no flock leg — writes serialize in-process
+/// only, and the kernel logs one warning per process; cross-process
+/// writes to one root are not supported off unix (the LockFileEx escape
+/// hatch is tracked as tuned-org-uk/genegraph-storage#124).
+pub fn try_with_dataset_file_lock<T>(
+    lock_path: &Path,
+    dataset_dir: &Path,
+    write: impl FnOnce() -> StorageResult<T>,
+) -> StorageResult<T> {
+    with_dataset_write_lock(dataset_dir, || {
+        dataset_flock(lock_path)?;
+        write()
+    })
+}
+
+/// Fail-fast flock leg of [`try_with_dataset_file_lock`]: unix takes the
+/// advisory lock; other platforms keep the in-process mailbox only.
+#[cfg(unix)]
+fn dataset_flock(lock_path: &Path) -> StorageResult<()> {
+    FileLock::try_acquire(lock_path).map(|_| ())
+}
+
+#[cfg(not(unix))]
+fn dataset_flock(_lock_path: &Path) -> StorageResult<()> {
+    static WARNED: OnceLock<()> = OnceLock::new();
+    if WARNED.set(()).is_ok() {
+        log::warn!(
+            "cross-process dataset locks require POSIX flock; dataset \
+             writes serialize in-process only on this platform"
+        );
+    }
+    Ok(())
 }
 
 /// Test hook: (commit-registry size, dataset-registry size).

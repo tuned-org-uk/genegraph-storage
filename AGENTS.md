@@ -12,7 +12,8 @@ Module map:
 - `lancefmt/` — in-house Lance v2.1 writer/reader (default for all I/O; no official `lance` dependency). `pb/` holds vendored protobuf types; no `protoc` needed. Unsupported encodings are rejected with `StorageError::UnsupportedFormat`, never guessed. Conformance is fixture-based (`tests/fixtures`, golden files from official lance).
 - `graph.rs` — graph collection types (`GraphEdge`, `StoredGraph`, `GraphWriteOptions`, `NodeIdWidth`); CSR conversion stays at the API boundary, sprs never reaches the format layer.
 - `generations.rs` — transactional generations: immutable `{logical}__g{N}` artifacts, the per-generation metadata JSON as single commit pointer, `write_json_atomic` (tmp + fsync + rename), sweep/delete helpers, reader pins. `__g{digits}` suffix on instance names is reserved.
-- `commit.rs` — commit serialization: per-metadata-path and per-dataset-dir mailboxes (duva-style single commit actor) so concurrent writers can't lose updates or mint duplicate manifest versions. Registries are weak-valued to stay bounded.
+- `commit.rs` — commit serialization: per-metadata-path and per-dataset-dir mailboxes (duva-style single commit actor) so concurrent writers can't lose updates or mint duplicate manifest versions. Registries are weak-valued to stay bounded. `try_with_dataset_file_lock` composes the dataset mailbox with a fail-fast rendezvous flock for cross-process exclusion.
+- `zarr_storage.rs` + `zzarr/` — Zarr v3 backend (`ZarrStorage`, `ZarrStorageOps`) over one root directory; registry at `{root}/.arro/metadata.json`; write rendezvous at `{root}/.arro/locks/{dataset_id}.lock`. `zzarr/` is the format codec only — it holds no locks.
 - `catalog.rs` — `TableDescriptor` + `Catalog` (Lance Namespace / Polaris Generic Table API shape) with `LocalRegistry` over `GeneMetadata`.
 - `src/tests/` — unit/integration suites (`cargo test --release --lib`; doc-tests via `cargo test --release --doc`).
 
@@ -21,6 +22,23 @@ Key invariants to preserve when editing:
 - Reserved properties/metadata keys (`catalog::RESERVED_PROPERTIES`, `graph::RESERVED_METADATA_KEYS`) are computed facts; user properties may not shadow them.
 - Values above a storage type's range surface `StorageError::Overflow`, never silent truncation (#51).
 - `StorageError` is `#[non_exhaustive]`; downstream matches carry a wildcard arm.
+
+## Concurrency conventions (write paths)
+
+One lock system, shared by every format (`commit.rs`). Formats do not roll their own locks. Per format, only two things vary: the rendezvous path convention and the hold scope of the write cycle. Keep all mechanics in `commit.rs`.
+
+Dataset writes take two locks, in this order:
+1. In-process mailbox (`with_dataset_write_lock`) — std mutex per dataset dir. Writers in this process queue.
+2. Cross-process rendezvous flock (`try_with_dataset_file_lock`) — `LOCK_NB`, fail-fast. A foreign holder surfaces `StorageError::LockWouldBlock { path }` before any write.
+
+Rules:
+- Mailbox first, flock second. A same-process writer must never contend on the flock against its own mailbox siblings — that ordering keeps concurrent in-process appends queueing (they must all succeed).
+- Mailbox keys are lexically absolute (`std::path::absolute`): one mailbox per dataset regardless of path spelling. `..` stays literal.
+- Rendezvous files are kernel-owned. Lance anchors them next to the metadata (`{metadata-stem}.lock`); Zarr anchors them at `{root}/.arro/locks/{dataset_id}.lock`. Never write them into user trees.
+- Rendezvous files carry no data. Create on demand, leave in place, ignore in discovery and scans.
+- The flock is POSIX-only. Off unix, dataset writes serialize in-process only and the kernel logs one warning. Cross-process writes to one root are not supported off unix (LockFileEx escape hatch: tuned-org-uk/genegraph-storage#124).
+- The flock APIs (`with_file_lock` and friends) fail typed off unix. Do not silently skip arbitration in those APIs.
+- Registry refreshes read the shape from disk inside the commit-actor cycle. Refreshes of concurrent appends may land in any order; reading the disk truth makes every order converge.
 
 ## Shell tools
 
