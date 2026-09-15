@@ -7,6 +7,7 @@ pub mod lance_storage_graph;
 pub mod lancefmt;
 pub mod metadata;
 pub mod traits;
+pub mod zarr_storage;
 pub mod zzarr;
 
 #[cfg(all(test, unix))]

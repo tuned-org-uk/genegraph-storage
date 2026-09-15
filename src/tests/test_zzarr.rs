@@ -53,7 +53,9 @@ async fn python_uncompressed_fixture_decodes() {
 #[tokio::test]
 async fn python_f32_1d_subset_read_matches_full_read() {
     let arr = crate::zzarr::open(&fixture("f32_1d.zarr")).unwrap();
-    let subset = arr.read_subset::<f32>(std::slice::from_ref(&(2..7))).unwrap();
+    let subset = arr
+        .read_subset::<f32>(std::slice::from_ref(&(2..7)))
+        .unwrap();
     assert_eq!(subset, vec![1.0f32, 1.5, 2.0, 2.5, 3.0]);
 }
 

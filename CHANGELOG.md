@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.66.0 (2026-09-15)
+
+Adds `ZarrStorage` (Genefold/arro-server-rs#4): a `StorageBackend`
+sibling of `LanceStorageGraph` over one Zarr root directory. Dense and
+scalar artifacts persist as Zarr v3 arrays; operations that do not fit
+Zarr trees surface `StorageError::UnsupportedFiletype` and are never
+forced. The kernel-owned metadata registry is pinned at
+`{root}/.arro/metadata.json` — outside user trees, atomically published,
+and never scanned as a dataset.
+
+**Added**
+
+- `zarr_storage` module: `ZarrStorage` backend, the dataset-ID codec
+  (`make_dataset_id`/`decode_dataset_id`, Python `base.py` contract),
+  and the root scan over v3 `zarr.json` plus legacy `.zarray`/`.zgroup`
+  markers (shape, dtype, chunks, fill value, child counts).
+- `traits::zarr` child trait `ZarrStorageOps` (`list_datasets`, `open`,
+  `summarize`) with `DatasetSummary`/`NodeKind`, the `traits::lance`
+  analog.
+- `StorageBackend` impl: dense/vector/lambdas/index save-load over Zarr
+  trees, kernel registry metadata I/O, `file://` URI helpers, and typed
+  `UnsupportedFiletype` for sparse/graph/RecordBatch-collection IO.
+- Zarr datasets surface through `Catalog`/`LocalRegistry` via the
+  `GeneMetadata` files map (artifact `storage_format` records `zzarr`).
+
+Refs: Genefold/arro-server-rs#4, Genefold/arro-server-rs#26
+
 ## 0.65.0 (2026-09-15)
 
 Adds Zarr v3 ("zzarr") array support (#3, tracked as

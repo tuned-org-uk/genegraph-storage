@@ -10,6 +10,7 @@ mod test_lancefmt_impl;
 mod test_metadata;
 mod test_parquet_io;
 mod test_verify;
+mod test_zarr_storage;
 mod test_zzarr;
 
 use std::fs;
