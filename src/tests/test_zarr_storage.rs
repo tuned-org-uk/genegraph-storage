@@ -569,6 +569,41 @@ async fn scan_never_lists_the_kernel_registry_dir() {
 }
 
 #[tokio::test]
+async fn dataset_keys_must_not_target_the_kernel_registry_dir() {
+    // The registry dir is kernel-only: `.arro` is reserved for
+    // `metadata.json` and the rendezvous locks. No resolution — write or
+    // read — may land inside it (sibling of scan_never_lists above).
+    let root = tmp_dir("zarr_st_arro_key").await.join("main");
+    let storage = seeded(&root, "main", 2, 1).await;
+    let m = dense(&[&[1.0, 2.0]]);
+
+    let err = storage
+        .save_dense(".arro", &m, &storage.metadata_path())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, crate::StorageError::Invalid(_)),
+        "registry-dir key rejected: {err:?}"
+    );
+    let err = storage
+        .save_dense(".arro/locks", &m, &storage.metadata_path())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, crate::StorageError::Invalid(_)),
+        "locks subdir key rejected: {err:?}"
+    );
+    let err = storage.open("main--.arro").await.unwrap_err();
+    assert!(
+        matches!(err, crate::StorageError::Invalid(_)),
+        "registry-dir id rejected: {err:?}"
+    );
+    // The registry stays pristine: no node markers written inside `.arro`.
+    assert!(root.join(".arro").join("metadata.json").is_file());
+    assert!(!root.join(".arro").join("zarr.json").exists());
+}
+
+#[tokio::test]
 async fn missing_root_scans_to_empty() {
     let root = tmp_dir("zarr_st_scan_missing").await.join("absent");
     let storage = ZarrStorage::new(root, "main".to_string()).unwrap();

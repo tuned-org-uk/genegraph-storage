@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.69.2 (2026-09-15)
+
+Registry-directory write guard for Zarr roots (Genefold/arro-server-rs#14
+review). The root scan skipped `{root}/.arro` by node markers, but key
+resolution did not reject the name: `save_dense(".arro", …)` could write
+`zarr.json` into the kernel namespace (registry file + rendezvous locks)
+and the scan would then surface it as a dataset.
+
+**Fixed**
+
+- `clean_rel` now rejects any relative path whose first segment is
+  `.arro` with `StorageError::Invalid`. Covers every key-based
+  resolution: `dataset_path` (saves) and `dataset_dir` (open, append,
+  overwrite, summarize-by-ID). Locked in by
+  `dataset_keys_must_not_target_the_kernel_registry_dir`.
+
+Refs: Genefold/arro-server-rs#14, Genefold/arro-server-rs#16,
+Genefold/arro-server-rs#26
+
 ## 0.69.1 (2026-09-15)
 
 Adds `ZarrStorage::summarize_by_id` (Genefold/arro-server-rs#8): resolve a

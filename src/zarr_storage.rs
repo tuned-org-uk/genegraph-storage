@@ -107,6 +107,14 @@ fn clean_rel(key: &str) -> StorageResult<PathBuf> {
             "relative path '{key}' resolves to nothing under the root"
         )));
     }
+    // First-segment `.arro` resolves into the kernel namespace (registry
+    // file + rendezvous locks); no dataset may share it. The root scan
+    // skips the dir by node markers; the write side needs the name guard.
+    if out.starts_with(REGISTRY_DIR) {
+        return Err(StorageError::Invalid(format!(
+            "relative path '{key}' must not target the kernel registry directory '{REGISTRY_DIR}'"
+        )));
+    }
     Ok(out)
 }
 
