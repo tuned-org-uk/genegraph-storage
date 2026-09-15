@@ -20,7 +20,7 @@ use smartcore::linalg::basic::matrix::DenseMatrix;
 
 use crate::metadata::FileInfo;
 use crate::traits::backend::StorageBackend;
-use crate::traits::zarr::{DatasetSummary, NodeKind, ZarrStorageOps};
+use crate::traits::zarr::{DatasetSummary, NodeKind, RowUpdate, ZarrStorageOps};
 use crate::zzarr::ZarrArray;
 use crate::{StorageError, StorageResult};
 
@@ -154,6 +154,30 @@ impl ZarrStorage {
     /// Traversal-guarded root-relative path for a save/load key.
     fn dataset_path(&self, key: &str) -> StorageResult<PathBuf> {
         Ok(self.root.join(clean_rel(key)?))
+    }
+
+    /// Resolves a dataset ID to its directory: label must match this
+    /// root, the rel path is traversal-guarded, the node must exist.
+    fn dataset_dir(&self, dataset_id: &str) -> StorageResult<PathBuf> {
+        let (label, rel) = decode_dataset_id(dataset_id);
+        if label != self.label {
+            return Err(StorageError::Invalid(format!(
+                "dataset '{dataset_id}' does not belong to root '{}'",
+                self.label
+            )));
+        }
+        let target = if rel == "." {
+            self.root.clone()
+        } else {
+            self.root.join(clean_rel(&rel)?)
+        };
+        if !target.is_dir() {
+            return Err(StorageError::Invalid(format!(
+                "dataset '{dataset_id}' not found at {}",
+                target.display()
+            )));
+        }
+        Ok(target)
     }
 
     /// Registers a written artifact in the kernel registry under its rel
@@ -518,6 +542,135 @@ fn checked_i64_values(values: &[usize]) -> StorageResult<Vec<i64>> {
         .collect()
 }
 
+/// f64 -> f32 narrowing for vector writes (the same_kind auto-cast of the
+/// Python contract). Finite values above the f32 range surface
+/// [`StorageError::Overflow`] instead of becoming silent infinities (#51).
+fn cast_f64_to_f32(values: &[f64]) -> StorageResult<Vec<f32>> {
+    values
+        .iter()
+        .map(|&v| {
+            let narrowed = v as f32;
+            if v.is_finite() && !narrowed.is_finite() {
+                return Err(StorageError::Overflow(format!(
+                    "value {v} exceeds the f32 range and would be silently narrowed"
+                )));
+            }
+            Ok(narrowed)
+        })
+        .collect()
+}
+
+/// Sync append core: open, validate, resize, write the tail — all under
+/// the dataset's write mailbox. Python `append_vectors` port (#5): the
+/// two-phase validate/re-validate collapses into one phase because
+/// validation itself runs under the lock.
+fn append_vectors_blocking(
+    path: PathBuf,
+    dataset_id: String,
+    values: Vec<f64>,
+    m: usize,
+    d: usize,
+) -> StorageResult<(usize, usize)> {
+    crate::commit::with_dataset_write_lock(&path, || {
+        let mut arr = crate::zzarr::open(&path)?;
+        let shape = arr.shape();
+        if shape.len() != 2 {
+            return Err(StorageError::Invalid(format!(
+                "dataset '{dataset_id}' is not a 2-D array (shape {shape:?})"
+            )));
+        }
+        let (n, arr_d) = (shape[0] as usize, shape[1] as usize);
+        if arr_d != d {
+            return Err(StorageError::DimensionMismatch {
+                expected: format!("{} features", arr_d),
+                found: format!("{} features", d),
+            });
+        }
+        match read_node_meta(&path)?.dtype.as_str() {
+            "float64" => arr.append(values.as_slice())?,
+            "float32" => {
+                let cast = cast_f64_to_f32(&values)?;
+                arr.append(cast.as_slice())?
+            }
+            other => {
+                return Err(StorageError::Invalid(format!(
+                    "dtype mismatch for '{dataset_id}': vectors are f64, \
+                     dataset expects '{other}'"
+                )));
+            }
+        }
+        Ok((n, n + m))
+    })
+}
+
+/// Sync overwrite core: validate all updates, then write row by row
+/// (Python `overwrite_vectors` port; shape unchanged, last duplicate wins).
+fn overwrite_vectors_blocking(
+    path: PathBuf,
+    dataset_id: String,
+    updates: Vec<RowUpdate>,
+) -> StorageResult<usize> {
+    crate::commit::with_dataset_write_lock(&path, || {
+        let mut arr = crate::zzarr::open(&path)?;
+        let shape = arr.shape();
+        if shape.len() != 2 {
+            return Err(StorageError::Invalid(format!(
+                "dataset '{dataset_id}' is not a 2-D array (shape {shape:?})"
+            )));
+        }
+        let (n, d) = (shape[0] as u64, shape[1] as u64);
+        // Validate ALL updates before the first write: no partial writes.
+        for upd in &updates {
+            if upd.row_index as u64 >= n {
+                return Err(StorageError::Invalid(format!(
+                    "row index {} is out of bounds: dataset '{dataset_id}' has \
+                     {n} rows (valid range 0..{n})",
+                    upd.row_index
+                )));
+            }
+            if upd.vector.len() as u64 != d {
+                return Err(StorageError::DimensionMismatch {
+                    expected: format!("{d} features"),
+                    found: format!("{} features", upd.vector.len()),
+                });
+            }
+        }
+        match read_node_meta(&path)?.dtype.as_str() {
+            "float64" => {
+                for upd in &updates {
+                    write_row(&mut arr, upd.row_index as u64, d, upd.vector.as_slice())?;
+                }
+            }
+            "float32" => {
+                let casted: Vec<Vec<f32>> = updates
+                    .iter()
+                    .map(|upd| cast_f64_to_f32(&upd.vector))
+                    .collect::<StorageResult<_>>()?;
+                for (upd, vector) in updates.iter().zip(casted) {
+                    write_row(&mut arr, upd.row_index as u64, d, vector.as_slice())?;
+                }
+            }
+            other => {
+                return Err(StorageError::Invalid(format!(
+                    "dtype mismatch for '{dataset_id}': vectors are f64, \
+                     dataset expects '{other}'"
+                )));
+            }
+        }
+        Ok(updates.len())
+    })
+}
+
+/// Writes one full row of a 2-D array (any float element type).
+fn write_row<T: zarrs::array::Element>(
+    arr: &mut ZarrArray,
+    row: u64,
+    d: u64,
+    values: &[T],
+) -> StorageResult<()> {
+    arr.write_subset(&[row..row + 1, 0..d], values)
+}
+
 async fn blocking<T, F>(what: &str, f: F) -> StorageResult<T>
 where
     T: Send + 'static,
@@ -873,24 +1026,7 @@ impl ZarrStorageOps for ZarrStorage {
     }
 
     async fn open(&self, dataset_id: &str) -> StorageResult<ZarrArray> {
-        let (label, rel) = decode_dataset_id(dataset_id);
-        if label != self.label {
-            return Err(StorageError::Invalid(format!(
-                "dataset '{dataset_id}' does not belong to root '{}'",
-                self.label
-            )));
-        }
-        let target = if rel == "." {
-            self.root.clone()
-        } else {
-            self.root.join(clean_rel(&rel)?)
-        };
-        if !target.is_dir() {
-            return Err(StorageError::Invalid(format!(
-                "dataset '{dataset_id}' not found at {}",
-                target.display()
-            )));
-        }
+        let target = self.dataset_dir(dataset_id)?;
         // Typed group rejection; zzarr::open would only report "not an array".
         if let Ok(meta) = read_node_meta(&target)
             && meta.kind == NodeKind::Group
@@ -931,6 +1067,88 @@ impl ZarrStorageOps for ZarrStorage {
                 kind: meta.kind,
                 extra: BTreeMap::new(),
             })
+        })
+        .await
+    }
+
+    async fn append_vectors(
+        &self,
+        dataset_id: &str,
+        vecs: &DenseMatrix<f64>,
+    ) -> StorageResult<(usize, usize)> {
+        let (m, d) = vecs.shape();
+        if m == 0 {
+            return Err(StorageError::Invalid(
+                "Cannot append zero vectors".to_string(),
+            ));
+        }
+        let path = self.dataset_dir(dataset_id)?;
+        let values = flatten_row_major(vecs)?;
+        let id = dataset_id.to_string();
+        let p = path.clone();
+        let (start, new_n) = blocking("append vectors", move || {
+            append_vectors_blocking(p, id, values, m, d)
+        })
+        .await?;
+        // Best-effort registry refresh (Python `register_dataset` cache
+        // update); unregistered user trees stay registry-free.
+        self.update_registered_shape(&self.rel_of(dataset_id), new_n, d)
+            .await?;
+        Ok((start, new_n))
+    }
+
+    async fn overwrite_vectors(
+        &self,
+        dataset_id: &str,
+        updates: &[RowUpdate],
+    ) -> StorageResult<usize> {
+        if updates.is_empty() {
+            return Err(StorageError::Invalid(
+                "empty updates: overwrite requires at least one row".to_string(),
+            ));
+        }
+        let path = self.dataset_dir(dataset_id)?;
+        let id = dataset_id.to_string();
+        let owned = updates.to_vec();
+        let p = path;
+        blocking("overwrite vectors", move || {
+            overwrite_vectors_blocking(p, id, owned)
+        })
+        .await
+    }
+}
+
+impl ZarrStorage {
+    /// Rel-path key of a dataset ID under this root (post-validation).
+    fn rel_of(&self, dataset_id: &str) -> String {
+        let (_, rel) = decode_dataset_id(dataset_id);
+        rel
+    }
+
+    /// Updates the registered shape of `key` in the kernel registry
+    /// (Python `register_dataset` cache update). Best-effort: unseeded
+    /// roots and unregistered keys are left alone — the filesystem scan is
+    /// the discovery truth.
+    async fn update_registered_shape(
+        &self,
+        key: &str,
+        rows: usize,
+        cols: usize,
+    ) -> StorageResult<()> {
+        if !self.registry_path().is_file() {
+            return Ok(());
+        }
+        let key = key.to_string();
+        crate::commit::with_commit_actor(&self.registry_path(), || async {
+            let mut md = match self.load_metadata().await {
+                Ok(md) => md,
+                Err(_) => return Ok(()),
+            };
+            if let Some(info) = md.files.get_mut(&key) {
+                info.rows = rows;
+                info.cols = cols;
+            }
+            self.save_metadata(&md).await.map(|_| ())
         })
         .await
     }

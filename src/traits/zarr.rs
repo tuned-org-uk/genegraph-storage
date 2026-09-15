@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use smartcore::linalg::basic::matrix::DenseMatrix;
 
 use crate::StorageResult;
 use crate::traits::backend::StorageBackend;
@@ -61,6 +62,17 @@ pub struct DatasetSummary {
     pub extra: BTreeMap<String, serde_json::Value>,
 }
 
+/// One row replacement for [`ZarrStorageOps::overwrite_vectors`] — the
+/// kernel form of the Python `RowUpdate` request model (`usize` makes the
+/// `row_index >= 0` constraint structural).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RowUpdate {
+    /// Row to replace; must be below the array's leading extent.
+    pub row_index: usize,
+    /// Replacement vector; length must equal the array's feature count.
+    pub vector: Vec<f64>,
+}
+
 /// Zarr-specific operations over a [`ZarrStorage`](crate::zarr_storage::ZarrStorage)
 /// root: the child trait analog of [`crate::traits::lance::LanceStorage`].
 ///
@@ -80,4 +92,32 @@ pub trait ZarrStorageOps: StorageBackend {
     /// Summarizes the single node at `fs_path` (O(1): one metadata read,
     /// no walk). Mirrors the Python `summarize` contract: arrays only.
     async fn summarize(&self, dataset_id: &str, fs_path: &Path) -> StorageResult<DatasetSummary>;
+
+    /// Appends `vecs` (M rows x D features, f64) to the 2-D array
+    /// `dataset_id`: resize the leading axis, then write the new rows
+    /// (O(M): existing rows are never read). Vectors are auto-cast to the
+    /// array's float width (`f64` source, `f32` target narrowing with
+    /// `Overflow` above the f32 range); non-float targets are rejected.
+    ///
+    /// The whole open → validate → resize → write cycle runs under the
+    /// dataset's write mailbox: concurrent appends to one dataset
+    /// serialize with contiguous, non-overlapping start rows; appends to
+    /// different datasets proceed in parallel. Returns
+    /// `(start_row, new_nrows)`.
+    async fn append_vectors(
+        &self,
+        dataset_id: &str,
+        vecs: &DenseMatrix<f64>,
+    ) -> StorageResult<(usize, usize)>;
+
+    /// Replaces specific rows of the 2-D array `dataset_id`
+    /// (validate-all-then-write: one invalid row rejects the whole batch
+    /// before the first write). Shape is unchanged; duplicate row indices
+    /// are allowed and the last entry wins. Returns the number of written
+    /// rows (`updates.len()`).
+    async fn overwrite_vectors(
+        &self,
+        dataset_id: &str,
+        updates: &[RowUpdate],
+    ) -> StorageResult<usize>;
 }

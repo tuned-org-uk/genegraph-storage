@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.67.0 (2026-09-15)
+
+Adds the Zarr vector write paths (Genefold/arro-server-rs#5): appends and
+row overwrites on 2-D arrays through `ZarrStorageOps`, ported from the
+Python backend's `append_vectors`/`overwrite_vectors`. Every write runs
+under the dataset's write mailbox: concurrent appends to one dataset
+serialize with contiguous, non-overlapping start rows; different datasets
+proceed in parallel.
+
+**Added**
+
+- `ZarrStorageOps::append_vectors`: leading-axis resize + O(M) tail
+  write, `(start_row, new_nrows)` return, best-effort registered-shape
+  refresh, and no seed requirement (uploaded user trees are
+  registry-free).
+- `ZarrStorageOps::overwrite_vectors`: validate-all-then-write row
+  replacement, shape unchanged, last duplicate wins, `RowUpdate` input
+  type.
+- `ZarrArray::write_subset` (hyperrectangular store, the read_subset
+  counterpart); f64->f32 auto-cast with `Overflow` above the f32 range
+  (#51).
+
+**Changed**
+
+- Validation of both write paths runs inside the dataset write lock
+  (single phase), which supersedes the Python two-phase TOCTOU
+  re-check with a strictly stronger guarantee.
+
+Refs: Genefold/arro-server-rs#5, Genefold/arro-server-rs#26
+
 ## 0.66.0 (2026-09-15)
 
 Adds `ZarrStorage` (Genefold/arro-server-rs#4): a `StorageBackend`

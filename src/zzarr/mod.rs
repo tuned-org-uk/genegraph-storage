@@ -99,6 +99,19 @@ impl ZarrArray {
             .map_err(map_err)
     }
 
+    /// Write a hyperrectangular subset, row-major (the counterpart of
+    /// [`Self::read_subset`]). Only the touched chunks are stored.
+    pub fn write_subset<T: Element>(
+        &mut self,
+        ranges: &[Range<u64>],
+        values: &[T],
+    ) -> StorageResult<()> {
+        let subset = ArraySubset::new_with_ranges(ranges);
+        self.array
+            .store_array_subset(&subset, values)
+            .map_err(map_err)
+    }
+
     /// Append elements along the leading axis: resize, persist the new
     /// shape, then write the tail. Values must tile the trailing extent.
     pub fn append<T: Element>(&mut self, values: &[T]) -> StorageResult<()> {

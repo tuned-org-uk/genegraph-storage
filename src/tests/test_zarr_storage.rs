@@ -699,3 +699,418 @@ async fn zarr_datasets_surface_through_local_registry() {
     assert_eq!(desc.properties["rows"], "3");
     assert_eq!(desc.properties["cols"], "2");
 }
+
+// ---------------------------------------------------------------------------
+// #5: vector write paths — append
+// ---------------------------------------------------------------------------
+
+/// f32 arange matrix at `<root>/<name>` (chunks `[chunk_rows, cols]`) — the
+/// Python test_vectors_append/overwrite fixture shape.
+fn write_arange_f32(dir: &Path, rows: u64, cols: u64, chunk_rows: u64) {
+    let values: Vec<f32> = (0..rows * cols).map(|i| i as f32).collect();
+    crate::zzarr::write_array(dir, &[rows, cols], &[chunk_rows, cols], &values, true).unwrap();
+}
+
+/// Dense (m, d) matrix filled with `value`.
+fn filled(m: usize, d: usize, value: f64) -> DenseMatrix<f64> {
+    DenseMatrix::from_iterator((0..m * d).map(|_| value), m, d, 0)
+}
+
+fn read_rows_f32(dir: &Path, from: u64, to: u64, cols: u64) -> Vec<f32> {
+    let arr = crate::zzarr::open(dir).unwrap();
+    arr.read_subset::<f32>(&[from..to, 0..cols]).unwrap()
+}
+
+#[tokio::test]
+async fn append_returns_start_row_and_new_shape_and_writes_rows() {
+    let root = tmp_dir("zarr_app_basic").await.join("main");
+    write_arange_f32(&root.join("matrix"), 50, 4, 10);
+    let storage = ZarrStorage::new(root.clone(), "main".to_string()).unwrap();
+
+    let rows: Vec<Vec<f64>> = (0..7)
+        .map(|i| (0..4).map(|j| 100.0 + (i * 4 + j) as f64).collect())
+        .collect();
+    let refs: Vec<&[f64]> = rows.iter().map(|r| r.as_slice()).collect();
+    let (start, new_n) = storage
+        .append_vectors("main--matrix", &dense(&refs))
+        .await
+        .unwrap();
+
+    assert_eq!(start, 50);
+    assert_eq!(new_n, 57);
+    let got = read_rows_f32(&root.join("matrix"), 50, 57, 4);
+    for (i, row) in rows.iter().enumerate() {
+        for (j, want) in row.iter().enumerate() {
+            assert!(
+                (got[i * 4 + j] as f64 - want).abs() < 1e-6,
+                "row {i} col {j}"
+            );
+        }
+    }
+    // Existing rows are untouched.
+    assert_eq!(
+        read_rows_f32(&root.join("matrix"), 0, 1, 4),
+        vec![0.0f32, 1.0, 2.0, 3.0]
+    );
+}
+
+#[tokio::test]
+async fn append_start_row_advances_across_sequential_appends() {
+    let root = tmp_dir("zarr_app_seq").await.join("main");
+    write_arange_f32(&root.join("matrix"), 50, 4, 10);
+    let storage = ZarrStorage::new(root, "main".to_string()).unwrap();
+
+    let r1 = storage
+        .append_vectors("main--matrix", &filled(10, 4, 1.0))
+        .await
+        .unwrap();
+    assert_eq!(r1, (50, 60));
+    let r2 = storage
+        .append_vectors("main--matrix", &filled(5, 4, 2.0))
+        .await
+        .unwrap();
+    assert_eq!(r2, (60, 65));
+}
+
+#[tokio::test]
+async fn append_updates_registered_shape() {
+    let root = tmp_dir("zarr_app_registry").await.join("main");
+    let storage = seeded(&root, "main", 50, 4).await;
+    let m = filled(50, 4, 0.0);
+    storage
+        .save_dense("matrix", &m, &storage.metadata_path())
+        .await
+        .unwrap();
+    storage
+        .append_vectors("main--matrix", &filled(3, 4, 1.0))
+        .await
+        .unwrap();
+
+    let md = storage.load_metadata().await.unwrap();
+    let info = md.files.get("matrix").unwrap();
+    assert_eq!((info.rows, info.cols), (53, 4));
+}
+
+#[tokio::test]
+async fn append_works_on_unregistered_user_trees() {
+    // Uploaded trees carry no kernel registry: append is filesystem-first.
+    let root = tmp_dir("zarr_app_unreg").await.join("main");
+    write_arange_f32(&root.join("matrix"), 50, 4, 10);
+    let storage = ZarrStorage::new(root.clone(), "main".to_string()).unwrap();
+    let (start, new_n) = storage
+        .append_vectors("main--matrix", &filled(2, 4, 9.0))
+        .await
+        .unwrap();
+    assert_eq!((start, new_n), (50, 52));
+    assert!(!root.join(".arro").join("metadata.json").is_file());
+}
+
+#[tokio::test]
+async fn append_dim_mismatch_surfaces_dimension_mismatch() {
+    let root = tmp_dir("zarr_app_dim").await.join("main");
+    write_arange_f32(&root.join("matrix"), 50, 4, 10);
+    let storage = ZarrStorage::new(root, "main".to_string()).unwrap();
+    let err = storage
+        .append_vectors("main--matrix", &filled(1, 7, 0.0))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, crate::StorageError::DimensionMismatch { .. }),
+        "{err:?}"
+    );
+    assert!(err.to_string().contains("Dimension mismatch"));
+}
+
+#[tokio::test]
+async fn append_empty_batch_is_invalid() {
+    let root = tmp_dir("zarr_app_empty").await.join("main");
+    write_arange_f32(&root.join("matrix"), 50, 4, 10);
+    let storage = ZarrStorage::new(root, "main".to_string()).unwrap();
+    let err = storage
+        .append_vectors("main--matrix", &filled(0, 4, 0.0))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, crate::StorageError::Invalid(_)), "{err:?}");
+}
+
+#[tokio::test]
+async fn append_to_non_float_dtype_is_rejected() {
+    // f64 vectors into an i64 array is not same_kind: dtype mismatch.
+    let root = tmp_dir("zarr_app_dtype").await.join("main");
+    crate::zzarr::write_array(&root.join("ints"), &[4, 2], &[4, 2], &[0i64; 8], true).unwrap();
+    let storage = ZarrStorage::new(root, "main".to_string()).unwrap();
+    let err = storage
+        .append_vectors("main--ints", &filled(1, 2, 1.0))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, crate::StorageError::Invalid(_)), "{err:?}");
+    assert!(err.to_string().contains("dtype mismatch"));
+}
+
+#[tokio::test]
+async fn append_missing_dataset_is_invalid() {
+    let root = tmp_dir("zarr_app_missing").await.join("main");
+    let storage = ZarrStorage::new(root, "main".to_string()).unwrap();
+    let err = storage
+        .append_vectors("main--nope", &filled(1, 4, 0.0))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, crate::StorageError::Invalid(_)), "{err:?}");
+}
+
+#[tokio::test]
+async fn append_rejects_non_2d_target() {
+    let root = tmp_dir("zarr_app_ndim").await.join("main");
+    crate::zzarr::write_array(&root.join("flat"), &[10], &[10], &[0.0f32; 10], true).unwrap();
+    let storage = ZarrStorage::new(root, "main".to_string()).unwrap();
+    let err = storage
+        .append_vectors("main--flat", &filled(1, 4, 0.0))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, crate::StorageError::Invalid(_)), "{err:?}");
+    assert!(err.to_string().contains("not a 2-D array"));
+}
+
+#[tokio::test]
+async fn append_concurrent_ranges_partition_without_overlap() {
+    // Direct port of test_append_concurrent_start_rows_no_overlap: three
+    // concurrent appends must return disjoint, contiguous start ranges.
+    let root = tmp_dir("zarr_app_conc").await.join("main");
+    write_arange_f32(&root.join("matrix"), 50, 4, 10);
+    let storage = ZarrStorage::new(root.clone(), "main".to_string()).unwrap();
+
+    let sizes = [4usize, 7, 3];
+    let handles: Vec<_> = sizes
+        .iter()
+        .map(|&size| {
+            let storage = storage.clone();
+            tokio::spawn(async move {
+                storage
+                    .append_vectors("main--matrix", &filled(size, 4, size as f64))
+                    .await
+                    .unwrap()
+            })
+        })
+        .collect();
+    let mut results: Vec<(usize, usize)> = Vec::new();
+    for h in handles {
+        results.push(h.await.unwrap());
+    }
+    results.sort();
+
+    assert_eq!(results[0].0, 50, "first range starts at old_n");
+    for i in 0..results.len() - 1 {
+        assert_eq!(results[i].1, results[i + 1].0, "gap between {results:?}");
+    }
+    let total: usize = sizes.iter().sum();
+    assert_eq!(results[2].1, 50 + total);
+    assert_eq!(
+        storage
+            .summarize("main--matrix", &root.join("matrix"))
+            .await
+            .unwrap()
+            .shape,
+        vec![64, 4]
+    );
+}
+
+#[tokio::test]
+async fn append_to_different_datasets_proceeds_independently() {
+    let root = tmp_dir("zarr_app_par").await.join("main");
+    write_arange_f32(&root.join("a"), 10, 4, 4);
+    write_arange_f32(&root.join("other"), 20, 4, 4);
+    let storage = ZarrStorage::new(root, "main".to_string()).unwrap();
+
+    let m1 = filled(2, 4, 1.0);
+    let m2 = filled(3, 4, 2.0);
+    let (r1, r2) = tokio::join!(
+        storage.append_vectors("main--a", &m1),
+        storage.append_vectors("main--other", &m2),
+    );
+    assert_eq!(r1.unwrap(), (10, 12));
+    assert_eq!(r2.unwrap(), (20, 23));
+}
+
+// ---------------------------------------------------------------------------
+// #5: vector write paths — overwrite
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn overwrite_single_row_updates_values() {
+    let root = tmp_dir("zarr_ovw_single").await.join("main");
+    write_arange_f32(&root.join("matrix"), 50, 4, 10);
+    let storage = ZarrStorage::new(root.clone(), "main".to_string()).unwrap();
+
+    let n = storage
+        .overwrite_vectors(
+            "main--matrix",
+            &[crate::traits::zarr::RowUpdate {
+                row_index: 10,
+                vector: vec![99.0, 98.0, 97.0, 96.0],
+            }],
+        )
+        .await
+        .unwrap();
+    assert_eq!(n, 1);
+    assert_eq!(
+        read_rows_f32(&root.join("matrix"), 10, 11, 4),
+        vec![99.0f32, 98.0, 97.0, 96.0]
+    );
+}
+
+#[tokio::test]
+async fn overwrite_multiple_rows_keeps_shape() {
+    let root = tmp_dir("zarr_ovw_multi").await.join("main");
+    write_arange_f32(&root.join("matrix"), 50, 4, 10);
+    let storage = ZarrStorage::new(root.clone(), "main".to_string()).unwrap();
+
+    let n = storage
+        .overwrite_vectors(
+            "main--matrix",
+            &[
+                crate::traits::zarr::RowUpdate {
+                    row_index: 0,
+                    vector: vec![1.0, 2.0, 3.0, 4.0],
+                },
+                crate::traits::zarr::RowUpdate {
+                    row_index: 25,
+                    vector: vec![5.0, 6.0, 7.0, 8.0],
+                },
+                crate::traits::zarr::RowUpdate {
+                    row_index: 49,
+                    vector: vec![9.0, 10.0, 11.0, 12.0],
+                },
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(n, 3);
+    assert_eq!(
+        read_rows_f32(&root.join("matrix"), 25, 26, 4),
+        vec![5.0f32, 6.0, 7.0, 8.0]
+    );
+    // Shape unchanged.
+    let arr = crate::zzarr::open(&root.join("matrix")).unwrap();
+    assert_eq!(arr.shape(), vec![50, 4]);
+}
+
+#[tokio::test]
+async fn overwrite_out_of_bounds_rejects_whole_batch_without_partial_write() {
+    let root = tmp_dir("zarr_ovw_bounds").await.join("main");
+    write_arange_f32(&root.join("matrix"), 50, 4, 10);
+    let storage = ZarrStorage::new(root.clone(), "main".to_string()).unwrap();
+
+    let err = storage
+        .overwrite_vectors(
+            "main--matrix",
+            &[
+                crate::traits::zarr::RowUpdate {
+                    row_index: 0,
+                    vector: vec![99.0; 4],
+                },
+                crate::traits::zarr::RowUpdate {
+                    row_index: 50,
+                    vector: vec![1.0; 4],
+                },
+            ],
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, crate::StorageError::Invalid(_)), "{err:?}");
+    assert!(err.to_string().contains("out of bounds"));
+    // Validate-all-then-write: row 0 must be unchanged.
+    assert_eq!(
+        read_rows_f32(&root.join("matrix"), 0, 1, 4),
+        vec![0.0f32, 1.0, 2.0, 3.0]
+    );
+}
+
+#[tokio::test]
+async fn overwrite_dim_mismatch_rejects_whole_batch() {
+    let root = tmp_dir("zarr_ovw_dim").await.join("main");
+    write_arange_f32(&root.join("matrix"), 50, 4, 10);
+    let storage = ZarrStorage::new(root.clone(), "main".to_string()).unwrap();
+    let err = storage
+        .overwrite_vectors(
+            "main--matrix",
+            &[
+                crate::traits::zarr::RowUpdate {
+                    row_index: 0,
+                    vector: vec![1.0; 4],
+                },
+                crate::traits::zarr::RowUpdate {
+                    row_index: 1,
+                    vector: vec![1.0, 2.0, 3.0],
+                },
+            ],
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, crate::StorageError::DimensionMismatch { .. }),
+        "{err:?}"
+    );
+    // Row 0 unchanged.
+    assert_eq!(
+        read_rows_f32(&root.join("matrix"), 0, 1, 4),
+        vec![0.0f32, 1.0, 2.0, 3.0]
+    );
+}
+
+#[tokio::test]
+async fn overwrite_empty_updates_is_invalid() {
+    let root = tmp_dir("zarr_ovw_empty").await.join("main");
+    write_arange_f32(&root.join("matrix"), 50, 4, 10);
+    let storage = ZarrStorage::new(root, "main".to_string()).unwrap();
+    let err = storage
+        .overwrite_vectors("main--matrix", &[])
+        .await
+        .unwrap_err();
+    assert!(matches!(err, crate::StorageError::Invalid(_)), "{err:?}");
+}
+
+#[tokio::test]
+async fn overwrite_duplicate_row_index_last_wins() {
+    let root = tmp_dir("zarr_ovw_dup").await.join("main");
+    write_arange_f32(&root.join("matrix"), 50, 4, 10);
+    let storage = ZarrStorage::new(root.clone(), "main".to_string()).unwrap();
+
+    let n = storage
+        .overwrite_vectors(
+            "main--matrix",
+            &[
+                crate::traits::zarr::RowUpdate {
+                    row_index: 7,
+                    vector: vec![1.0; 4],
+                },
+                crate::traits::zarr::RowUpdate {
+                    row_index: 7,
+                    vector: vec![2.0; 4],
+                },
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(n, 2);
+    assert_eq!(
+        read_rows_f32(&root.join("matrix"), 7, 8, 4),
+        vec![2.0f32; 4]
+    );
+}
+
+#[tokio::test]
+async fn overwrite_missing_dataset_is_invalid() {
+    let root = tmp_dir("zarr_ovw_missing").await.join("main");
+    let storage = ZarrStorage::new(root, "main".to_string()).unwrap();
+    let err = storage
+        .overwrite_vectors(
+            "main--nope",
+            &[crate::traits::zarr::RowUpdate {
+                row_index: 0,
+                vector: vec![1.0; 4],
+            }],
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, crate::StorageError::Invalid(_)), "{err:?}");
+}
