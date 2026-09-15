@@ -114,6 +114,10 @@ impl ZarrArray {
 
     /// Append elements along the leading axis: resize, persist the new
     /// shape, then write the tail. Values must tile the trailing extent.
+    ///
+    /// Accepted crash window (Python parity, #5 review): the resized shape
+    /// is published before the tail data lands, so a crash in between
+    /// leaves zero-filled phantom rows visible to readers.
     pub fn append<T: Element>(&mut self, values: &[T]) -> StorageResult<()> {
         let shape = self.array.shape().to_vec();
         let trailing: u64 = shape[1..].iter().product::<u64>().max(1);

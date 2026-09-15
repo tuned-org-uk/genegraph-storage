@@ -1,12 +1,43 @@
 # Changelog
 
+## 0.68.0 (2026-09-15)
+
+Review fixes for the Zarr vector write paths (Genefold/arro-server-rs#5
+review). All four findings land with reproduction tests.
+
+**Fixed**
+
+- `append_vectors`: the registry shape refresh is now best-effort in both
+  directions — a registry save failure is logged, never propagated, so a
+  failed refresh can no longer surface as an append failure (which would
+  make a retrying client append twice). Unregistered keys are not
+  republished.
+- Dataset creation (`save_dense`, `save_dense_to_file`, `save_vector`,
+  `save_index`) routes through the per-dataset write mailbox, so the
+  `InvalidState` overwrite rejection is guaranteed under concurrency.
+- `clean_rel` rejects segments carrying `--`: a key segment with the
+  dataset-ID separator would encode into an ID that decodes to a
+  different path. `make_dataset_id`/`decode_dataset_id` is now a
+  bijection over creatable keys.
+- Root scan: chunk-grid entries that are not `u64` surface
+  `UnsupportedFormat` instead of being silently dropped.
+
+**Changed**
+
+- `commit::with_dataset_write_lock` documented: in-process only, raw-path
+  mailbox key. `zzarr::append` documented: the resize-publishes-before-
+  data crash window is accepted (Python parity).
+
+Refs: Genefold/arro-server-rs#5, Genefold/arro-server-rs#26
+
 ## 0.67.0 (2026-09-15)
 
 Adds the Zarr vector write paths (Genefold/arro-server-rs#5): appends and
 row overwrites on 2-D arrays through `ZarrStorageOps`, ported from the
 Python backend's `append_vectors`/`overwrite_vectors`. Every write runs
 under the dataset's write mailbox: concurrent appends to one dataset
-serialize with contiguous, non-overlapping start rows; different datasets
+serialize with contiguous, non-overlapping start rows (in-process mailbox;
+cross-process writers need a flock); different datasets
 proceed in parallel.
 
 **Added**

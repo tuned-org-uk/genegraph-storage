@@ -84,6 +84,14 @@ fn clean_rel(key: &str) -> StorageResult<PathBuf> {
                     "relative path '{key}' must not traverse outside the root"
                 )));
             }
+            seg if seg.contains(DATASET_ID_SEP) => {
+                // Review of #5: a segment carrying `--` would encode into a
+                // dataset ID that decodes to a different path; reject it so
+                // make/decode_dataset_id stays a bijection.
+                return Err(StorageError::Invalid(format!(
+                    "relative path segment '{seg}' must not contain '{DATASET_ID_SEP}'"
+                )));
+            }
             seg => out.push(seg),
         }
     }
@@ -277,17 +285,16 @@ fn read_json(path: &Path) -> StorageResult<serde_json::Value> {
     serde_json::from_str(&text).map_err(StorageError::Serde)
 }
 
-fn shape_of(value: &serde_json::Value, dir: &Path) -> StorageResult<Vec<u64>> {
+fn u64_list(value: &serde_json::Value, dir: &Path, what: &str) -> StorageResult<Vec<u64>> {
     let items = value
-        .get("shape")
-        .and_then(|s| s.as_array())
-        .ok_or_else(|| unsupported(dir, "node metadata is missing 'shape'"))?;
+        .as_array()
+        .ok_or_else(|| unsupported(dir, &format!("node metadata has a malformed '{what}' list")))?;
     items
         .iter()
         .map(|v| {
             v.as_u64().ok_or_else(|| {
                 StorageError::UnsupportedFormat(format!(
-                    "malformed shape entry {v} in {}",
+                    "malformed {what} entry {v} in {}",
                     dir.display()
                 ))
             })
@@ -303,18 +310,23 @@ fn group_of(v: &serde_json::Value, dir: &Path) -> StorageResult<NodeMeta> {
     match v.get("node_type").and_then(|t| t.as_str()) {
         Some("group") => Ok(NodeMeta::group()),
         Some("array") => {
-            let shape = shape_of(v, dir)?;
+            let shape = v
+                .get("shape")
+                .ok_or_else(|| unsupported(dir, "node metadata is missing 'shape'"))?;
+            let shape = u64_list(shape, dir, "shape")?;
             let dtype = v
                 .get("data_type")
                 .and_then(|d| d.as_str())
                 .ok_or_else(|| unsupported(dir, "v3 array metadata is missing 'data_type'"))?
                 .to_string();
-            let chunks = v
+            let chunks = match v
                 .get("chunk_grid")
                 .and_then(|g| g.get("configuration"))
                 .and_then(|c| c.get("chunk_shape"))
-                .and_then(|s| s.as_array())
-                .map(|a| a.iter().filter_map(|x| x.as_u64()).collect::<Vec<_>>());
+            {
+                Some(s) => Some(u64_list(s, dir, "chunk_shape")?),
+                None => None,
+            };
             let fill_value = v.get("fill_value").cloned().filter(|f| !f.is_null());
             Ok(NodeMeta {
                 kind: NodeKind::Array,
@@ -343,14 +355,17 @@ fn read_node_meta(dir: &Path) -> StorageResult<NodeMeta> {
             .and_then(|d| d.as_str())
             .ok_or_else(|| unsupported(dir, "v2 .zarray is missing 'dtype'"))?
             .to_string();
-        let chunks = v
-            .get("chunks")
-            .and_then(|c| c.as_array())
-            .map(|a| a.iter().filter_map(|x| x.as_u64()).collect::<Vec<_>>());
+        let chunks = match v.get("chunks") {
+            Some(c) => Some(u64_list(c, dir, "chunks")?),
+            None => None,
+        };
         let fill_value = v.get("fill_value").cloned().filter(|f| !f.is_null());
+        let shape = v
+            .get("shape")
+            .ok_or_else(|| unsupported(dir, "node metadata is missing 'shape'"))?;
         return Ok(NodeMeta {
             kind: NodeKind::Array,
-            shape: shape_of(&v, dir)?,
+            shape: u64_list(shape, dir, "shape")?,
             dtype,
             chunks,
             fill_value,
@@ -740,13 +755,17 @@ impl StorageBackend for ZarrStorage {
         let values = flatten_row_major(matrix)?;
         let p = path.clone();
         blocking("dense save", move || {
-            crate::zzarr::write_array(
-                &p,
-                &[rows as u64, cols as u64],
-                &[rows as u64, cols as u64],
-                &values,
-                true,
-            )
+            // Creation runs under the dataset mailbox (review of #5): the
+            // exists-check + write sequence must not interleave.
+            crate::commit::with_dataset_write_lock(&p, || {
+                crate::zzarr::write_array(
+                    &p,
+                    &[rows as u64, cols as u64],
+                    &[rows as u64, cols as u64],
+                    &values,
+                    true,
+                )
+            })
         })
         .await?;
         self.register_artifact(key, "dense", (rows, cols)).await
@@ -776,13 +795,15 @@ impl StorageBackend for ZarrStorage {
         let values = flatten_row_major(data)?;
         let p = path.to_path_buf();
         blocking("dense save", move || {
-            crate::zzarr::write_array(
-                &p,
-                &[rows as u64, cols as u64],
-                &[rows as u64, cols as u64],
-                &values,
-                true,
-            )
+            crate::commit::with_dataset_write_lock(&p, || {
+                crate::zzarr::write_array(
+                    &p,
+                    &[rows as u64, cols as u64],
+                    &[rows as u64, cols as u64],
+                    &values,
+                    true,
+                )
+            })
         })
         .await
     }
@@ -799,7 +820,9 @@ impl StorageBackend for ZarrStorage {
         let values = vector.to_vec();
         let p = path.clone();
         blocking("vector save", move || {
-            crate::zzarr::write_array(&p, &[len as u64], &[len as u64], &values, true)
+            crate::commit::with_dataset_write_lock(&p, || {
+                crate::zzarr::write_array(&p, &[len as u64], &[len as u64], &values, true)
+            })
         })
         .await?;
         self.register_artifact(key, "vector", (len, 1)).await
@@ -826,7 +849,9 @@ impl StorageBackend for ZarrStorage {
         let path = self.dataset_path(key)?;
         let p = path.clone();
         blocking("index save", move || {
-            crate::zzarr::write_array(&p, &[len as u64], &[len as u64], &values, true)
+            crate::commit::with_dataset_write_lock(&p, || {
+                crate::zzarr::write_array(&p, &[len as u64], &[len as u64], &values, true)
+            })
         })
         .await?;
         self.register_artifact(key, "vector", (vector.len(), 1))
@@ -1126,9 +1151,17 @@ impl ZarrStorage {
     }
 
     /// Updates the registered shape of `key` in the kernel registry
-    /// (Python `register_dataset` cache update). Best-effort: unseeded
-    /// roots and unregistered keys are left alone — the filesystem scan is
-    /// the discovery truth.
+    /// (Python `register_dataset` cache update). Best-effort in BOTH
+    /// directions: unseeded roots and unregistered keys are left alone,
+    /// and a save failure is logged, never propagated — the tail write
+    /// already succeeded, and surfacing an append failure here would make
+    /// a retrying client append twice (#5 review). Unregistered keys are
+    /// not republished.
+    ///
+    /// Staleness tolerance: the refresh runs outside the dataset mailbox,
+    /// so under concurrent appends the last committer wins and the
+    /// registered shape may trail the disk shape until the next refresh.
+    /// The filesystem scan is the discovery truth.
     async fn update_registered_shape(
         &self,
         key: &str,
@@ -1139,17 +1172,28 @@ impl ZarrStorage {
             return Ok(());
         }
         let key = key.to_string();
-        crate::commit::with_commit_actor(&self.registry_path(), || async {
+        let outcome = crate::commit::with_commit_actor(&self.registry_path(), || async {
             let mut md = match self.load_metadata().await {
                 Ok(md) => md,
-                Err(_) => return Ok(()),
+                Err(_) => return Ok(false),
             };
-            if let Some(info) = md.files.get_mut(&key) {
-                info.rows = rows;
-                info.cols = cols;
-            }
-            self.save_metadata(&md).await.map(|_| ())
+            let Some(info) = md.files.get_mut(&key) else {
+                return Ok(false);
+            };
+            info.rows = rows;
+            info.cols = cols;
+            self.save_metadata(&md).await.map(|_| true)
         })
-        .await
+        .await;
+        match outcome {
+            Ok(_) => {}
+            Err(e) => {
+                log::warn!(
+                    "registry shape refresh for '{key}' failed (best-effort, \
+                     disk write stands): {e}"
+                );
+            }
+        }
+        Ok(())
     }
 }

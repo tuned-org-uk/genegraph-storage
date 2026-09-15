@@ -721,6 +721,11 @@ fn read_rows_f32(dir: &Path, from: u64, to: u64, cols: u64) -> Vec<f32> {
     arr.read_subset::<f32>(&[from..to, 0..cols]).unwrap()
 }
 
+fn read_rows_f64(dir: &Path, from: u64, to: u64, cols: u64) -> Vec<f64> {
+    let arr = crate::zzarr::open(dir).unwrap();
+    arr.read_subset::<f64>(&[from..to, 0..cols]).unwrap()
+}
+
 #[tokio::test]
 async fn append_returns_start_row_and_new_shape_and_writes_rows() {
     let root = tmp_dir("zarr_app_basic").await.join("main");
@@ -1113,4 +1118,120 @@ async fn overwrite_missing_dataset_is_invalid() {
         .await
         .unwrap_err();
     assert!(matches!(err, crate::StorageError::Invalid(_)), "{err:?}");
+}
+
+// ---------------------------------------------------------------------------
+// #5 review follow-ups (post-close findings)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn append_succeeds_when_registry_refresh_fails() {
+    // Review finding 1: the registry refresh is best-effort in BOTH
+    // directions — a save failure after a successful tail write must not
+    // surface as an append failure, or a retrying client appends twice.
+    let root = tmp_dir("zarr_app_reg_fail").await.join("main");
+    let storage = seeded(&root, "main", 3, 2).await;
+    let m = filled(3, 2, 1.0);
+    storage
+        .save_dense("m", &m, &storage.metadata_path())
+        .await
+        .unwrap();
+
+    // Make the registry unwritable: the tail write is already on disk.
+    let arro = root.join(".arro");
+    let mut perms = std::fs::metadata(&arro).unwrap().permissions();
+    use std::os::unix::fs::PermissionsExt;
+    let original = perms.mode();
+    perms.set_mode(0o555);
+    std::fs::set_permissions(&arro, perms).unwrap();
+
+    let result = storage.append_vectors("main--m", &filled(2, 2, 9.0)).await;
+    // Restore before the tempdir drops (cleanup needs write permission).
+    let mut perms = std::fs::metadata(&arro).unwrap().permissions();
+    perms.set_mode(original);
+    std::fs::set_permissions(&arro, perms).unwrap();
+
+    let (start, new_n) = result.unwrap();
+    assert_eq!(
+        (start, new_n),
+        (3, 5),
+        "append must succeed despite the registry failure"
+    );
+    assert_eq!(read_rows_f64(&root.join("m"), 3, 5, 2), vec![9.0f64; 4]);
+}
+
+#[tokio::test]
+async fn save_dense_waits_for_the_dataset_mailbox() {
+    // Review finding 4: creation (save_dense/save_vector/save_index) must
+    // serialize through the same per-dataset mailbox as append/overwrite;
+    // otherwise the InvalidState overwrite rejection is not guaranteed
+    // under concurrency.
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    let root = tmp_dir("zarr_save_mailbox").await.join("main");
+    let storage = seeded(&root, "main", 1, 1).await;
+    let path = root.join("held");
+
+    let entered = Arc::new(AtomicBool::new(false));
+    let flag = entered.clone();
+    let holder = path.clone();
+    let handle = std::thread::spawn(move || {
+        crate::commit::with_dataset_write_lock(&holder, || {
+            flag.store(true, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(400));
+            Ok(())
+        })
+    });
+    while !entered.load(Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let start = Instant::now();
+    storage
+        .save_dense("held", &filled(2, 2, 1.0), &storage.metadata_path())
+        .await
+        .unwrap();
+    let elapsed = start.elapsed();
+    handle.join().unwrap().unwrap();
+    assert!(
+        elapsed >= Duration::from_millis(300),
+        "save_dense must wait for the dataset mailbox; waited {elapsed:?}"
+    );
+}
+
+#[tokio::test]
+async fn save_rejects_separator_in_keys() {
+    // Review finding 5: a segment containing `--` would encode into a
+    // dataset ID that decodes to a different path — reject it so the codec
+    // stays a bijection (labels are already guarded).
+    let root = tmp_dir("zarr_key_sep").await.join("main");
+    let storage = seeded(&root, "main", 1, 1).await;
+    let err = storage
+        .save_dense("my--array", &filled(1, 1, 1.0), &storage.metadata_path())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, crate::StorageError::Invalid(_)), "{err:?}");
+    let err = storage.load_vector("a--b").await.unwrap_err();
+    assert!(matches!(err, crate::StorageError::Invalid(_)), "{err:?}");
+}
+
+#[tokio::test]
+async fn scan_rejects_malformed_chunk_shape() {
+    // Review minor: chunk-shape entries that are not u64 must surface
+    // UnsupportedFormat, never be silently dropped.
+    let root = tmp_dir("zarr_scan_badchunks").await.join("main");
+    std::fs::create_dir_all(root.join("bad")).unwrap();
+    std::fs::write(
+        root.join("bad").join("zarr.json"),
+        r#"{"zarr_format":3,"node_type":"array","shape":[4],"data_type":"float32","chunk_grid":{"configuration":{"chunk_shape":["4"]}},"fill_value":0}"#,
+    )
+    .unwrap();
+    let storage = ZarrStorage::new(root, "main".to_string()).unwrap();
+    let err = storage.list_datasets().await.unwrap_err();
+    assert!(
+        matches!(err, crate::StorageError::UnsupportedFormat(_)),
+        "{err:?}"
+    );
 }

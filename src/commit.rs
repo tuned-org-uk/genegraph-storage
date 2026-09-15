@@ -152,7 +152,10 @@ fn lock_for(metadata_path: &Path) -> Arc<Mutex<()>> {
     weak_lookup(&COMMIT_LOCKS, key, Arc::new(Mutex::new(())))
 }
 
-/// One dataset-write mailbox per dataset directory.
+/// One dataset-write mailbox per dataset directory. Keyed by the raw path
+/// string (not canonicalized); the mailbox is in-process only — cross-process
+/// writers need a flock (see `with_metadata_file_lock` for the metadata
+/// recipe). Correct for the one-server arro-server model (#5 review).
 fn dataset_lock_for(dataset_dir: &Path) -> Arc<StdMutex<()>> {
     let key = dataset_dir.to_string_lossy().to_string();
     weak_lookup(&DATASET_LOCKS, key, Arc::new(StdMutex::new(())))
