@@ -1165,6 +1165,35 @@ impl ZarrStorageOps for ZarrStorage {
 }
 
 impl ZarrStorage {
+    /// Resolves a dataset ID to its array summary in one call: label
+    /// check, traversal guard, existence, and the O(1) node summary. The
+    /// registry-layer primitive for consumers that route by dataset ID.
+    pub async fn summarize_by_id(&self, dataset_id: &str) -> StorageResult<DatasetSummary> {
+        let target = self.dataset_dir(dataset_id)?;
+        let id = dataset_id.to_string();
+        blocking("node summarize", move || {
+            let meta = read_node_meta(&target)?;
+            if meta.kind != NodeKind::Array {
+                return Err(StorageError::Invalid(format!(
+                    "dataset '{id}' is a group, not an array"
+                )));
+            }
+            let (label, rel) = decode_dataset_id(&id);
+            Ok(DatasetSummary {
+                dataset_id: id,
+                root: label,
+                path: rel,
+                shape: meta.shape,
+                dtype: meta.dtype,
+                chunks: meta.chunks,
+                fill_value: meta.fill_value,
+                kind: meta.kind,
+                extra: BTreeMap::new(),
+            })
+        })
+        .await
+    }
+
     /// Rel-path key of a dataset ID under this root (post-validation).
     fn rel_of(&self, dataset_id: &str) -> String {
         let (_, rel) = decode_dataset_id(dataset_id);

@@ -10,13 +10,15 @@
 
 pub mod csr;
 
+pub use zarrs::array::ElementOwned;
+
 use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
 
 use zarrs::array::codec::ZstdCodec;
 use zarrs::array::{Array, data_type};
-use zarrs::array::{ArraySubset, DataType, Element, ElementOwned, FillValue};
+use zarrs::array::{ArraySubset, DataType, Element, FillValue};
 use zarrs::filesystem::FilesystemStore;
 use zarrs::storage::ReadableWritableListableStorageTraits;
 

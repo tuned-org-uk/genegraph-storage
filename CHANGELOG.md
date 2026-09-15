@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.69.1 (2026-09-15)
+
+Adds `ZarrStorage::summarize_by_id` (Genefold/arro-server-rs#8): resolve a
+dataset ID to its array summary in one call — label check, traversal
+guard, existence, and the O(1) node summary. Inherent method (not on the
+`ZarrStorageOps` trait) so external implementors keep compiling.
+
+Refs: Genefold/arro-server-rs#8, Genefold/arro-server-rs#26
+
 ## 0.69.0 (2026-09-15)
 
 Enforces the genefold-vd concurrency patterns on the Zarr write paths

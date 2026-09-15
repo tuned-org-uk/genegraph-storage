@@ -1549,3 +1549,39 @@ async fn append_registry_refresh_converges_to_the_disk_shape() {
     );
     assert_eq!(md.files["matrix"].cols, 4);
 }
+
+#[tokio::test]
+async fn summarize_by_id_resolves_and_guards() {
+    // Serving-layer registry need (#8): resolve a dataset ID to its node
+    // summary in one call — label check, traversal guard, existence, and
+    // the O(1) node summary.
+    let root = tmp_dir("zarr_summ_by_id").await.join("main");
+    write_v3_group(&root);
+    let values: Vec<f32> = (0..6).map(|i| i as f32 * 0.5).collect();
+    crate::zzarr::write_array(
+        &root.join("sub").join("cube"),
+        &[2, 3],
+        &[2, 3],
+        &values,
+        true,
+    )
+    .unwrap();
+    let storage = ZarrStorage::new(root.clone(), "main".to_string()).unwrap();
+
+    let summary = storage.summarize_by_id("main--sub--cube").await.unwrap();
+    assert_eq!(summary.dataset_id, "main--sub--cube");
+    assert_eq!(summary.path, "sub/cube");
+    assert_eq!(summary.shape, vec![2, 3]);
+    assert_eq!(summary.dtype, "float32");
+
+    // Foreign label, traversal and missing nodes are rejected.
+    let err = storage
+        .summarize_by_id("other--sub--cube")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, crate::StorageError::Invalid(_)), "{err:?}");
+    let err = storage.summarize_by_id("main--..").await.unwrap_err();
+    assert!(matches!(err, crate::StorageError::Invalid(_)), "{err:?}");
+    let err = storage.summarize_by_id("main--nope").await.unwrap_err();
+    assert!(matches!(err, crate::StorageError::Invalid(_)), "{err:?}");
+}
