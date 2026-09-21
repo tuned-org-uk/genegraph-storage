@@ -23,6 +23,14 @@ Key invariants to preserve when editing:
 - Values above a storage type's range surface `StorageError::Overflow`, never silent truncation (#51).
 - `StorageError` is `#[non_exhaustive]`; downstream matches carry a wildcard arm.
 
+## Layer responsibilities (metadata vs storage)
+
+The catalog layer owns registry reasoning. The storage layer owns artifacts only. Keep each rule in its layer:
+- Lineage and staleness are catalog facts. `Catalog::graph_source` resolves a graph source against the registry. `Catalog::describe_vector_space` computes `GraphStaleness` from current registry facts. Storage code never resolves or computes them.
+- Write paths stamp caller-declared lineage (`source`/`source_rows`, resolved through the catalog) as reserved computed facts. They persist declared facts faithfully. They do not read the registry to validate them: no cross-collection tricks.
+- Registry-free paths stamp the same declared lineage. One rule per fact, every path.
+- Every improvement ships for every implemented format (Lance, Zarr). A format that cannot hold a collection says so with a typed rejection instead of a partial copy of the feature.
+
 ## Concurrency conventions (write paths)
 
 One lock system, shared by every format (`commit.rs`). Formats do not roll their own locks. Per format, only two things vary: the rendezvous path convention and the hold scope of the write cycle. Keep all mechanics in `commit.rs`.

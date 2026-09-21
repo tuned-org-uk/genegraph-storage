@@ -1,9 +1,9 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
-use crate::catalog::{Catalog, CollectionKind, LocalRegistry, TableDescriptor};
+use crate::catalog::{Catalog, CollectionKind, GraphStaleness, LocalRegistry, TableDescriptor};
 use crate::lance_storage_graph::LanceStorageGraph;
-use crate::metadata::GeneMetadata;
+use crate::metadata::{FileInfo, GeneMetadata};
 use crate::tests::tmp_dir;
 use crate::traits::metadata::Metadata;
 
@@ -307,4 +307,239 @@ async fn catalog_locations_match_storage_layout() {
         registry.describe_table("rawinput").unwrap_err().to_string(),
         "Invalid data: table 'rawinput' is not registered"
     );
+}
+
+// ---------------------------------------------------------------------------
+// #140: graph source lineage + vector-space staleness
+// ---------------------------------------------------------------------------
+
+/// #140: the catalog resolves a graph source against the registry. The
+/// source must be a registered vector-space collection; the resolved
+/// lineage is what a graph write stamps as `source`/`source_rows`.
+#[tokio::test(flavor = "multi_thread")]
+async fn graph_source_resolves_only_registered_vector_spaces() {
+    let base = tmp_dir("catalog_m_c1").await;
+    let registry = registry_with(&base, "graph_source");
+
+    // rawinput: dense -> vector space with 100 rows
+    let src = registry.graph_source("rawinput").expect("resolves");
+    assert_eq!(src.name, "rawinput");
+    assert_eq!(src.rows, 100);
+
+    // adjacency: sparse -> graph kind is not a valid source
+    let err = registry.graph_source("adjacency").unwrap_err();
+    assert!(
+        matches!(err, crate::StorageError::Invalid(_)),
+        "expected Invalid for graph-kind source, got {err:?}"
+    );
+
+    let err = registry.graph_source("missing").unwrap_err();
+    assert!(
+        matches!(err, crate::StorageError::Invalid(_)),
+        "expected Invalid for unregistered source, got {err:?}"
+    );
+}
+
+/// #140: `describe_vector_space` computes graph staleness from current
+/// registry facts. Lineage (`source`/`source_rows`) is authoritative when
+/// present; without it a `num_nodes`/rows mismatch is `Stale`, while an
+/// agreement is `Unknown` — counts agree, content may differ, no guesses.
+#[tokio::test(flavor = "multi_thread")]
+async fn describe_vector_space_reports_graph_staleness_states() {
+    let base = tmp_dir("catalog_m_c1").await;
+    let mut registry = registry_with(&base, "staleness_states");
+
+    let vector_space = |name: &str, extra: &[(&str, &str)]| TableDescriptor {
+        name: name.to_string(),
+        format: "lance".to_string(),
+        base_location: base.join(format!("staleness_states_{name}.lance")),
+        kind: CollectionKind::VectorSpace,
+        properties: {
+            let mut props = BTreeMap::from([
+                ("filetype".to_string(), "vectors".to_string()),
+                ("rows".to_string(), "100".to_string()),
+                ("cols".to_string(), "4".to_string()),
+            ]);
+            props.extend(extra.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+            props
+        },
+    };
+    let graph = |name: &str, extra: &[(&str, &str)]| TableDescriptor {
+        name: name.to_string(),
+        format: "lance".to_string(),
+        base_location: base.join(format!("staleness_states_{name}.lance")),
+        kind: CollectionKind::Graph,
+        properties: {
+            let mut props = BTreeMap::from([
+                ("filetype".to_string(), "graph".to_string()),
+                ("rows".to_string(), "200".to_string()),
+                ("cols".to_string(), "3".to_string()),
+            ]);
+            props.extend(extra.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+            props
+        },
+    };
+
+    // unlinked: no `graph` property, nothing to assess
+    registry.register_table(vector_space("bare", &[])).unwrap();
+    assert_eq!(
+        registry
+            .describe_vector_space("bare")
+            .unwrap()
+            .graph_staleness,
+        GraphStaleness::Unlinked
+    );
+
+    // fresh: lineage present and matching this vector space
+    registry
+        .register_table(graph(
+            "g_fresh",
+            &[
+                ("source", "vs_fresh"),
+                ("source_rows", "100"),
+                ("num_nodes", "100"),
+            ],
+        ))
+        .unwrap();
+    registry
+        .register_table(vector_space("vs_fresh", &[("graph", "g_fresh")]))
+        .unwrap();
+    assert_eq!(
+        registry
+            .describe_vector_space("vs_fresh")
+            .unwrap()
+            .graph_staleness,
+        GraphStaleness::Fresh
+    );
+
+    // stale: the lineage names another collection
+    registry
+        .register_table(graph(
+            "g_foreign",
+            &[("source", "someone_else"), ("source_rows", "100")],
+        ))
+        .unwrap();
+    registry
+        .register_table(vector_space("vs_foreign", &[("graph", "g_foreign")]))
+        .unwrap();
+    assert_eq!(
+        registry
+            .describe_vector_space("vs_foreign")
+            .unwrap()
+            .graph_staleness,
+        GraphStaleness::Stale
+    );
+
+    // stale: source_rows differs from the current row count
+    registry
+        .register_table(graph(
+            "g_oldrows",
+            &[("source", "vs_oldrows"), ("source_rows", "99")],
+        ))
+        .unwrap();
+    registry
+        .register_table(vector_space("vs_oldrows", &[("graph", "g_oldrows")]))
+        .unwrap();
+    assert_eq!(
+        registry
+            .describe_vector_space("vs_oldrows")
+            .unwrap()
+            .graph_staleness,
+        GraphStaleness::Stale
+    );
+
+    // stale without lineage: num_nodes differs from the row count
+    registry
+        .register_table(graph("g_big", &[("num_nodes", "150")]))
+        .unwrap();
+    registry
+        .register_table(vector_space("vs_big", &[("graph", "g_big")]))
+        .unwrap();
+    assert_eq!(
+        registry
+            .describe_vector_space("vs_big")
+            .unwrap()
+            .graph_staleness,
+        GraphStaleness::Stale
+    );
+
+    // unknown without lineage: num_nodes matches rows, content unverified
+    registry
+        .register_table(graph("g_match", &[("num_nodes", "100")]))
+        .unwrap();
+    registry
+        .register_table(vector_space("vs_match", &[("graph", "g_match")]))
+        .unwrap();
+    assert_eq!(
+        registry
+            .describe_vector_space("vs_match")
+            .unwrap()
+            .graph_staleness,
+        GraphStaleness::Unknown
+    );
+
+    // lineage wins over the num_nodes fallback
+    registry
+        .register_table(graph(
+            "g_wins",
+            &[
+                ("num_nodes", "7"),
+                ("source", "vs_wins"),
+                ("source_rows", "100"),
+            ],
+        ))
+        .unwrap();
+    registry
+        .register_table(vector_space("vs_wins", &[("graph", "g_wins")]))
+        .unwrap();
+    assert_eq!(
+        registry
+            .describe_vector_space("vs_wins")
+            .unwrap()
+            .graph_staleness,
+        GraphStaleness::Fresh
+    );
+}
+
+/// #140: the staleness signal reads registry facts only. It computes
+/// identically over a zarr-shaped registry (`storage_format = "zzarr"`,
+/// rel-path keys, filetypes `dense`/`graph`) — one rule, every format.
+#[tokio::test(flavor = "multi_thread")]
+async fn staleness_signal_is_storage_format_agnostic() {
+    let base = tmp_dir("catalog_m_c1").await;
+
+    let metadata = GeneMetadata::new("zzarr_stale")
+        .with_base(base.clone())
+        .with_dimensions(100, 50);
+    let mut vectors = FileInfo::new("main/vectors".to_string(), "dense", (100, 4), None, None)
+        .expect("dense filetype");
+    vectors.storage_format = "zzarr".to_string();
+    vectors
+        .properties
+        .insert("graph".to_string(), "main/g".to_string());
+    let mut graph = FileInfo::new("main/g".to_string(), "graph", (100, 3), Some(200), None)
+        .expect("graph filetype");
+    graph.storage_format = "zzarr".to_string();
+    graph
+        .properties
+        .insert("source".to_string(), "main/vectors".to_string());
+    graph
+        .properties
+        .insert("source_rows".to_string(), "100".to_string());
+    let metadata = metadata
+        .add_file("main/vectors", vectors)
+        .add_file("main/g", graph);
+
+    let registry = LocalRegistry::new(metadata, base);
+    let desc = registry
+        .describe_vector_space("main/vectors")
+        .expect("describe zarr-shaped registry");
+    assert_eq!(
+        desc.vectors
+            .properties
+            .get("storage_format")
+            .map(String::as_str),
+        Some("zzarr")
+    );
+    assert_eq!(desc.graph_staleness, GraphStaleness::Fresh);
 }

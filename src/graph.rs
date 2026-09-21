@@ -142,6 +142,18 @@ impl GraphEdge {
     }
 }
 
+/// Declared source lineage of a graph collection (#140): the name of the
+/// vector-space collection the graph was built from and its row count at
+/// build time. Resolve it through `Catalog::graph_source` — never hand-
+/// build rows from stale facts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphSource {
+    /// Name of the source vector-space collection (registry key).
+    pub name: String,
+    /// Row count of the source collection at build time.
+    pub rows: usize,
+}
+
 /// Options for [`crate::traits::backend::StorageBackend::save_graph_with`].
 #[derive(Debug, Clone)]
 pub struct GraphWriteOptions {
@@ -166,6 +178,14 @@ pub struct GraphWriteOptions {
     /// Explicit node count (e.g. to keep isolated vertices). Must be at
     /// least `max(src, dst) + 1` over all edges; defaults to exactly that.
     pub num_nodes: Option<u64>,
+    /// Declared source lineage (#140): the vector-space collection this
+    /// graph was built from and its row count at build time. Resolve it
+    /// through `Catalog::graph_source`; the write paths stamp it as the
+    /// reserved `source`/`source_rows` metadata without reading the
+    /// registry (the catalog owns that reasoning, the storage layer only
+    /// persists declared facts). `Catalog::describe_vector_space` turns
+    /// the stamp into a staleness signal.
+    pub source: Option<GraphSource>,
     /// User properties stored on the collection (registry level) and
     /// stamped into the dataset schema metadata (dataset level).
     pub properties: BTreeMap<String, String>,
@@ -178,6 +198,7 @@ impl Default for GraphWriteOptions {
             weight_type: WeightType::F64,
             weight_range: None,
             num_nodes: None,
+            source: None,
             properties: BTreeMap::new(),
         }
     }
@@ -280,10 +301,12 @@ impl StoredGraph {
 /// Dataset-level schema-metadata keys stamped by the `save_graph` /
 /// `save_vectors` writers (RFC #81-P1: dataset-level kinds alongside
 /// registry-level kinds). User properties may not shadow these.
-pub(crate) const RESERVED_METADATA_KEYS: [&str; 5] = [
+pub(crate) const RESERVED_METADATA_KEYS: [&str; 7] = [
     "kind",
     "node_id_width",
     "weighted",
     "num_nodes",
     "weight_type",
+    "source",
+    "source_rows",
 ];

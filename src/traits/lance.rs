@@ -278,18 +278,20 @@ pub(crate) fn graph_record_batch(
     }
     let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
         .map_err(|e| StorageError::Lance(e.to_string()))?;
-    // Dataset-level kind + graph layout facts (RFC #81-P1/P3, #106).
-    let batch = with_collection_metadata(
-        &batch,
-        "graph",
-        &[
-            ("node_id_width", width.as_str().to_string()),
-            ("weighted", weighted.to_string()),
-            ("num_nodes", num_nodes.to_string()),
-            ("weight_type", options.weight_type.as_str().to_string()),
-        ],
-        &options.properties,
-    )?;
+    // Dataset-level kind + graph layout facts (RFC #81-P1/P3, #106), plus
+    // the caller-declared source lineage (#140): stamped as reserved
+    // computed facts, never read back from the registry here.
+    let mut fixed = vec![
+        ("node_id_width", width.as_str().to_string()),
+        ("weighted", weighted.to_string()),
+        ("num_nodes", num_nodes.to_string()),
+        ("weight_type", options.weight_type.as_str().to_string()),
+    ];
+    if let Some(source) = &options.source {
+        fixed.push(("source", source.name.clone()));
+        fixed.push(("source_rows", source.rows.to_string()));
+    }
+    let batch = with_collection_metadata(&batch, "graph", &fixed, &options.properties)?;
     Ok((batch, num_nodes))
 }
 
