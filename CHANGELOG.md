@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.70.0 (2026-09-21)
+
+Graph source lineage and a vector-space staleness signal (#140), ported
+from Genefold/arro-server#56 (`index_stale`). A graph collection can now
+declare the vector space it was built from; the catalog turns that stamp
+into a staleness signal that follows the data — re-save the vectors, the
+linked graph goes stale; rebuild the graph, it goes fresh again. Layer
+rules: the catalog owns lineage reasoning (`Catalog::graph_source`,
+`GraphStaleness`); write paths only stamp caller-declared facts, with no
+registry reads (no cross-collection tricks). One rule, every format: the
+signal reads registry facts only, so it computes identically over Lance
+and Zarr registries; Zarr keeps its typed rejection for graph
+collections.
+
+**Added**
+
+- `GraphWriteOptions::source` (`graph::GraphSource`): declared lineage,
+  stamped as the reserved `source`/`source_rows` metadata on both the
+  dataset schema and the registry entry, on registry-coupled and
+  registry-free graph saves alike.
+- `Catalog::graph_source(name)`: resolves a registered vector-space
+  source and its row count.
+- `VectorSpaceDescriptor::graph_staleness`
+  (`catalog::GraphStaleness`: `Unlinked` / `Fresh` / `Stale` /
+  `Unknown`), computed at describe time from current registry facts —
+  never persisted, no latch to clear. Without lineage, a
+  `num_nodes`/rows mismatch is `Stale` and an agreement is `Unknown`.
+
+**Fixed**
+
+- `source`/`source_rows` joined the reserved collection metadata keys;
+  user properties may not shadow them.
+
+Refs: #140, Genefold/arro-server#56
+
 ## 0.69.2 (2026-09-15)
 
 Registry-directory write guard for Zarr roots (Genefold/arro-server-rs#14

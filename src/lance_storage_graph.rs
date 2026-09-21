@@ -884,6 +884,14 @@ impl StorageBackend for LanceStorageGraph {
                 "weight_type".to_string(),
                 options.weight_type.as_str().to_string(),
             );
+            // Declared source lineage (#140): the catalog resolved it, the
+            // write path persists it as a computed fact.
+            if let Some(source) = &options.source {
+                info.properties
+                    .insert("source".to_string(), source.name.clone());
+                info.properties
+                    .insert("source_rows".to_string(), source.rows.to_string());
+            }
             md = md.add_file(name, info);
             self.save_metadata(&md).await
         })

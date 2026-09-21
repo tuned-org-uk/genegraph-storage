@@ -1,8 +1,8 @@
 [package]
 name = "genegraph-storage"
-version = "0.69.2"
+version = "0.70.0"
 edition = "2024"
-description = "vector database: base Lance storage"
+description = "vector database: Lance and Zarr storage backends with a shared metadata catalog"
 authors = ["Lorenzo <tunedconsulting@gmail.com>"]
 license = "Apache-2.0"
 repository = "https://github.com/tuned-org-uk/genegraph-storage"

@@ -17,6 +17,7 @@ use std::path::PathBuf;
 
 use crate::StorageError;
 use crate::StorageResult;
+use crate::graph::GraphSource;
 pub use crate::metadata::CollectionKind;
 use crate::metadata::{FileInfo, GeneMetadata};
 
@@ -49,6 +50,25 @@ pub struct TableDescriptor {
     pub properties: BTreeMap<String, String>,
 }
 
+/// Staleness of the graph linked to a vector space (#140), computed at
+/// describe time from current registry facts. Never persisted: there is
+/// no latch to clear, the signal follows the data on every call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphStaleness {
+    /// The vector space has no `graph` property: nothing to assess.
+    Unlinked,
+    /// Lineage (`source`/`source_rows`) is present and matches this
+    /// vector space: the graph was rebuilt against the current rows.
+    Fresh,
+    /// Detectable divergence: the lineage names another collection, the
+    /// lineage row count differs from the current row count, or (without
+    /// lineage) the stamped `num_nodes` differs from the row count.
+    Stale,
+    /// No lineage and `num_nodes` equals the row count. The counts agree;
+    /// the content may still differ. The library does not guess.
+    Unknown,
+}
+
 /// Vector-space descriptor plus its linked graph collection (RFC #81-P4).
 ///
 /// A vector space references a graph collection by name through its `graph`
@@ -60,6 +80,9 @@ pub struct VectorSpaceDescriptor {
     pub vectors: TableDescriptor,
     /// The linked graph collection, if the `graph` property is set.
     pub graph: Option<TableDescriptor>,
+    /// Whether the linked graph still describes the current vectors
+    /// (#140). `Unlinked` when no graph is linked.
+    pub graph_staleness: GraphStaleness,
 }
 
 /// Registry of Lance tables backing a storage instance.
@@ -80,6 +103,10 @@ pub trait Catalog {
     /// collection it references through the `graph` user property
     /// (RFC #81-P4). Fails with [`StorageError::Invalid`] if `name` is not a
     /// vector-space collection or the linked graph is not registered.
+    ///
+    /// The descriptor reports whether the linked graph still describes the
+    /// current vectors ([`GraphStaleness`], #140), computed from current
+    /// registry facts only.
     fn describe_vector_space(&self, name: &str) -> StorageResult<VectorSpaceDescriptor> {
         let vectors = self.describe_table(name)?;
         if vectors.kind != CollectionKind::VectorSpace {
@@ -92,7 +119,75 @@ pub trait Catalog {
             Some(graph_name) => Some(self.describe_table(graph_name)?),
             None => None,
         };
-        Ok(VectorSpaceDescriptor { vectors, graph })
+        let graph_staleness = match &graph {
+            None => GraphStaleness::Unlinked,
+            Some(g) => {
+                let rows = vectors
+                    .properties
+                    .get("rows")
+                    .and_then(|v| v.parse::<usize>().ok());
+                match (g.properties.get("source"), g.properties.get("source_rows")) {
+                    // Declared lineage is authoritative when present.
+                    (Some(source), Some(source_rows)) => {
+                        if source == &vectors.name && source_rows.parse::<usize>().ok() == rows {
+                            GraphStaleness::Fresh
+                        } else {
+                            GraphStaleness::Stale
+                        }
+                    }
+                    // Without lineage only a num_nodes/rows divergence is
+                    // detectable; an agreement proves nothing about content.
+                    _ => {
+                        match (
+                            g.properties
+                                .get("num_nodes")
+                                .and_then(|v| v.parse::<usize>().ok()),
+                            rows,
+                        ) {
+                            (Some(num_nodes), Some(rows)) if num_nodes != rows => {
+                                GraphStaleness::Stale
+                            }
+                            _ => GraphStaleness::Unknown,
+                        }
+                    }
+                }
+            }
+        };
+        Ok(VectorSpaceDescriptor {
+            vectors,
+            graph,
+            graph_staleness,
+        })
+    }
+
+    /// Resolves a graph source against the registry (#140): the source
+    /// must be a registered vector-space collection. Feed the result to
+    /// [`crate::graph::GraphWriteOptions::source`]; the write paths stamp
+    /// it as the reserved `source`/`source_rows` metadata, and
+    /// [`Self::describe_vector_space`] turns the stamp into the
+    /// staleness signal. Lineage reasoning lives here, in the catalog —
+    /// storage write paths only persist declared facts.
+    fn graph_source(&self, name: &str) -> StorageResult<GraphSource> {
+        let table = self.describe_table(name)?;
+        if table.kind != CollectionKind::VectorSpace {
+            return Err(StorageError::Invalid(format!(
+                "graph source '{name}' has kind '{}', not a vector space",
+                table.kind.as_str()
+            )));
+        }
+        let rows = table
+            .properties
+            .get("rows")
+            .and_then(|v| v.parse::<usize>().ok())
+            .ok_or_else(|| {
+                StorageError::Invalid(format!(
+                    "graph source '{name}' carries no usable 'rows' fact"
+                ))
+            })?;
+        Ok(GraphSource {
+            name: table.name,
+            rows,
+        })
     }
 }
 

@@ -12,8 +12,10 @@ use rand::{RngExt, SeedableRng};
 use smartcore::linalg::basic::arrays::Array2;
 use sprs::{CsMat, TriMat};
 
-use crate::catalog::{Catalog, CollectionKind, LocalRegistry, TableDescriptor};
-use crate::graph::{GraphEdge, GraphWriteOptions, NodeIdWidth, StoredGraph, WeightType};
+use crate::catalog::{Catalog, CollectionKind, GraphStaleness, LocalRegistry, TableDescriptor};
+use crate::graph::{
+    GraphEdge, GraphSource, GraphWriteOptions, NodeIdWidth, StoredGraph, WeightType,
+};
 use crate::lance_storage_graph::LanceStorageGraph;
 use crate::metadata::GeneMetadata;
 use crate::tests::tmp_dir;
@@ -549,6 +551,214 @@ async fn vector_space_links_graph_end_to_end() {
     assert_eq!(graph.name, "space_graph");
     assert_eq!(graph.kind, CollectionKind::Graph);
     assert_eq!(graph.properties.get("nnz").map(String::as_str), Some("6"));
+}
+
+// ---------------------------------------------------------------------------
+// #140: graph source lineage (catalog-resolved, storage-stamped)
+// ---------------------------------------------------------------------------
+
+/// #140: a graph write stamps the caller-declared lineage — resolved
+/// through the catalog — into the registry properties and the dataset
+/// schema metadata. The storage path performs no registry reasoning of
+/// its own.
+#[tokio::test(flavor = "multi_thread")]
+async fn graph_source_lineage_stamps_registry_and_schema() {
+    let (base, storage) = seeded_storage("lineage_stamp").await;
+    let md_path = storage.metadata_path();
+
+    let vectors: Vec<Vec<f64>> = (0..4)
+        .map(|row| (0..4).map(|c| 0.1 * (row * 4 + c) as f64).collect())
+        .collect();
+    storage
+        .save_vectors(
+            "src_vecs",
+            &f64_vector_batch(&[0, 1, 2, 3], &vectors),
+            &md_path,
+        )
+        .await
+        .expect("save_vectors");
+
+    // resolve the lineage through the catalog (the blessed path)
+    let md = storage.load_metadata().await.unwrap();
+    let source = LocalRegistry::new(md, base.clone())
+        .graph_source("src_vecs")
+        .expect("graph_source");
+
+    let options = GraphWriteOptions {
+        source: Some(source),
+        ..Default::default()
+    };
+    let edges = generated_graph(4, 6, 3407, true);
+    storage
+        .save_graph_with("linked_graph", &edges, &options, &md_path)
+        .await
+        .expect("save_graph_with");
+
+    let md = storage.load_metadata().await.unwrap();
+    let info = md.files.get("linked_graph").unwrap();
+    assert_eq!(
+        info.properties.get("source").map(String::as_str),
+        Some("src_vecs")
+    );
+    assert_eq!(
+        info.properties.get("source_rows").map(String::as_str),
+        Some("4")
+    );
+
+    // dataset-level schema metadata carries the same declared facts
+    let batch = crate::lancefmt::scan_all(&storage.file_path("linked_graph")).unwrap();
+    let schema = batch.schema();
+    let meta = schema.metadata();
+    assert_eq!(meta.get("source").map(String::as_str), Some("src_vecs"));
+    assert_eq!(meta.get("source_rows").map(String::as_str), Some("4"));
+}
+
+/// #140: `source`/`source_rows` are reserved collection metadata; user
+/// properties may not shadow them (same rule as `num_nodes` & co).
+#[tokio::test(flavor = "multi_thread")]
+async fn graph_write_rejects_user_properties_shadowing_source_keys() {
+    let (_base, storage) = seeded_storage("lineage_shadow").await;
+    let md_path = storage.metadata_path();
+
+    for key in ["source", "source_rows"] {
+        let mut options = GraphWriteOptions::default();
+        options
+            .properties
+            .insert(key.to_string(), "999".to_string());
+        let edges = vec![GraphEdge::weighted(0, 1, 0.5)];
+        let err = storage
+            .save_graph_with("bad_graph", &edges, &options, &md_path)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::StorageError::Invalid(_)),
+            "expected Invalid for '{key}', got {err:?}"
+        );
+    }
+
+    let md = storage.load_metadata().await.unwrap();
+    assert!(!md.files.contains_key("bad_graph"));
+}
+
+/// #140: one rule per fact, every path — the registry-free
+/// `save_graph_to_path` stamps the same declared lineage. No registry is
+/// read or written.
+#[tokio::test(flavor = "multi_thread")]
+async fn registry_free_graph_stamps_declared_source_lineage() {
+    let base = tmp_dir("lineage_registry_free").await;
+    let storage = LanceStorageGraph::new(
+        base.to_string_lossy().to_string(),
+        "lineage_free".to_string(),
+    )
+    .expect("valid instance name");
+
+    let options = GraphWriteOptions {
+        source: Some(GraphSource {
+            name: "elsewhere".to_string(),
+            rows: 7,
+        }),
+        ..Default::default()
+    };
+    let path = base.join("declared_graph.lance");
+    let edges = generated_graph(4, 6, 3407, true);
+    storage
+        .save_graph_to_path(&path, &edges, &options)
+        .await
+        .expect("save_graph_to_path");
+
+    let batch = crate::lancefmt::scan_all(&path).unwrap();
+    let schema = batch.schema();
+    let meta = schema.metadata();
+    assert_eq!(meta.get("source").map(String::as_str), Some("elsewhere"));
+    assert_eq!(meta.get("source_rows").map(String::as_str), Some("7"));
+}
+
+/// #140: the staleness signal follows the data. Re-saving the vectors
+/// makes the linked graph stale; re-saving the graph with fresh lineage
+/// makes it fresh again. The signal is computed from current facts at
+/// describe time, not a persisted latch.
+#[tokio::test(flavor = "multi_thread")]
+async fn vector_space_staleness_follows_the_data() {
+    let (base, storage) = seeded_storage("staleness_lifecycle").await;
+    let md_path = storage.metadata_path();
+
+    async fn staleness_of(storage: &LanceStorageGraph, base: &std::path::Path) -> GraphStaleness {
+        let md = storage.load_metadata().await.unwrap();
+        LocalRegistry::new(md, base.to_path_buf())
+            .describe_vector_space("vs")
+            .unwrap()
+            .graph_staleness
+    }
+
+    let mut link = BTreeMap::new();
+    link.insert("graph".to_string(), "g".to_string());
+
+    // linked pair: 4-row vector space + graph built from it
+    let vectors: Vec<Vec<f64>> = (0..4)
+        .map(|row| (0..4).map(|c| 0.1 * (row * 4 + c) as f64).collect())
+        .collect();
+    storage
+        .save_vectors_with(
+            "vs",
+            &f64_vector_batch(&[0, 1, 2, 3], &vectors),
+            &link,
+            &md_path,
+        )
+        .await
+        .expect("save vectors");
+
+    let md = storage.load_metadata().await.unwrap();
+    let source = LocalRegistry::new(md, base.clone())
+        .graph_source("vs")
+        .expect("resolve lineage");
+    let options = GraphWriteOptions {
+        source: Some(source),
+        ..Default::default()
+    };
+    storage
+        .save_graph_with("g", &generated_graph(4, 6, 3407, true), &options, &md_path)
+        .await
+        .expect("save graph");
+    assert!(
+        matches!(staleness_of(&storage, &base).await, GraphStaleness::Fresh),
+        "a freshly built pair is Fresh"
+    );
+
+    // the vectors change under the graph: the signal turns stale
+    let vectors: Vec<Vec<f64>> = (0..5)
+        .map(|row| (0..4).map(|c| 0.2 * (row * 4 + c) as f64).collect())
+        .collect();
+    storage
+        .save_vectors_with(
+            "vs",
+            &f64_vector_batch(&[0, 1, 2, 3, 4], &vectors),
+            &link,
+            &md_path,
+        )
+        .await
+        .expect("re-save vectors");
+    assert!(
+        matches!(staleness_of(&storage, &base).await, GraphStaleness::Stale),
+        "a row-count change must mark the linked graph stale"
+    );
+
+    // rebuilding the graph against the new vectors restores Fresh
+    let md = storage.load_metadata().await.unwrap();
+    let source = LocalRegistry::new(md, base.clone())
+        .graph_source("vs")
+        .expect("resolve lineage");
+    let options = GraphWriteOptions {
+        source: Some(source),
+        ..Default::default()
+    };
+    storage
+        .save_graph_with("g", &generated_graph(5, 8, 3407, true), &options, &md_path)
+        .await
+        .expect("re-save graph");
+    assert!(
+        matches!(staleness_of(&storage, &base).await, GraphStaleness::Fresh),
+        "a rebuilt graph is Fresh against the current vectors"
+    );
 }
 
 // ---------------------------------------------------------------------------
