@@ -38,7 +38,7 @@ uuid = { version = "1.26.1", features = ["v4", "serde"] }
 futures = "0.3.34"
 url = "2.5.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "sync"] }
-parquet = { version = "^59.3.0" }
+parquet = { version = "^60.0.0" }
 prost = "0.14.4"
 prost-types = "0.14.4"
 fastlanes = "0.7.2"
