@@ -11,6 +11,15 @@
 //! published). Discovery is filesystem-first; the registry is the catalog
 //! view.
 //!
+//! Registry keys are root-relative paths for every artifact (#146): a
+//! dense dataset registers under `matrix`, a nested one under
+//! `main/vectors`, and a flat interop file under its file name with the
+//! extension (`matrix.arrow`, #142). This differs from the Lance
+//! convention, where the files-map key is the logical collection name and
+//! the artifact filename lives in `FileInfo.filename`. The catalog layer
+//! never parses keys — it copies them into `TableDescriptor::name` — so
+//! both conventions describe identically.
+//!
 //! Every dataset write (creation, append, overwrite) runs under the
 //! composed write lock of [`crate::commit::try_with_dataset_file_lock`]:
 //! the in-process mailbox queues same-process writers, and a fail-fast
