@@ -1,6 +1,6 @@
 [package]
 name = "genegraph-storage"
-version = "0.70.0"
+version = "0.72.0"
 edition = "2024"
 description = "vector database: Lance and Zarr storage backends with a shared metadata catalog"
 authors = ["Lorenzo <tunedconsulting@gmail.com>"]
@@ -46,6 +46,12 @@ zarrs = "0.23"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[features]
+# Arrow-IPC interop path (#142): `.arrow` file / `.arrows` stream I/O on
+# StorageBackend. Off by default; arrow (with its ipc codec) is already an
+# unconditional dependency, so the gate controls API surface only.
+arrow-ipc = []
 
 [dev-dependencies]
 rand = "0.10.2"

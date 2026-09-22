@@ -3,6 +3,8 @@ pub mod catalog;
 pub mod commit;
 pub mod generations;
 pub mod graph;
+#[cfg(feature = "arrow-ipc")]
+pub mod ipc;
 pub mod lance_storage_graph;
 pub mod lancefmt;
 pub mod metadata;
@@ -33,6 +35,9 @@ pub enum StorageError {
     InvalidState(String),
     /// A filetype does not map to a known storage format.
     UnsupportedFormat(String),
+    /// An Arrow-IPC codec error (#142): file/stream write, read or schema
+    /// mismatch surfaced by the `arrow-ipc` writer/reader.
+    IPC(String),
     /// A key/filetype is not recognised as one of the supported file types.
     UnsupportedFiletype(String),
     /// Dimensions recorded in schema metadata do not match the dimensions
@@ -62,6 +67,7 @@ impl fmt::Display for StorageError {
             StorageError::QueryError(msg) => write!(f, "Query error: {}", msg),
             StorageError::InvalidState(msg) => write!(f, "Invalid state: {}", msg),
             StorageError::UnsupportedFormat(msg) => write!(f, "Unsupported format: {}", msg),
+            StorageError::IPC(msg) => write!(f, "Arrow IPC error: {}", msg),
             StorageError::UnsupportedFiletype(msg) => write!(f, "Unsupported filetype: {}", msg),
             StorageError::DimensionMismatch { expected, found } => {
                 write!(

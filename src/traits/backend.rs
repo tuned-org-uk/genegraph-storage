@@ -788,4 +788,89 @@ pub trait StorageBackend: Send + Sync {
         self.verify_collection_from_path(&self.file_path(name), expected)
             .await
     }
+
+    // =========
+    // #142: Arrow-IPC interop (feature-gated: `arrow-ipc`)
+    // =========
+
+    /// Interop: writes a dense matrix as an Arrow IPC *file* (`.arrow`,
+    /// `{instance}_{key}.arrow` per generation naming) and registers it in
+    /// the metadata registry (filetype `dense`, storage format
+    /// `arrow-ipc`). Returns the artifact path. The file is overwritten on
+    /// re-save. Defaults to [`StorageError::UnsupportedFormat`] for
+    /// backends that do not implement the IPC path.
+    #[cfg(feature = "arrow-ipc")]
+    async fn save_dense_to_ipc(
+        &self,
+        key: &str,
+        data: &DenseMatrix<f64>,
+        md_path: &Path,
+    ) -> StorageResult<PathBuf> {
+        let _ = (key, data, md_path);
+        Err(StorageError::UnsupportedFormat(
+            "Arrow IPC not implemented for this backend".into(),
+        ))
+    }
+
+    /// Interop: reads the dense matrix from the Arrow IPC artifact saved
+    /// under `key` — the file format (`{instance}_{key}.arrow`) when
+    /// present, else the stream format (`{instance}_{key}.arrows`). Both
+    /// formats decode as the vector layout (`FixedSizeList<Float64>`,
+    /// multiple batches concatenate in order).
+    #[cfg(feature = "arrow-ipc")]
+    async fn load_dense_from_ipc(&self, key: &str) -> StorageResult<DenseMatrix<f64>> {
+        let _ = key;
+        Err(StorageError::UnsupportedFormat(
+            "Arrow IPC not implemented for this backend".into(),
+        ))
+    }
+
+    /// Interop: opens a streaming Arrow IPC writer (`*.arrows`) for
+    /// incremental flush. The handle owns the file; batches must match
+    /// `schema` and [`crate::ipc::IpcStreamWriterHandle::finish`] completes
+    /// the artifact (EOS marker) and returns its path. Registry-free
+    /// (#106 tier): the stream surface takes no metadata path, so no
+    /// registry entry is minted; registry ownership stays with the caller.
+    #[cfg(feature = "arrow-ipc")]
+    async fn open_ipc_stream_writer(
+        &self,
+        key: &str,
+        schema: arrow::datatypes::SchemaRef,
+    ) -> StorageResult<crate::ipc::IpcStreamWriterHandle> {
+        let _ = (key, schema);
+        Err(StorageError::UnsupportedFormat(
+            "Arrow IPC not implemented for this backend".into(),
+        ))
+    }
+
+    /// Interop: writes an edge-list graph collection as an Arrow IPC
+    /// *file* (`{instance}_{key}.arrow`) and registers it (filetype
+    /// `graph`, storage format `arrow-ipc`). Fixed widths per the #142
+    /// type mapping: `u32` node ids and `f64` weights; ids above
+    /// `u32::MAX` surface [`StorageError::Overflow`] instead of being
+    /// truncated. The same validation and dataset-level stamping as the
+    /// canonical `save_graph` path apply.
+    #[cfg(feature = "arrow-ipc")]
+    async fn save_graph_to_ipc(
+        &self,
+        key: &str,
+        edges: &[GraphEdge],
+        md_path: &Path,
+    ) -> StorageResult<PathBuf> {
+        let _ = (key, edges, md_path);
+        Err(StorageError::UnsupportedFormat(
+            "Arrow IPC not implemented for this backend".into(),
+        ))
+    }
+
+    /// Interop: loads the graph collection saved under `key` as an Arrow
+    /// IPC artifact (file format preferred, stream fallback — see
+    /// [`Self::load_dense_from_ipc`]).
+    #[cfg(feature = "arrow-ipc")]
+    async fn load_graph_from_ipc(&self, key: &str) -> StorageResult<StoredGraph> {
+        let _ = key;
+        Err(StorageError::UnsupportedFormat(
+            "Arrow IPC not implemented for this backend".into(),
+        ))
+    }
 }

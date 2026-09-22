@@ -1,4 +1,6 @@
 mod lancefmt_common;
+#[cfg(feature = "arrow-ipc")]
+mod test_arrow_ipc;
 mod test_catalog;
 mod test_collections;
 mod test_commit;

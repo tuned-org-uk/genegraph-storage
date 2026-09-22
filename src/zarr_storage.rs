@@ -205,17 +205,20 @@ impl ZarrStorage {
 
     /// Registers a written artifact in the kernel registry under its rel
     /// path. Commit-serialized through the registry-path commit actor.
+    /// Zarr artifacts are not Lance; `storage_format` records the true
+    /// storage format (`zzarr`, or `arrow-ipc` for the IPC interop files,
+    /// #142).
     async fn register_artifact(
         &self,
         rel: &str,
         filetype: &str,
         shape: (usize, usize),
+        storage_format: &str,
     ) -> StorageResult<()> {
         crate::commit::with_commit_actor(&self.registry_path(), || async {
             let mut md = self.load_metadata().await?;
             let mut info = FileInfo::new(rel.to_string(), filetype, shape, None, None)?;
-            // Zarr artifacts are not Lance; record the true storage format.
-            info.storage_format = "zzarr".to_string();
+            info.storage_format = storage_format.to_string();
             md = md.add_file(rel, info);
             self.save_metadata(&md).await.map(|_| ())
         })
@@ -789,7 +792,8 @@ impl StorageBackend for ZarrStorage {
             })
         })
         .await?;
-        self.register_artifact(key, "dense", (rows, cols)).await
+        self.register_artifact(key, "dense", (rows, cols), "zzarr")
+            .await
     }
 
     async fn load_dense(&self, key: &str) -> StorageResult<DenseMatrix<f64>> {
@@ -849,7 +853,8 @@ impl StorageBackend for ZarrStorage {
             })
         })
         .await?;
-        self.register_artifact(key, "vector", (len, 1)).await
+        self.register_artifact(key, "vector", (len, 1), "zzarr")
+            .await
     }
 
     async fn load_vector(&self, key: &str) -> StorageResult<Vec<f64>> {
@@ -879,7 +884,7 @@ impl StorageBackend for ZarrStorage {
             })
         })
         .await?;
-        self.register_artifact(key, "vector", (vector.len(), 1))
+        self.register_artifact(key, "vector", (vector.len(), 1), "zzarr")
             .await
     }
 
@@ -1062,10 +1067,172 @@ impl StorageBackend for ZarrStorage {
             "collection verification is a Lance-format concept",
         ))
     }
+
+    // =========
+    // #142: Arrow-IPC interop (feature-gated)
+    // =========
+
+    /// Interop: writes the dense matrix as an Arrow IPC file at
+    /// `{key}.arrow` under the root and registers it (filetype `dense`,
+    /// storage format `arrow-ipc`). The file is overwritten on re-save.
+    /// No dataset rendezvous exists for flat interop files: the registry
+    /// mailbox serializes publishes, concurrent artifact overwrites are
+    /// caller-owned (the same tier as the Parquet path).
+    #[cfg(feature = "arrow-ipc")]
+    async fn save_dense_to_ipc(
+        &self,
+        key: &str,
+        data: &DenseMatrix<f64>,
+        md_path: &Path,
+    ) -> StorageResult<PathBuf> {
+        self.validate_initialized(md_path)?;
+        let path = self.ipc_file_path(key)?;
+        let (rows, cols) = data.shape();
+        info!(
+            "Saving dense {key} to IPC: {rows}x{cols} at {}",
+            path.display()
+        );
+
+        let batch = self.to_dense_record_batch(data)?;
+        ensure_ipc_parent(&path).await?;
+        write_ipc_file_blocking(path.clone(), vec![batch]).await?;
+        self.register_artifact(
+            &format!("{key}.{}", crate::ipc::FILE_EXT),
+            "dense",
+            (rows, cols),
+            crate::ipc::FILE_STORAGE_FORMAT,
+        )
+        .await?;
+        info!("Dense {key} saved to IPC successfully");
+        Ok(path)
+    }
+
+    /// Interop: loads the dense matrix from the Arrow IPC artifact saved
+    /// under `key` (file format preferred, stream fallback).
+    #[cfg(feature = "arrow-ipc")]
+    async fn load_dense_from_ipc(&self, key: &str) -> StorageResult<DenseMatrix<f64>> {
+        let path = self.resolve_ipc_artifact(key)?;
+        info!("Loading dense {key} from IPC at {}", path.display());
+        let combined = read_ipc_artifact_blocking(path).await?;
+        self.from_dense_record_batch(&combined)
+    }
+
+    /// Interop: opens the streaming IPC writer for `key` at
+    /// `{key}.arrows` under the root. Registry-free: no registry entry is
+    /// minted on finish.
+    #[cfg(feature = "arrow-ipc")]
+    async fn open_ipc_stream_writer(
+        &self,
+        key: &str,
+        schema: arrow::datatypes::SchemaRef,
+    ) -> StorageResult<crate::ipc::IpcStreamWriterHandle> {
+        let path = self.ipc_stream_path(key)?;
+        info!("Opening IPC stream writer {key} at {}", path.display());
+        ensure_ipc_parent(&path).await?;
+        tokio::task::spawn_blocking(move || {
+            crate::ipc::IpcStreamWriterHandle::create(path, schema.as_ref())
+        })
+        .await
+        .map_err(|e| StorageError::Io(format!("ipc stream writer task failed: {e}")))?
+    }
+
+    /// The Zarr layer has no graph concept; the interop path does not
+    /// smuggle one in. Use the Lance backend for graph IPC artifacts.
+    #[cfg(feature = "arrow-ipc")]
+    async fn save_graph_to_ipc(
+        &self,
+        _key: &str,
+        _edges: &[crate::graph::GraphEdge],
+        _md_path: &Path,
+    ) -> StorageResult<PathBuf> {
+        Err(unsupported_filetype(
+            "graph collections do not fit Zarr trees; use the Lance backend",
+        ))
+    }
+
+    /// The Zarr layer has no graph concept; the interop path does not
+    /// smuggle one in. Use the Lance backend for graph IPC artifacts.
+    #[cfg(feature = "arrow-ipc")]
+    async fn load_graph_from_ipc(&self, _key: &str) -> StorageResult<crate::graph::StoredGraph> {
+        Err(unsupported_filetype(
+            "graph collections do not fit Zarr trees; use the Lance backend",
+        ))
+    }
+}
+
+/// Creates the parent directory of an IPC artifact path (the Zarr root
+/// itself may not exist yet).
+#[cfg(feature = "arrow-ipc")]
+async fn ensure_ipc_parent(path: &Path) -> StorageResult<()> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| StorageError::Io(format!("create dir {parent:?}: {e}")))?;
+    }
+    Ok(())
 }
 
 fn unsupported_filetype(what: &str) -> StorageError {
     StorageError::UnsupportedFiletype(what.to_string())
+}
+
+// =========
+// #142: Arrow-IPC interop (feature-gated): flat interop files in the
+// root. Dense matrices and generic streams fit the Zarr root (flat
+// artifacts next to Zarr nodes); graph collections keep their typed
+// rejection — the Zarr layer has no graph concept, and the interop path
+// does not smuggle one in.
+// =========
+
+#[cfg(feature = "arrow-ipc")]
+impl ZarrStorage {
+    /// Arrow IPC file artifact path: `{key}.arrow` under the root.
+    fn ipc_file_path(&self, key: &str) -> StorageResult<PathBuf> {
+        self.dataset_path(&format!("{key}.{}", crate::ipc::FILE_EXT))
+    }
+
+    /// Arrow IPC stream artifact path: `{key}.arrows` under the root.
+    fn ipc_stream_path(&self, key: &str) -> StorageResult<PathBuf> {
+        self.dataset_path(&format!("{key}.{}", crate::ipc::STREAM_EXT))
+    }
+
+    /// Resolves the Arrow IPC artifact saved under `key`: the file format
+    /// when present, else the stream format. A missing artifact names
+    /// both candidates in the typed error.
+    fn resolve_ipc_artifact(&self, key: &str) -> StorageResult<PathBuf> {
+        let file_path = self.ipc_file_path(key)?;
+        if file_path.exists() {
+            return Ok(file_path);
+        }
+        let stream_path = self.ipc_stream_path(key)?;
+        if stream_path.exists() {
+            return Ok(stream_path);
+        }
+        Err(StorageError::Invalid(format!(
+            "no Arrow IPC artifact '{key}' for instance '{}' at {} or {}",
+            self.label,
+            file_path.display(),
+            stream_path.display()
+        )))
+    }
+}
+
+#[cfg(feature = "arrow-ipc")]
+async fn write_ipc_file_blocking(
+    path: PathBuf,
+    batches: Vec<arrow::record_batch::RecordBatch>,
+) -> StorageResult<()> {
+    blocking("ipc write", move || {
+        crate::ipc::write_ipc_file(&path, &batches)
+    })
+    .await
+}
+
+#[cfg(feature = "arrow-ipc")]
+async fn read_ipc_artifact_blocking(
+    path: PathBuf,
+) -> StorageResult<arrow::record_batch::RecordBatch> {
+    blocking("ipc read", move || crate::ipc::read_ipc_artifact(&path)).await
 }
 
 impl ZarrStorageOps for ZarrStorage {

@@ -79,7 +79,14 @@ pub fn validate_logical_name(name: &str) -> StorageResult<()> {
 /// (paths, registered `FileInfo` names) builds it here so the two roles
 /// cannot drift apart.
 pub fn artifact_file_name(instance: &str, key: &str) -> String {
-    format!("{instance}_{key}.lance")
+    artifact_file_name_ext(instance, key, "lance")
+}
+
+/// File name of a per-instance artifact with an explicit extension:
+/// `{instance}_{key}.{ext}` (the extension-general form of
+/// [`artifact_file_name`], used by the Arrow-IPC interop path, #142).
+pub fn artifact_file_name_ext(instance: &str, key: &str, ext: &str) -> String {
+    format!("{instance}_{key}.{ext}")
 }
 
 /// File name of the per-instance metadata registry: `{instance}_metadata.json`.
@@ -90,6 +97,12 @@ pub fn metadata_file_name(instance: &str) -> String {
 /// Full artifact dataset path: `{base}/{instance}_{key}.lance`.
 pub fn artifact_file_path(base: &Path, instance: &str, key: &str) -> PathBuf {
     base.join(artifact_file_name(instance, key))
+}
+
+/// Full artifact path with an explicit extension:
+/// `{base}/{instance}_{key}.{ext}` (#142).
+pub fn artifact_file_path_ext(base: &Path, instance: &str, key: &str, ext: &str) -> PathBuf {
+    base.join(artifact_file_name_ext(instance, key, ext))
 }
 
 /// Full metadata registry path: `{base}/{instance}_metadata.json`.
