@@ -1547,12 +1547,22 @@ async fn append_registry_refresh_converges_to_the_disk_shape() {
                 .await
         }
     });
-    // Wait until the append's tail landed (rows 10..12 hold 7.0).
+    // Wait until the append's tail landed (rows 10..12 hold 7.0). A read
+    // racing the writer's chunk flush surfaces as a transient
+    // invalid-range error: poll through it (bounded), never unwrap it.
+    let mut polls = 0usize;
     loop {
-        let tail = read_rows_f64(&root.join("matrix"), 10, 12, 4);
-        if tail == vec![7.0f64; 8] {
+        let tail: Option<Vec<f64>> = crate::zzarr::open(&root.join("matrix"))
+            .ok()
+            .and_then(|arr| arr.read_subset::<f64>(&[10..12, 0..4]).ok());
+        if tail.as_deref() == Some(&[7.0f64; 8][..]) {
             break;
         }
+        polls += 1;
+        assert!(
+            polls < 2000,
+            "append tail did not land within the poll budget"
+        );
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
 

@@ -241,15 +241,30 @@ impl LocalRegistry {
             properties.insert(k.clone(), v.clone());
         }
         properties.insert("kind".to_string(), kind.as_str().to_string());
+        // The table format is the leading token of the storage format:
+        // `lance fixed-row` -> `lance`, `arrow-ipc` -> `arrow-ipc`,
+        // `arrow-ipc-stream` -> `arrow-ipc-stream`, `zzarr` -> `zzarr`
+        // (#142). The semantic kind stays `CollectionKind`.
+        let format = info
+            .storage_format
+            .split(' ')
+            .next()
+            .unwrap_or_default()
+            .to_string();
         TableDescriptor {
             name: key.to_string(),
-            format: "lance".to_string(),
+            format,
             base_location: self.base.join(&info.filename),
             kind,
             properties,
         }
     }
 }
+
+/// Table formats the registry can describe: the Lance datasets this crate
+/// writes, and the Arrow-IPC interop artifacts (#142). Anything else keeps
+/// its typed rejection.
+const SUPPORTED_TABLE_FORMATS: [&str; 3] = ["lance", "arrow-ipc", "arrow-ipc-stream"];
 
 impl Catalog for LocalRegistry {
     fn list_tables(&self) -> StorageResult<Vec<TableDescriptor>> {
@@ -276,7 +291,7 @@ impl Catalog for LocalRegistry {
     }
 
     fn register_table(&mut self, table: TableDescriptor) -> StorageResult<()> {
-        if table.format != "lance" {
+        if !SUPPORTED_TABLE_FORMATS.contains(&table.format.as_str()) {
             return Err(StorageError::UnsupportedFormat(format!(
                 "unsupported table format '{}'",
                 table.format
@@ -337,6 +352,12 @@ impl Catalog for LocalRegistry {
             None,
         )?;
         info.kind = kind;
+        if table.format != "lance" {
+            // Preserve a declared non-Lance table format (the IPC interop
+            // formats, #142) as the entry's storage format; Lance entries
+            // keep the filetype-derived format.
+            info.storage_format = table.format.clone();
+        }
         info.properties = user_properties;
         self.metadata.files.insert(table.name, info);
         Ok(())

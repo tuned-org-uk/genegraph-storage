@@ -1,6 +1,6 @@
 [package]
 name = "genegraph-storage"
-version = "0.70.0"
+version = "0.72.0"
 edition = "2024"
 description = "vector database: Lance and Zarr storage backends with a shared metadata catalog"
 authors = ["Lorenzo <tunedconsulting@gmail.com>"]
@@ -33,12 +33,12 @@ env_logger = "0.11.11"
 chrono = "0.4.45"
 serde = { version = "^1.0.229", features = ["derive"] }
 serde_json = { version = "^1.0.151"}
-arrow = { version = "^59.3.0" }
+arrow = { version = "^60.0.0" }
 uuid = { version = "1.26.1", features = ["v4", "serde"] }
 futures = "0.3.34"
 url = "2.5.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "sync"] }
-parquet = { version = "^59.3.0" }
+parquet = { version = "^60.0.0" }
 prost = "0.14.4"
 prost-types = "0.14.4"
 fastlanes = "0.7.2"
@@ -47,10 +47,16 @@ zarrs = "0.23"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[features]
+# Arrow-IPC interop path (#142): `.arrow` file / `.arrows` stream I/O on
+# StorageBackend. Off by default; arrow (with its ipc codec) is already an
+# unconditional dependency, so the gate controls API surface only.
+arrow-ipc = []
+
 [dev-dependencies]
 rand = "0.10.2"
 rand_distr = "0.6.0"
 approx = "0.5.1"
 serde_json = "^1.0.151"
-arrow = { version = "^59.3.0" }
+arrow = { version = "^60.0.0" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

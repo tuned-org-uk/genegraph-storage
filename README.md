@@ -12,6 +12,7 @@ Provided functionalities:
 * **transactional generations**: atomic metadata commits (tmp + fsync + rename), `scoped_generation(n)` handles, generation listing/deletion for sweeps, reader pins
 * **catalog contract** (`src/catalog.rs`): `TableDescriptor` + `Catalog` trait mirroring the Lance Namespace / Polaris Generic Table API shape, with `LocalRegistry` over the JSON metadata registry
 * parquet interop (`save_dense_to_file` / `load_dense_from_file`)
+* Arrow-IPC interop behind the `arrow-ipc` feature (#142): `.arrow` file and `.arrows` streaming artifacts (`save_dense_to_ipc` / `load_dense_from_ipc` / `open_ipc_stream_writer`, graph IPC on the Lance backend), natively readable by PyArrow, Polars and DuckDB
 
 A storage layer for:
 * [`javelin-tui`](https://github.com/tuned-org-uk/javelin-tui): a graph-based vector database Text-Interface and

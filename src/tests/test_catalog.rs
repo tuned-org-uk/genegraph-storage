@@ -543,3 +543,90 @@ async fn staleness_signal_is_storage_format_agnostic() {
     );
     assert_eq!(desc.graph_staleness, GraphStaleness::Fresh);
 }
+
+// ---------------------------------------------------------------------------
+// #142: Arrow-IPC artifacts in the catalog
+// ---------------------------------------------------------------------------
+
+/// An IPC artifact registered with `storage_format = "arrow-ipc"` describes
+/// as an `arrow-ipc` table of the vector-space kind — the semantic kind
+/// stays `CollectionKind`, the table format names the storage format.
+#[tokio::test(flavor = "multi_thread")]
+async fn catalog_describes_arrow_ipc_entries() {
+    let base = tmp_dir("catalog_m_c1").await;
+    let metadata = GeneMetadata::new("ipc_catalog")
+        .with_base(base.clone())
+        .with_dimensions(4, 8);
+    let mut vectors = FileInfo::new(
+        "ipc_catalog_vectors.arrow".to_string(),
+        "dense",
+        (4, 8),
+        None,
+        None,
+    )
+    .expect("dense filetype");
+    vectors.storage_format = "arrow-ipc".to_string();
+    let registry = LocalRegistry::new(metadata.add_file("vectors", vectors), base);
+
+    let desc = registry
+        .describe_table("vectors")
+        .expect("describe IPC entry");
+    assert_eq!(desc.format, "arrow-ipc");
+    assert_eq!(desc.kind, CollectionKind::VectorSpace);
+    assert_eq!(
+        desc.properties.get("storage_format").map(String::as_str),
+        Some("arrow-ipc")
+    );
+}
+
+/// Streaming IPC artifacts (`arrow-ipc-stream`) register through
+/// `register_table` and keep their format through describe; unrelated
+/// formats stay rejected.
+#[tokio::test(flavor = "multi_thread")]
+async fn catalog_registers_arrow_ipc_descriptors() {
+    let base = tmp_dir("catalog_m_c1").await;
+    let mut registry = registry_with(&base, "ipc_stream_catalog");
+
+    let base_location = base.join("ipc_stream_catalog_stream.arrows");
+    registry
+        .register_table(TableDescriptor {
+            name: "stream".to_string(),
+            format: "arrow-ipc-stream".to_string(),
+            base_location: base_location.clone(),
+            kind: CollectionKind::VectorSpace,
+            properties: BTreeMap::from([
+                ("filetype".to_string(), "dense".to_string()),
+                ("rows".to_string(), "12".to_string()),
+                ("cols".to_string(), "4".to_string()),
+            ])
+            .into_iter()
+            .collect(),
+        })
+        .expect("register arrow-ipc-stream descriptor");
+
+    let desc = registry.describe_table("stream").expect("describe stream");
+    assert_eq!(desc.format, "arrow-ipc-stream");
+    assert_eq!(desc.base_location, base_location);
+    // the declared format survives into the registry entry
+    assert_eq!(
+        registry
+            .metadata()
+            .files
+            .get("stream")
+            .expect("registry entry")
+            .storage_format,
+        "arrow-ipc-stream"
+    );
+
+    // unrelated formats keep their typed rejection
+    let err = registry
+        .register_table(TableDescriptor {
+            name: "delta_thing".to_string(),
+            format: "delta".to_string(),
+            base_location: base.join("delta_thing"),
+            kind: CollectionKind::Table,
+            properties: Default::default(),
+        })
+        .unwrap_err();
+    assert!(matches!(err, crate::StorageError::UnsupportedFormat(_)));
+}

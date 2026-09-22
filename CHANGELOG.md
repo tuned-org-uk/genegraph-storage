@@ -1,5 +1,67 @@
 # Changelog
 
+## 0.72.0 (2026-09-22)
+
+> Version note: 0.71.0 is intentionally skipped — the arrow/parquet 60.0
+> dependency upgrade folded into this release per maintainer decision
+> (#145), so no standalone 0.71.0 ships.
+
+Arrow-IPC interop path on `StorageBackend` (#142): `.arrow` file and
+`.arrows` streaming artifacts as a first-class interop surface next to the
+Parquet path. The codec lives in `src/ipc.rs` (format only — no locks, no
+registry logic); both in-tree backends compose it. The surface is gated
+behind the `arrow-ipc` Cargo feature (off by default): `arrow` is already
+an unconditional dependency, so the gate controls API surface only.
+
+**Added**
+
+- `StorageBackend::save_dense_to_ipc` / `load_dense_from_ipc` (feature
+  `arrow-ipc`): exact `DenseMatrix<f64>` round-trip through the Arrow IPC
+  file format; the loader accepts `.arrow` and falls back to `.arrows`,
+  concatenating batches in order. Defaults are typed
+  `UnsupportedFormat` rejections for backends without the path.
+- `StorageBackend::open_ipc_stream_writer` (feature `arrow-ipc`):
+  incremental-flush stream handle (`crate::ipc::IpcStreamWriterHandle`,
+  `write_batch` / `finish`), registry-free like the #106 path tier — the
+  stream surface takes no metadata path, so no registry entry is minted.
+- `StorageBackend::save_graph_to_ipc` / `load_graph_from_ipc` (feature
+  `arrow-ipc`): graph collections through IPC with the canonical
+  `graph_record_batch` validation and dataset-level stamping; fixed
+  widths per the #142 type mapping (`u32` node ids, `f64` weights).
+- Lance path layout: `{instance}_{key}.arrow` / `.arrows`, generation
+  scoping through `scoped_generation(n)` works transparently; Zarr
+  layout: `{key}.arrow` / `.arrows` under the root. Graph IPC on Zarr
+  keeps its typed `UnsupportedFiletype` rejection (the Zarr layer has no
+  graph concept; the interop path does not smuggle one in).
+- Registry facts for IPC artifacts: `storage_format = "arrow-ipc"` with
+  the semantic `CollectionKind` unchanged (`dense` -> vector-space,
+  `graph` -> graph). Catalog descriptors now derive `TableDescriptor::format`
+  from the leading storage-format token, and `register_table` accepts
+  `arrow-ipc` / `arrow-ipc-stream` while keeping its typed rejection for
+  anything else.
+- `generations::artifact_file_name_ext` / `artifact_file_path_ext`: the
+  extension-general naming forms (`.lance` stays the delegated default).
+- `StorageError::IPC`: typed Arrow-IPC codec errors (non-exhaustive enum,
+  downstream wildcard arms unaffected).
+
+**Changed**
+
+- `TableDescriptor::format` is now derived from the registry entry's
+  storage format instead of being hardcoded to `lance`; Zarr entries
+  describe as `zzarr` (they never were Lance tables).
+- `arrow` / `parquet` bumped 59.3.0 -> 60.0.0 (supersedes #143/#144).
+  Arrow 60's schema-metadata `Metadata` port needed no call-site changes
+  here (`with_metadata`/`new_with_metadata` take `impl Into<Metadata>`);
+  the IPC writer/reader APIs the interop path uses are unchanged and the
+  file byte layout is unchanged (the conformance test re-pins it).
+  Arrow 60's rebuilt timings exposed a race in the
+  `append_registry_refresh_converges_to_the_disk_shape` polling loop: a
+  read racing the writer's chunk flush now polls through the transient
+  error (bounded) instead of unwrapping it. The pre-existing `pin_*`
+  sweep race tests remain documented in #23.
+
+Refs: #142
+
 ## 0.70.0 (2026-09-21)
 
 Graph source lineage and a vector-space staleness signal (#140), ported
