@@ -45,6 +45,16 @@ an unconditional dependency, so the gate controls API surface only.
 - `TableDescriptor::format` is now derived from the registry entry's
   storage format instead of being hardcoded to `lance`; Zarr entries
   describe as `zzarr` (they never were Lance tables).
+- `arrow` / `parquet` bumped 59.3.0 -> 60.0.0 (supersedes #143/#144).
+  Arrow 60's schema-metadata `Metadata` port needed no call-site changes
+  here (`with_metadata`/`new_with_metadata` take `impl Into<Metadata>`);
+  the IPC writer/reader APIs the interop path uses are unchanged and the
+  file byte layout is unchanged (the conformance test re-pins it).
+  Arrow 60's rebuilt timings exposed a race in the
+  `append_registry_refresh_converges_to_the_disk_shape` polling loop: a
+  read racing the writer's chunk flush now polls through the transient
+  error (bounded) instead of unwrapping it. The pre-existing `pin_*`
+  sweep race tests remain documented in #23.
 
 Refs: #142
 
