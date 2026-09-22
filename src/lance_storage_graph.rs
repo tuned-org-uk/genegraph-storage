@@ -209,7 +209,10 @@ impl LanceStorageGraph {
 
     /// Resolves the Arrow IPC artifact saved under `key`: the file format
     /// when present, else the stream format. A missing artifact names both
-    /// candidates in the typed error.
+    /// candidates in the typed error — `StorageError::Invalid`, the
+    /// repo-wide missing-resource convention (every "not found" path
+    /// surfaces `Invalid`); `StorageError::IPC` stays reserved for codec
+    /// failures.
     fn resolve_ipc_artifact(&self, key: &str) -> StorageResult<PathBuf> {
         let file_path = self.ipc_file_path(key);
         if file_path.exists() {
@@ -227,9 +230,11 @@ impl LanceStorageGraph {
         )))
     }
 
-    /// Publishes a written IPC artifact in the registry (commit-serialized):
-    /// artifact-first callers keep the single-commit-point invariant.
-    async fn register_ipc_artifact(
+    /// Publishes a written IPC *file-format* artifact (`.arrow`) in the
+    /// registry (commit-serialized): artifact-first callers keep the
+    /// single-commit-point invariant. Stream artifacts (`.arrows`) are
+    /// registry-free by design (#106 tier) and never pass through here.
+    async fn register_ipc_file_artifact(
         &self,
         key: &str,
         filetype: &str,
@@ -259,36 +264,18 @@ impl LanceStorageGraph {
     }
 }
 
-/// Writes batches as an Arrow IPC file off the async executor thread.
-#[cfg(feature = "arrow-ipc")]
-async fn write_ipc_file_blocking(path: PathBuf, batches: Vec<RecordBatch>) -> StorageResult<()> {
-    tokio::task::spawn_blocking(move || crate::ipc::write_ipc_file(&path, &batches))
-        .await
-        .map_err(|e| StorageError::Io(format!("ipc writer task failed: {e}")))?
-}
-
-/// Reads an Arrow IPC artifact (file or stream, by extension) off the
-/// async executor thread.
-#[cfg(feature = "arrow-ipc")]
-async fn read_ipc_artifact(path: PathBuf) -> StorageResult<RecordBatch> {
-    tokio::task::spawn_blocking(move || crate::ipc::read_ipc_artifact(&path))
-        .await
-        .map_err(|e| StorageError::Io(format!("ipc reader task failed: {e}")))?
-}
-
 /// Registry facts describing a saved graph collection (the shared shape
-/// of the `save_graph_with` registry entry, #142).
+/// of the `save_graph_with` registry entry, #142). `weighted` is computed
+/// by the caller at the validated batch step — the helper carries no
+/// slice-index contract of its own.
 #[cfg(feature = "arrow-ipc")]
-fn ipc_graph_properties(edges: &[GraphEdge], num_nodes: u64) -> BTreeMap<String, String> {
+fn ipc_graph_properties(weighted: bool, num_nodes: u64) -> BTreeMap<String, String> {
     BTreeMap::from([
         (
             "node_id_width".to_string(),
             crate::graph::NodeIdWidth::U32.as_str().to_string(),
         ),
-        (
-            "weighted".to_string(),
-            edges[0].weight.is_some().to_string(),
-        ),
+        ("weighted".to_string(), weighted.to_string()),
         ("num_nodes".to_string(), num_nodes.to_string()),
         (
             "weight_type".to_string(),
@@ -1289,9 +1276,9 @@ impl StorageBackend for LanceStorageGraph {
 
         let batch = self.to_dense_record_batch(data)?;
         ensure_parent_dir(&path).await?;
-        write_ipc_file_blocking(path.clone(), vec![batch]).await?;
+        crate::ipc::write_ipc_file_async(path.clone(), vec![batch]).await?;
 
-        self.register_ipc_artifact(key, "dense", data.shape(), None, BTreeMap::new())
+        self.register_ipc_file_artifact(key, "dense", data.shape(), None, BTreeMap::new())
             .await?;
         info!("Dense {key} saved to IPC successfully");
         Ok(path)
@@ -1304,7 +1291,7 @@ impl StorageBackend for LanceStorageGraph {
     async fn load_dense_from_ipc(&self, key: &str) -> StorageResult<DenseMatrix<f64>> {
         let path = self.resolve_ipc_artifact(key)?;
         info!("Loading dense {key} from IPC at {}", path.display());
-        let combined = read_ipc_artifact(path).await?;
+        let combined = crate::ipc::read_ipc_artifact_async(path).await?;
         let matrix = self.from_dense_record_batch(&combined)?;
         let (n_rows, n_cols) = matrix.shape();
         info!("Loaded dense {key} from IPC: {n_rows}x{n_cols}");
@@ -1323,11 +1310,7 @@ impl StorageBackend for LanceStorageGraph {
         let path = self.ipc_stream_path(key);
         info!("Opening IPC stream writer {key} at {}", path.display());
         ensure_parent_dir(&path).await?;
-        tokio::task::spawn_blocking(move || {
-            crate::ipc::IpcStreamWriterHandle::create(path, schema.as_ref())
-        })
-        .await
-        .map_err(|e| StorageError::Io(format!("ipc stream writer task failed: {e}")))?
+        crate::ipc::open_stream_writer_async(path, schema).await
     }
 
     /// Interop: writes the edge-list graph collection as an Arrow IPC
@@ -1348,6 +1331,8 @@ impl StorageBackend for LanceStorageGraph {
         let (batch, num_nodes) = crate::traits::lance::graph_record_batch(edges, &options)?;
         let num_nodes_usize = usize::try_from(num_nodes)
             .map_err(|_| StorageError::Overflow(format!("node count {num_nodes} exceeds usize")))?;
+        // Validated non-empty and uniform by graph_record_batch above.
+        let weighted = edges[0].weight.is_some();
 
         let path = self.ipc_file_path(key);
         info!(
@@ -1356,14 +1341,14 @@ impl StorageBackend for LanceStorageGraph {
             path.display()
         );
         ensure_parent_dir(&path).await?;
-        write_ipc_file_blocking(path.clone(), vec![batch]).await?;
+        crate::ipc::write_ipc_file_async(path.clone(), vec![batch]).await?;
 
-        self.register_ipc_artifact(
+        self.register_ipc_file_artifact(
             key,
             "graph",
             (num_nodes_usize, num_nodes_usize),
             Some(edges.len()),
-            ipc_graph_properties(edges, num_nodes),
+            ipc_graph_properties(weighted, num_nodes),
         )
         .await?;
         info!("Graph {key} saved to IPC successfully");
@@ -1377,7 +1362,7 @@ impl StorageBackend for LanceStorageGraph {
     async fn load_graph_from_ipc(&self, key: &str) -> StorageResult<StoredGraph> {
         let path = self.resolve_ipc_artifact(key)?;
         info!("Loading graph {key} from IPC at {}", path.display());
-        let combined = read_ipc_artifact(path).await?;
+        let combined = crate::ipc::read_ipc_artifact_async(path).await?;
         crate::traits::lance::stored_graph_from_batch_with_options(
             combined,
             &GraphReadOptions::default(),

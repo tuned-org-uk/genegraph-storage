@@ -2,6 +2,10 @@
 
 ## 0.72.0 (2026-09-22)
 
+> Version note: 0.71.0 is intentionally skipped — the arrow/parquet 60.0
+> dependency upgrade folded into this release per maintainer decision
+> (#145), so no standalone 0.71.0 ships.
+
 Arrow-IPC interop path on `StorageBackend` (#142): `.arrow` file and
 `.arrows` streaming artifacts as a first-class interop surface next to the
 Parquet path. The codec lives in `src/ipc.rs` (format only — no locks, no

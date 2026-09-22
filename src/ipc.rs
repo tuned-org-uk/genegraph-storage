@@ -221,11 +221,10 @@ impl IpcStreamWriterHandle {
     /// Writes the EOS marker, flushes and closes the file. Returns the
     /// artifact path.
     pub fn finish(mut self) -> StorageResult<PathBuf> {
-        let writer = self
+        let mut writer = self
             .writer
             .take()
             .ok_or_else(|| StorageError::Invalid("IPC stream writer is already finished".into()))?;
-        let mut writer = writer;
         writer.finish().map_err(|e| {
             ipc_err(
                 &format!("Failed to finish IPC stream at {}", self.path.display()),
@@ -235,4 +234,33 @@ impl IpcStreamWriterHandle {
         info!("Closed Arrow IPC stream at {}", self.path.display());
         Ok(self.path)
     }
+}
+
+// =========
+// Async wrappers: the codec is synchronous; backends share these so the
+// blocking dispatch exists once, not per backend (#145 review).
+// =========
+
+/// [`write_ipc_file`] off the async executor thread.
+pub async fn write_ipc_file_async(path: PathBuf, batches: Vec<RecordBatch>) -> StorageResult<()> {
+    tokio::task::spawn_blocking(move || write_ipc_file(&path, &batches))
+        .await
+        .map_err(|e| StorageError::Io(format!("ipc writer task failed: {e}")))?
+}
+
+/// [`read_ipc_artifact`] off the async executor thread.
+pub async fn read_ipc_artifact_async(path: PathBuf) -> StorageResult<RecordBatch> {
+    tokio::task::spawn_blocking(move || read_ipc_artifact(&path))
+        .await
+        .map_err(|e| StorageError::Io(format!("ipc reader task failed: {e}")))?
+}
+
+/// [`IpcStreamWriterHandle::create`] off the async executor thread.
+pub async fn open_stream_writer_async(
+    path: PathBuf,
+    schema: arrow::datatypes::SchemaRef,
+) -> StorageResult<IpcStreamWriterHandle> {
+    tokio::task::spawn_blocking(move || IpcStreamWriterHandle::create(path, schema.as_ref()))
+        .await
+        .map_err(|e| StorageError::Io(format!("ipc stream writer task failed: {e}")))?
 }

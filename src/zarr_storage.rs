@@ -1095,7 +1095,7 @@ impl StorageBackend for ZarrStorage {
 
         let batch = self.to_dense_record_batch(data)?;
         ensure_ipc_parent(&path).await?;
-        write_ipc_file_blocking(path.clone(), vec![batch]).await?;
+        crate::ipc::write_ipc_file_async(path.clone(), vec![batch]).await?;
         self.register_artifact(
             &format!("{key}.{}", crate::ipc::FILE_EXT),
             "dense",
@@ -1113,7 +1113,7 @@ impl StorageBackend for ZarrStorage {
     async fn load_dense_from_ipc(&self, key: &str) -> StorageResult<DenseMatrix<f64>> {
         let path = self.resolve_ipc_artifact(key)?;
         info!("Loading dense {key} from IPC at {}", path.display());
-        let combined = read_ipc_artifact_blocking(path).await?;
+        let combined = crate::ipc::read_ipc_artifact_async(path).await?;
         self.from_dense_record_batch(&combined)
     }
 
@@ -1129,11 +1129,7 @@ impl StorageBackend for ZarrStorage {
         let path = self.ipc_stream_path(key)?;
         info!("Opening IPC stream writer {key} at {}", path.display());
         ensure_ipc_parent(&path).await?;
-        tokio::task::spawn_blocking(move || {
-            crate::ipc::IpcStreamWriterHandle::create(path, schema.as_ref())
-        })
-        .await
-        .map_err(|e| StorageError::Io(format!("ipc stream writer task failed: {e}")))?
+        crate::ipc::open_stream_writer_async(path, schema).await
     }
 
     /// The Zarr layer has no graph concept; the interop path does not
@@ -1198,7 +1194,9 @@ impl ZarrStorage {
 
     /// Resolves the Arrow IPC artifact saved under `key`: the file format
     /// when present, else the stream format. A missing artifact names
-    /// both candidates in the typed error.
+    /// both candidates in the typed error — `StorageError::Invalid`, the
+    /// repo-wide missing-resource convention; `StorageError::IPC` stays
+    /// reserved for codec failures.
     fn resolve_ipc_artifact(&self, key: &str) -> StorageResult<PathBuf> {
         let file_path = self.ipc_file_path(key)?;
         if file_path.exists() {
@@ -1215,24 +1213,6 @@ impl ZarrStorage {
             stream_path.display()
         )))
     }
-}
-
-#[cfg(feature = "arrow-ipc")]
-async fn write_ipc_file_blocking(
-    path: PathBuf,
-    batches: Vec<arrow::record_batch::RecordBatch>,
-) -> StorageResult<()> {
-    blocking("ipc write", move || {
-        crate::ipc::write_ipc_file(&path, &batches)
-    })
-    .await
-}
-
-#[cfg(feature = "arrow-ipc")]
-async fn read_ipc_artifact_blocking(
-    path: PathBuf,
-) -> StorageResult<arrow::record_batch::RecordBatch> {
-    blocking("ipc read", move || crate::ipc::read_ipc_artifact(&path)).await
 }
 
 impl ZarrStorageOps for ZarrStorage {
