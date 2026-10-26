@@ -318,11 +318,49 @@ async fn load_dense_lance(path: &Path) -> StorageResult<DenseMatrix<f64>> {
     Ok(matrix)
 }
 
+#[cfg(feature = "npy")]
+async fn load_dense_npy(path: &Path) -> StorageResult<DenseMatrix<f64>> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let (shape, values) = crate::npy::read_f64(&path)?;
+        let [rows, cols] = shape.as_slice() else {
+            return Err(StorageError::Invalid(format!(
+                "dense NPY must have rank 2; found shape {shape:?}"
+            )));
+        };
+        if *rows == 0 || *cols == 0 {
+            return Err(StorageError::Invalid(
+                "dense NPY shape must be non-empty".into(),
+            ));
+        }
+        DenseMatrix::new(*rows, *cols, values, false)
+            .map_err(|e| StorageError::Invalid(format!("dense NPY matrix: {e}")))
+    })
+    .await
+    .map_err(|e| StorageError::Io(format!("NPY reader task failed: {e}")))?
+}
+
+#[cfg(feature = "npy")]
+async fn save_dense_npy(data: &DenseMatrix<f64>, path: &Path) -> StorageResult<()> {
+    let (rows, cols) = data.shape();
+    let mut values = Vec::with_capacity(rows.saturating_mul(cols));
+    for row in 0..rows {
+        for col in 0..cols {
+            values.push(*data.get((row, col)));
+        }
+    }
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || crate::npy::write_f64(&path, &[rows, cols], &values))
+        .await
+        .map_err(|e| StorageError::Io(format!("NPY writer task failed: {e}")))?
+}
+
 /// Parquet branch of `load_dense_from_file`, reader half.
 ///
 /// Parquet readers require a synchronous `Read` impl; run the blocking
 /// open/read/concat on the dedicated blocking pool so the async executor
 /// thread is not stalled (issue #52).
+#[cfg(feature = "parquet")]
 async fn read_parquet_batches(path: &Path) -> StorageResult<RecordBatch> {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
@@ -364,6 +402,7 @@ async fn read_parquet_batches(path: &Path) -> StorageResult<RecordBatch> {
 /// Supported layouts: `vector: FixedSizeList<Float64>` (decodes like the
 /// Lance path) and the legacy wide layout with `Float64` columns named
 /// `col_0..col_N`; anything else is rejected with `StorageError::Invalid`.
+#[cfg(feature = "parquet")]
 fn dense_matrix_from_parquet(
     path: &Path,
     combined: &RecordBatch,
@@ -485,6 +524,7 @@ async fn save_dense_lance(
 /// The parquet writer is synchronous: run it on the blocking pool so the
 /// async executor thread is not stalled (see #52 for the matching read
 /// path).
+#[cfg(feature = "parquet")]
 async fn save_dense_parquet(
     parent_dir: String,
     data: &DenseMatrix<f64>,
@@ -650,6 +690,21 @@ impl StorageBackend for LanceStorageGraph {
     async fn load_dense_from_file(&self, path: &Path) -> StorageResult<DenseMatrix<f64>> {
         info!("Loading dense matrix from file (async): {:?}", path);
 
+        let extension = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .ok_or_else(|| StorageError::Invalid(format!("Invalid file path: {:?}", path)))?;
+
+        if extension == "parquet" && !cfg!(feature = "parquet") {
+            return Err(StorageError::UnsupportedFormat(
+                "Parquet I/O is disabled; enable the `parquet` Cargo feature".into(),
+            ));
+        }
+        if extension == "npy" && !cfg!(feature = "npy") {
+            return Err(StorageError::UnsupportedFormat(
+                "NPY I/O is disabled; enable the `npy` Cargo feature".into(),
+            ));
+        }
         if !path.exists() {
             return Err(StorageError::Invalid(format!(
                 "Dense file does not exist: {:?}",
@@ -657,16 +712,28 @@ impl StorageBackend for LanceStorageGraph {
             )));
         }
 
-        let extension = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .ok_or_else(|| StorageError::Invalid(format!("Invalid file path: {:?}", path)))?;
-
         match extension {
             "lance" => load_dense_lance(path).await,
-            "parquet" => {
-                let combined = read_parquet_batches(path).await?;
-                dense_matrix_from_parquet(path, &combined)
+            "npy" if cfg!(feature = "npy") => {
+                #[cfg(feature = "npy")]
+                {
+                    load_dense_npy(path).await
+                }
+                #[cfg(not(feature = "npy"))]
+                {
+                    unreachable!()
+                }
+            }
+            "parquet" if cfg!(feature = "parquet") => {
+                #[cfg(feature = "parquet")]
+                {
+                    let combined = read_parquet_batches(path).await?;
+                    dense_matrix_from_parquet(path, &combined)
+                }
+                #[cfg(not(feature = "parquet"))]
+                {
+                    unreachable!()
+                }
             }
             _ => Err(StorageError::Invalid(format!(
                 "Unsupported file format: {}. Only .lance and .parquet are supported",
@@ -848,14 +915,34 @@ impl StorageBackend for LanceStorageGraph {
     async fn save_dense_to_file(data: &DenseMatrix<f64>, path: &Path) -> StorageResult<()> {
         info!("Saving dense matrix to file (async): {:?}", path);
 
-        // Create missing parent directories instead of failing late in the
-        // format-specific writers.
         let parent = path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .ok_or_else(|| {
                 StorageError::Invalid(format!("path has no parent directory: {:?}", path))
             })?;
+        let extension = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .ok_or_else(|| StorageError::Invalid(format!("Invalid file path: {:?}", path)))?;
+
+        if extension == "parquet" && !cfg!(feature = "parquet") {
+            return Err(StorageError::UnsupportedFormat(
+                "Parquet I/O is disabled; enable the `parquet` Cargo feature".into(),
+            ));
+        }
+        if extension == "npy" && !cfg!(feature = "npy") {
+            return Err(StorageError::UnsupportedFormat(
+                "NPY I/O is disabled; enable the `npy` Cargo feature".into(),
+            ));
+        }
+        if !matches!(extension, "lance" | "parquet" | "npy") {
+            return Err(StorageError::UnsupportedFormat(format!(
+                "unsupported dense file extension: {extension}"
+            )));
+        }
+
+        // Reject disabled and unknown formats before creating directories.
         tokio::fs::create_dir_all(parent)
             .await
             .map_err(|e| StorageError::Io(format!("create dir {:?}: {}", parent, e)))?;
@@ -864,17 +951,31 @@ impl StorageBackend for LanceStorageGraph {
             .ok_or_else(|| StorageError::Invalid(format!("non-UTF8 parent path for {:?}", path)))?
             .to_string();
 
-        let extension = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .ok_or_else(|| StorageError::Invalid(format!("Invalid file path: {:?}", path)))?;
-
         let (n_rows, n_cols) = data.shape();
         info!("Saving matrix: {} rows x {} cols", n_rows, n_cols);
 
         match extension {
             "lance" => save_dense_lance(parent_str, data, path).await,
-            "parquet" => save_dense_parquet(parent_str, data, path).await,
+            "npy" if cfg!(feature = "npy") => {
+                #[cfg(feature = "npy")]
+                {
+                    save_dense_npy(data, path).await
+                }
+                #[cfg(not(feature = "npy"))]
+                {
+                    unreachable!()
+                }
+            }
+            "parquet" if cfg!(feature = "parquet") => {
+                #[cfg(feature = "parquet")]
+                {
+                    save_dense_parquet(parent_str, data, path).await
+                }
+                #[cfg(not(feature = "parquet"))]
+                {
+                    unreachable!()
+                }
+            }
             _ => Err(StorageError::Invalid(format!(
                 "Unsupported file format: {}. Only .lance and .parquet are supported",
                 extension
