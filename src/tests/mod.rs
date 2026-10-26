@@ -5,14 +5,19 @@ mod test_catalog;
 mod test_collections;
 mod test_commit;
 mod test_data;
+mod test_format_features;
 mod test_generations;
 mod test_init;
 mod test_lance_layer;
 mod test_lancefmt_impl;
 mod test_metadata;
+#[cfg(feature = "npy")]
+mod test_npy;
 mod test_parquet_io;
 mod test_verify;
+#[cfg(feature = "zarr")]
 mod test_zarr_storage;
+#[cfg(feature = "zarr")]
 mod test_zzarr;
 
 use std::fs;

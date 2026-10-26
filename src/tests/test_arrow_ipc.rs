@@ -367,6 +367,7 @@ async fn ipc_missing_artifact_is_a_typed_error() {
 /// the dense and stream IPC paths (dense fits Zarr roots), and keeps its
 /// typed rejection for graph collections.
 #[tokio::test(flavor = "multi_thread")]
+#[cfg(feature = "zarr")]
 async fn zarr_ipc_dense_roundtrip_graph_rejected_and_stream_writes() {
     let base = tmp_dir("ipc_zarr").await;
     let storage = {

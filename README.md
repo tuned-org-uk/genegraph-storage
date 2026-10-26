@@ -194,5 +194,52 @@ Every custom definition of a Lance database (store or manifold or data-cube) sho
 
 Traits in `traits` module can also be reused to implement other formats. Other formats can use `StorageBackend` to implement similar child-traits alike to `LanceStorage`. Then if matched with a custom `Metadata` instance can make a database, so every database is simply a `StorageBackend + Metadata`.
 
+## Optional format features
+
+The default feature set is `parquet` and `zarr`. This keeps their existing
+APIs and storage support enabled. `npy` is opt-in. Features are additive.
+Arrow remains a required dependency for the core record-batch API.
+
+```toml
+genegraph-storage = { version = "0.72", default-features = false, features = ["npy"] }
+```
+
+| Capability | `parquet` | `zarr` | `npy` |
+| --- | --- | --- | --- |
+| Dense matrix native backend | No; explicit import/export only | Yes | No; explicit `.npy` matrix import/export |
+| Dense matrix file import/export | Yes, `.parquet` | Zarr arrays via `ZarrStorage` | Yes, `.npy`, rank 2 Float64 |
+| Scalars and checked indices | Lance only | Zarr backend APIs | Numeric arrays only (`f64` and `u64` codec) |
+| Sparse matrices | Lance only | Typed unsupported; separate CSR codec is not backend parity | Unsupported |
+| Named vector spaces and graphs | Lance only | Typed unsupported | Unsupported |
+| Registry, schema inspection, verification | Lance collections only | Zarr registry for supported arrays; no collection schema parity | No registry or schema sidecar |
+| Append and overwrite | Not provided by file interop | Supported by Zarr APIs | Not supported |
+
+Enable Parquet I/O with `features = ["parquet"]`. Disabled Parquet or NPY
+file requests return `StorageError::UnsupportedFormat` before creating the
+output parent directory. Zarr types and modules are available only with the
+`zarr` feature. A feature enables the codec and the operations listed above;
+it does not imply collection or catalog parity.
+
+The NPY codec supports NPY header versions 1, 2, and 3. It reads and writes
+little-endian C-order Float64 and UInt64 numeric arrays. It rejects other
+dtypes and Fortran-order arrays. `LanceStorageGraph::save_dense_to_file` and
+`load_dense_from_file` use rank-2 Float64 NPY arrays when `npy` is enabled.
+The lower-level `npy` module supports arbitrary ranks, including scalar and
+empty arrays, for those two dtypes. It does not store registry facts or
+collection metadata. Object arrays and pickle data are not supported.
+
+No-default builds retain Lance and the core registry APIs, but omit Parquet
+and Zarr dependencies and surfaces. Cargo dependency checks can confirm this:
+
+```sh
+cargo tree --no-default-features -e normal
+cargo tree --no-default-features -e normal -i parquet
+cargo tree --no-default-features -e normal -i zarrs
+```
+
+The latter two commands must report that those packages are not in the
+resolved graph.
+
 ## Contributing
+
 See `.github/` directory.

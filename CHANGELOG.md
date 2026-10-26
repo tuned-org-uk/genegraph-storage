@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Add optional `parquet`, `zarr`, and `npy` features. Parquet and Zarr remain
+  enabled by default. NPY is opt-in. NPY supports little-endian C-order
+  Float64 and UInt64 arrays, plus rank-2 Float64 dense matrix file I/O.
+- Gate Zarr modules and format dependencies. Disabled Parquet and NPY file
+  requests return typed unsupported-format errors before output directory
+  creation.
+
+### Changed
+
+- Return `StorageError::UnsupportedFormat` for unknown dense-file extensions
+  on both load and save paths. The save path previously returned `Invalid`.
+
 ## 0.72.1 (2026-10-26)
 
 ### Fixed

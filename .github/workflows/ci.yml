@@ -7,6 +7,32 @@ on:
     branches: [main]
 
 jobs:
+  feature-matrix:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        args:
+          - "--no-default-features"
+          - "--no-default-features --features parquet"
+          - "--no-default-features --features zarr"
+          - "--no-default-features --features npy"
+          - "--no-default-features --features parquet,zarr"
+          - "--no-default-features --features parquet,npy"
+          - "--no-default-features --features zarr,npy"
+          - "--no-default-features --features parquet,zarr,npy"
+          - "--no-default-features --features arrow-ipc"
+          - "--no-default-features --features parquet,arrow-ipc"
+          - "--no-default-features --features zarr,arrow-ipc"
+          - "--no-default-features --features npy,arrow-ipc"
+          - "--no-default-features --features parquet,zarr,arrow-ipc"
+          - ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Test feature combination
+        run: cargo test --release --lib ${{ matrix.args }}
+
   tests:
     runs-on: "${{ matrix.platform.os }}-latest"
     strategy:

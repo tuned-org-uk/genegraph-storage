@@ -8,8 +8,12 @@ pub mod ipc;
 pub mod lance_storage_graph;
 pub mod lancefmt;
 pub mod metadata;
+#[cfg(feature = "npy")]
+pub mod npy;
 pub mod traits;
+#[cfg(feature = "zarr")]
 pub mod zarr_storage;
+#[cfg(feature = "zarr")]
 pub mod zzarr;
 
 #[cfg(all(test, unix))]
