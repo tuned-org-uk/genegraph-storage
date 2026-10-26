@@ -99,7 +99,12 @@ fn impl_roundtrip_fsl_nonnull() {
     let dir = tmp_dir_sync("lancefmt_impl_fsl");
     write_dataset(&batch, &dir).expect("write");
     let loaded = scan_all(&dir).expect("our scan");
+    assert_eq!(
+        crate::lancefmt::read_schema(&dir).unwrap(),
+        fx::fsl_schema()
+    );
     assert_batch_fsl(&loaded, &fx::fsl_values(), fx::FSL_DIMS, "ours->ours fsl");
+    assert_eq!(loaded.schema(), batch.schema(), "FSL child nullability");
 }
 
 #[test]
@@ -125,6 +130,44 @@ fn impl_roundtrip_sparse_with_schema_metadata() {
     assert_batch_u32(&loaded, &rows, 0, "ours->ours sparse row");
     assert_batch_u32(&loaded, &cols, 1, "ours->ours sparse col");
     assert_batch_f64(&loaded, &vals, 2, "ours->ours sparse value");
+}
+
+#[test]
+fn impl_reads_nonnullable_fsl_golden_schema_and_values() {
+    let dir = Path::new(fx::FIXTURES_DIR).join("fsl_f64_child_nonnull.lance");
+    let loaded = scan_all(&dir).expect("read in-house golden fixture");
+    assert_eq!(
+        crate::lancefmt::read_schema(&dir).unwrap(),
+        fx::fsl_schema()
+    );
+    assert_eq!(loaded, fx::fsl_batch());
+}
+
+#[test]
+fn impl_roundtrip_fsl_nullable_children() {
+    use arrow::array::{ArrayRef, Float32Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    for item_type in [DataType::Float32, DataType::Float64] {
+        let child = Arc::new(Field::new("item", item_type.clone(), true));
+        let values: ArrayRef = match item_type {
+            DataType::Float32 => Arc::new(Float32Array::from(vec![0.5, -1.25, 2.0, 3.0])),
+            DataType::Float64 => Arc::new(Float64Array::from(vec![0.5, -1.25, 2.0, 3.0])),
+            _ => unreachable!(),
+        };
+        let list = FixedSizeListArray::new(child.clone(), 2, values, None);
+        let schema = Schema::new(vec![Field::new(
+            "vector",
+            DataType::FixedSizeList(child, 2),
+            false,
+        )]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(list)]).unwrap();
+        let dir = tmp_dir_sync("fsl_nullable_child");
+        write_dataset(&batch, &dir).unwrap();
+        assert_eq!(crate::lancefmt::read_schema(&dir).unwrap(), *batch.schema());
+        assert_eq!(scan_all(&dir).unwrap(), batch);
+    }
 }
 
 #[test]
@@ -165,6 +208,12 @@ fn impl_our_reader_reads_official_fixtures_fsl() {
         fx::FSL_DIMS,
         "official->ours fsl",
     );
+    let arrow::datatypes::DataType::FixedSizeList(child, _) =
+        loaded.schema().field(0).data_type().clone()
+    else {
+        panic!("expected fixed-size list");
+    };
+    assert!(child.is_nullable(), "official files omit child nullability");
 }
 
 #[test]
@@ -384,6 +433,7 @@ fn impl_roundtrip_fsl_float32_nonnull() {
     let dir = tmp_dir_sync("lancefmt_impl_fsl_f32");
     write_dataset(&batch, &dir).expect("write");
     let loaded = scan_all(&dir).expect("our scan");
+    assert_eq!(loaded.schema(), batch.schema(), "FSL child nullability");
     let list = loaded
         .column(0)
         .as_any()

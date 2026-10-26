@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.72.1 (2026-10-26)
+
+### Fixed
+
+- Preserve `FixedSizeList<Float32|Float64>` child nullability in Lance
+  writes, reads, and collection schema inspection (#147). The writer stores
+  the child contract in namespaced protobuf field metadata. Files without
+  this metadata retain the official nullable-child default. Official readers
+  do not interpret this extension.
+
 ## 0.72.0 (2026-09-22)
 
 > Version note: 0.71.0 is intentionally skipped — the arrow/parquet 60.0
