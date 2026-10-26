@@ -57,6 +57,35 @@ fn f64_vector_batch(ids: &[u32], vectors: &[Vec<f64>]) -> RecordBatch {
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
+async fn vectors_with_preserves_child_nullability_and_schema_facts() {
+    let (_base, storage) = seeded_storage("vectors_child_nullability").await;
+    let batch = f64_vector_batch(&[0, 1], &[vec![0.5; 8], vec![-1.25; 8]]);
+    let properties = BTreeMap::from([("tier".to_string(), "hot".to_string())]);
+    storage
+        .save_vectors_with("vectors", &batch, &properties, &storage.metadata_path())
+        .await
+        .unwrap();
+
+    let expected = batch.schema().as_ref().clone().with_metadata([
+        ("kind".to_string(), "vector-space".to_string()),
+        ("tier".to_string(), "hot".to_string()),
+    ]);
+    let loaded = storage.load_vectors("vectors").await.unwrap();
+    assert_eq!(loaded.schema().as_ref(), &expected);
+    let path = storage.file_path("vectors");
+    let inspected = storage.collection_schema_from_path(&path).await.unwrap();
+    assert_eq!(inspected, expected);
+
+    let metadata = storage.load_metadata().await.unwrap();
+    let facts = crate::lancefmt::DatasetFacts::from_file_info(&metadata.files["vectors"]);
+    crate::lancefmt::verify_dataset_schema(&path, &facts).unwrap();
+    assert_eq!(
+        crate::lancefmt::DatasetFacts::from_schema(&inspected),
+        facts
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn vectors_f64_roundtrip_with_id_column() {
     let (_base, storage) = seeded_storage("vectors_f64").await;
     let md_path = storage.metadata_path();

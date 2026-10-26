@@ -687,50 +687,45 @@ fn build_array(
             }
             Arc::new(arrow::array::Int64Array::from(values.i64))
         }
-        DataType::FixedSizeList(child, dim) => {
-            match child.data_type() {
-                DataType::Float64 => {
-                    values.keep_only(&["f64"])?;
-                    let items_expected = expected_rows * *dim as u64;
-                    if values.f64.len() as u64 != items_expected {
-                        return Err(StorageError::DimensionMismatch {
-                            expected: format!("{items_expected} items"),
-                            found: format!("{} items", values.f64.len()),
-                        });
-                    }
-                    let values = Float64Array::from(values.f64);
-                    // Mirror official-reader behavior: the FSL child field is nullable.
-                    let child = ArrowField::new("item", DataType::Float64, true);
-                    Arc::new(FixedSizeListArray::new(
-                        Arc::new(child),
-                        *dim,
-                        Arc::new(values),
-                        None,
-                    ))
+        DataType::FixedSizeList(child, dim) => match child.data_type() {
+            DataType::Float64 => {
+                values.keep_only(&["f64"])?;
+                let items_expected = expected_rows * *dim as u64;
+                if values.f64.len() as u64 != items_expected {
+                    return Err(StorageError::DimensionMismatch {
+                        expected: format!("{items_expected} items"),
+                        found: format!("{} items", values.f64.len()),
+                    });
                 }
-                DataType::Float32 => {
-                    values.keep_only(&["f32"])?;
-                    let items_expected = expected_rows * *dim as u64;
-                    if values.f32.len() as u64 != items_expected {
-                        return Err(StorageError::DimensionMismatch {
-                            expected: format!("{items_expected} items"),
-                            found: format!("{} items", values.f32.len()),
-                        });
-                    }
-                    let values = Float32Array::from(values.f32);
-                    let child = ArrowField::new("item", DataType::Float32, true);
-                    Arc::new(FixedSizeListArray::new(
-                        Arc::new(child),
-                        *dim,
-                        Arc::new(values),
-                        None,
-                    ))
-                }
-                other => {
-                    return Err(unsupported(&format!("fsl item type {other:?}")));
-                }
+                let values = Float64Array::from(values.f64);
+                Arc::new(FixedSizeListArray::new(
+                    child.clone(),
+                    *dim,
+                    Arc::new(values),
+                    None,
+                ))
             }
-        }
+            DataType::Float32 => {
+                values.keep_only(&["f32"])?;
+                let items_expected = expected_rows * *dim as u64;
+                if values.f32.len() as u64 != items_expected {
+                    return Err(StorageError::DimensionMismatch {
+                        expected: format!("{items_expected} items"),
+                        found: format!("{} items", values.f32.len()),
+                    });
+                }
+                let values = Float32Array::from(values.f32);
+                Arc::new(FixedSizeListArray::new(
+                    child.clone(),
+                    *dim,
+                    Arc::new(values),
+                    None,
+                ))
+            }
+            other => {
+                return Err(unsupported(&format!("fsl item type {other:?}")));
+            }
+        },
         other => {
             return Err(unsupported(&format!("column type {other:?}")));
         }

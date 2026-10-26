@@ -17,6 +17,10 @@ use crate::lancefmt::pb::file;
 
 pub(crate) const PLAIN_ENCODING: i32 = 1;
 
+// Primitive FSLs are Lance leaf fields. Store the child contract in field
+// metadata without changing field IDs or physical column mappings.
+const FSL_CHILD_NULLABLE: &str = "genegraph-storage:fsl-child-nullable";
+
 pub(crate) fn logical_type_name(dt: &DataType) -> StorageResult<String> {
     match dt {
         DataType::Float64 => Ok("double".to_string()),
@@ -79,6 +83,18 @@ pub(crate) fn to_lance_schema(schema: &Schema) -> StorageResult<(Vec<file::Field
                 f.name()
             )));
         }
+        if f.metadata().contains_key(FSL_CHILD_NULLABLE) {
+            return Err(StorageError::Invalid(format!(
+                "reserved field metadata key: {FSL_CHILD_NULLABLE}"
+            )));
+        }
+        let mut metadata = SchemaMeta::new();
+        if let DataType::FixedSizeList(child, _) = f.data_type() {
+            metadata.insert(
+                FSL_CHILD_NULLABLE.to_string(),
+                child.is_nullable().to_string().into_bytes(),
+            );
+        }
         fields.push(file::Field {
             r#type: 0,
             name: f.name().clone(),
@@ -86,7 +102,7 @@ pub(crate) fn to_lance_schema(schema: &Schema) -> StorageResult<(Vec<file::Field
             parent_id: -1,
             logical_type: logical_type_name(f.data_type())?,
             nullable: false,
-            metadata: Default::default(),
+            metadata,
             unenforced_primary_key: false,
             unenforced_primary_key_position: 0,
             unenforced_clustering_key: false,
@@ -108,7 +124,7 @@ pub(crate) type SchemaMeta = std::collections::HashMap<String, Vec<u8>>;
 
 /// Rebuilds an Arrow schema from the flat Lance field list.
 ///
-/// Mirrors official-reader behavior: FSL child fields are nullable.
+/// Files without the child-nullability stamp use the official nullable default.
 pub(crate) fn from_lance_fields(
     fields: &[file::Field],
     metadata: &SchemaMeta,
@@ -121,7 +137,29 @@ pub(crate) fn from_lance_fields(
                 f.name, f.parent_id
             )));
         }
-        let dt = parse_logical_type(&f.logical_type)?;
+        let mut dt = parse_logical_type(&f.logical_type)?;
+        if let Some(value) = f.metadata.get(FSL_CHILD_NULLABLE) {
+            let nullable = match value.as_slice() {
+                b"true" => true,
+                b"false" => false,
+                _ => {
+                    return Err(StorageError::Invalid(format!(
+                        "invalid {FSL_CHILD_NULLABLE} on field '{}'",
+                        f.name
+                    )));
+                }
+            };
+            let DataType::FixedSizeList(child, dim) = dt else {
+                return Err(StorageError::Invalid(format!(
+                    "{FSL_CHILD_NULLABLE} requires a fixed-size list on field '{}'",
+                    f.name
+                )));
+            };
+            dt = DataType::FixedSizeList(
+                Arc::new(child.as_ref().clone().with_nullable(nullable)),
+                dim,
+            );
+        }
         arrow_fields.push(Field::new(&f.name, dt, f.nullable));
     }
     let meta = metadata
@@ -148,4 +186,53 @@ pub(crate) fn encode_schema_global(
         length: num_rows,
     };
     descriptor.encode_to_vec()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_malformed_child_nullability() {
+        let field = file::Field {
+            name: "vector".into(),
+            parent_id: -1,
+            logical_type: "fixed_size_list:double:8".into(),
+            metadata: [(FSL_CHILD_NULLABLE.into(), b"invalid".to_vec())].into(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            from_lance_fields(&[field], &SchemaMeta::new()),
+            Err(StorageError::Invalid(message)) if message.contains(FSL_CHILD_NULLABLE)
+        ));
+    }
+
+    #[test]
+    fn rejects_child_nullability_on_scalar_fields() {
+        let field = file::Field {
+            name: "value".into(),
+            parent_id: -1,
+            logical_type: "double".into(),
+            metadata: [(FSL_CHILD_NULLABLE.into(), b"false".to_vec())].into(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            from_lance_fields(&[field], &SchemaMeta::new()),
+            Err(StorageError::Invalid(message)) if message.contains("fixed-size list")
+        ));
+    }
+
+    #[test]
+    fn rejects_user_child_nullability_stamp() {
+        let field = Field::new(
+            "vector",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float64, false)), 8),
+            false,
+        )
+        .with_metadata([(FSL_CHILD_NULLABLE.to_string(), "true".to_string())]);
+        assert!(matches!(
+            to_lance_schema(&Schema::new(vec![field])),
+            Err(StorageError::Invalid(message)) if message.contains("reserved field metadata")
+        ));
+    }
 }
