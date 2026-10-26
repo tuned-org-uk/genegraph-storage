@@ -22,6 +22,8 @@ jobs:
           - "--no-default-features --features zarr,npy"
           - "--no-default-features --features parquet,zarr,npy"
           - "--no-default-features --features arrow-ipc"
+          - "--no-default-features --features parquet,arrow-ipc"
+          - "--no-default-features --features zarr,arrow-ipc"
           - "--no-default-features --features npy,arrow-ipc"
           - "--no-default-features --features parquet,zarr,arrow-ipc"
           - ""

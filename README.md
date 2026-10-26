@@ -194,9 +194,7 @@ Every custom definition of a Lance database (store or manifold or data-cube) sho
 
 Traits in `traits` module can also be reused to implement other formats. Other formats can use `StorageBackend` to implement similar child-traits alike to `LanceStorage`. Then if matched with a custom `Metadata` instance can make a database, so every database is simply a `StorageBackend + Metadata`.
 
-## Contributing
-See `.github/` directory.
-# Optional format features
+## Optional format features
 
 The default feature set is `parquet` and `zarr`. This keeps their existing
 APIs and storage support enabled. `npy` is opt-in. Features are additive.
@@ -241,3 +239,7 @@ cargo tree --no-default-features -e normal -i zarrs
 
 The latter two commands must report that those packages are not in the
 resolved graph.
+
+## Contributing
+
+See `.github/` directory.

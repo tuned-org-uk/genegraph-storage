@@ -11,6 +11,11 @@
   requests return typed unsupported-format errors before output directory
   creation.
 
+### Changed
+
+- Return `StorageError::UnsupportedFormat` for unknown dense-file extensions
+  on both load and save paths. The save path previously returned `Invalid`.
+
 ## 0.72.1 (2026-10-26)
 
 ### Fixed

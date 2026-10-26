@@ -113,6 +113,9 @@ fn read_array(path: &Path, expected_descr: &str) -> StorageResult<(Vec<usize>, V
             12usize,
             u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize,
         ),
+        (2, 0) | (3, 0) => {
+            return Err(StorageError::Invalid("truncated NPY header length".into()));
+        }
         _ => {
             return Err(StorageError::UnsupportedFormat(format!(
                 "unsupported NPY version {version:?}"
@@ -197,7 +200,7 @@ mod tests {
         let old_len = u16::from_le_bytes([original[8], original[9]]) as usize;
         let old_header = std::str::from_utf8(&original[10..10 + old_len]).unwrap();
         let body = old_header.trim_end();
-        let prefix = body.trim_end_matches('\n').trim_end();
+        let prefix = body.trim_end();
         let padding = (16 - ((12 + prefix.len() + 1) % 16)) % 16;
         let header = format!("{prefix}{}\n", " ".repeat(padding));
         let mut bytes = Vec::new();

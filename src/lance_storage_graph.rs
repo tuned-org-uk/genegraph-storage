@@ -714,30 +714,15 @@ impl StorageBackend for LanceStorageGraph {
 
         match extension {
             "lance" => load_dense_lance(path).await,
-            "npy" if cfg!(feature = "npy") => {
-                #[cfg(feature = "npy")]
-                {
-                    load_dense_npy(path).await
-                }
-                #[cfg(not(feature = "npy"))]
-                {
-                    unreachable!()
-                }
+            #[cfg(feature = "npy")]
+            "npy" => load_dense_npy(path).await,
+            #[cfg(feature = "parquet")]
+            "parquet" => {
+                let combined = read_parquet_batches(path).await?;
+                dense_matrix_from_parquet(path, &combined)
             }
-            "parquet" if cfg!(feature = "parquet") => {
-                #[cfg(feature = "parquet")]
-                {
-                    let combined = read_parquet_batches(path).await?;
-                    dense_matrix_from_parquet(path, &combined)
-                }
-                #[cfg(not(feature = "parquet"))]
-                {
-                    unreachable!()
-                }
-            }
-            _ => Err(StorageError::Invalid(format!(
-                "Unsupported file format: {}. Only .lance and .parquet are supported",
-                extension
+            _ => Err(StorageError::UnsupportedFormat(format!(
+                "unsupported dense file extension: {extension}"
             ))),
         }
     }
@@ -956,29 +941,12 @@ impl StorageBackend for LanceStorageGraph {
 
         match extension {
             "lance" => save_dense_lance(parent_str, data, path).await,
-            "npy" if cfg!(feature = "npy") => {
-                #[cfg(feature = "npy")]
-                {
-                    save_dense_npy(data, path).await
-                }
-                #[cfg(not(feature = "npy"))]
-                {
-                    unreachable!()
-                }
-            }
-            "parquet" if cfg!(feature = "parquet") => {
-                #[cfg(feature = "parquet")]
-                {
-                    save_dense_parquet(parent_str, data, path).await
-                }
-                #[cfg(not(feature = "parquet"))]
-                {
-                    unreachable!()
-                }
-            }
-            _ => Err(StorageError::Invalid(format!(
-                "Unsupported file format: {}. Only .lance and .parquet are supported",
-                extension
+            #[cfg(feature = "npy")]
+            "npy" => save_dense_npy(data, path).await,
+            #[cfg(feature = "parquet")]
+            "parquet" => save_dense_parquet(parent_str, data, path).await,
+            _ => Err(StorageError::UnsupportedFormat(format!(
+                "unsupported dense file extension: {extension}"
             ))),
         }
     }
