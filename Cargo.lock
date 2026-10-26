@@ -973,7 +973,7 @@ dependencies = [
 
 [[package]]
 name = "genegraph-storage"
-version = "0.72.1"
+version = "0.73.0"
 dependencies = [
  "approx 0.5.1",
  "arrow",

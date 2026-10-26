@@ -1,6 +1,6 @@
 [package]
 name = "genegraph-storage"
-version = "0.72.1"
+version = "0.73.0"
 edition = "2024"
 description = "vector database: Lance and Zarr storage backends with a shared metadata catalog"
 authors = ["Lorenzo <tunedconsulting@gmail.com>"]
