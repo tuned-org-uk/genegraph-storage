@@ -2103,12 +2103,13 @@ checksum = "ba467056f1b547ed52077911161fc86985becbc60e8e1857c8a144dab0def891"
 
 [[package]]
 name = "smartcore"
-version = "0.6.16"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3fdeed8d6b33ec4ade226c614453e0279adb49e6754a199a718563760f654588"
+checksum = "8027848a0450ef3014a0d4a76c94ab7ac70bd3f94cf77ea5bacb437ef4686ba8"
 dependencies = [
  "approx 0.5.1",
  "cfg-if",
+ "ndarray",
  "num",
  "num-traits",
  "ordered-float",

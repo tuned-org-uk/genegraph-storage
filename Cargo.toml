@@ -24,7 +24,7 @@ exclude = [
 ]
 
 [dependencies]
-smartcore = "0.6.14"
+smartcore = "0.7.0"
 ordered-float = "5.5.0"
 rayon = "1.12.0"
 sprs = "0.11.5"
